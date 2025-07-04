@@ -1,0 +1,103 @@
+name: Deploy to Google Cloud Functions
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+   
+    # GCP에 인증하기 위한 권한 설정
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    
+    steps:
+    # GitHub 리포지토리의 코드를 가져옴
+    - name: Checkout repository
+      uses: actions/checkout@v4  
+    
+    # Python 환경 설정
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    # Poetry 설치 및 설정
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+    - name: Install poetry-plugin-export
+      run: poetry self add poetry-plugin-export
+
+    # Poetry 의존성 설치
+    - name: Install dependencies
+      run: poetry install --no-root
+    
+    # Poetry에서 requirements.txt 생성
+    - name: Generate requirements.txt
+      run: |
+        poetry export --output requirements.txt --without-hashes
+        echo "Generated requirements.txt:"
+        cat requirements.txt
+    
+    # Google Cloud에 인증
+    - name: Authenticate to Google Cloud
+      uses: 'google-github-actions/auth@v2'  
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+        service_account: ${{ secrets.GCP_SA_EMAIL }}
+    
+    # Google Cloud Functions에 배포
+    - name: Deploy Function
+      id: deploy
+      uses: 'google-github-actions/deploy-cloud-functions@v2'  
+      with:
+        name: crypto-rank-tracker          # 배포할 함수 이름
+        runtime: python310                # 파이썬 런타임 버전
+        entry_point: main                 # 진입점 함수 이름
+        region: us-west1                  # 리전
+        source_dir: ./                    # 소스 코드 디렉토리
+        service_account_email: ${{ secrets.GCP_SA_EMAIL }} # 서비스 계정
+        env_vars: |          # 환경 변수 설정
+          STATE_STORAGE_METHOD=GCS
+          GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME || 'storage' }}
+          WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+        
+    # Cloud Scheduler 설정 (10분마다 실행)
+    - name: Create Cloud Scheduler Job
+      run: |
+        # Cloud Function URL 가져오기
+        FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --region=us-west1 --gen2 --format="value(serviceConfig.uri)")
+        
+        echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
+
+        # 기존 잡 삭제 (없어도 무시)
+        gcloud scheduler jobs delete crypto-rank-tracker-scheduler \
+          --location=us-west1 --quiet || true
+
+        # 새로운 잡 생성
+        gcloud scheduler jobs create http crypto-rank-tracker-scheduler \
+          --location=us-west1 \
+          --schedule="*/10 * * * *" \
+          --uri="$FUNCTION_URL" \
+          --http-method=POST \
+          --oidc-service-account-email=${{ secrets.GCP_SA_EMAIL }} \
+          --attempt-deadline=15m \
+          --time-zone="Asia/Seoul" \
+          --description="10분마다 업비트 랭킹 체크"
+
+    # 배포 결과 확인
+    - name: Verify deployment
+      run: |
+        echo "Function deployed successfully!"
+        gcloud functions describe crypto-rank-tracker --region=us-west1 --gen2 --format="value(serviceConfig.uri)"
+        echo "Scheduler job created/updated:"
+        gcloud scheduler jobs describe crypto-rank-tracker-scheduler --location=us-west1
