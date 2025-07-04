@@ -20,6 +20,5 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
             response.raise_for_status()
             return await response.json()
     except Exception as e:
-        # 실제로는 logging을 사용해야 함
         logger.error(f"Error fetching tickers from Upbit: {e}")
         return []

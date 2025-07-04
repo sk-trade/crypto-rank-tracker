@@ -6,8 +6,8 @@ import aiohttp
 
 import config
 from common.upbit_client import get_all_krw_tickers
-from common.state_manager import load_previous_state, save_current_state
-from common.notifier import analyze_changes, format_notification, send_notification
+from common.state_manager import load_previous_states, save_current_state
+from common.notifier import analyze_and_format_notification, send_notification
 
 # 로거 설정
 logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -19,36 +19,20 @@ def process_raw_tickers(raw_tickers):
     
     # 1. 거래대금 계산 및 기본 데이터 구조 생성
     processed = {}
-    problematic_tickers = []
     for ticker in raw_tickers:
         market = ticker['market']
-        trade_price = ticker.get('trade_price', 0)
-        volume_24h = ticker.get('acc_trade_volume_24h', 0)
+        trade_price = ticker.get('trade_price')
+        volume_24h = ticker.get('acc_trade_volume_24h')
         
-        # --- 범인 색출을 위한 디버깅 코드 ---
-        # trade_price 또는 volume_24h가 None인지 확인
         if trade_price is None or volume_24h is None:
-            # 문제가 되는 종목의 정보를 리스트에 추가
-            problematic_tickers.append(
-                f"-> 종목: {market}, 가격: {trade_price}, 거래량: {volume_24h}"
-            )
-            # 일단 계산은 0으로 처리해서 프로그램이 멈추지 않게 함
-            trade_price = trade_price or 0
-            volume_24h = volume_24h or 0
-        # --- 디버깅 코드 끝 ---
+            logger.warning(f"데이터 누락: {market}, 가격: {trade_price}, 거래량: {volume_24h}. 계산에서 제외합니다.")
+            continue
             
         processed[market] = {
             "market": market,
             "price": trade_price,
             "trade_volume_24h_krw": trade_price * volume_24h,
         }
-    
-    # 만약 문제가 있는 종목이 하나라도 있었다면, 종합해서 로그를 남김
-    if problematic_tickers:
-        logger.warning(
-            "업비트 API 응답 중 일부 데이터에 None 값이 포함되어 있습니다:\n" + 
-            "\n".join(problematic_tickers)
-        )
 
     # 2. 거래대금 기준으로 정렬
     sorted_markets = sorted(
@@ -77,7 +61,7 @@ async def run_check():
     
     async with aiohttp.ClientSession() as session:
         # 1. 이전 상태 로드
-        old_state = await load_previous_state(gcs_client)
+        old_states = await load_previous_states(gcs_client)
         
         # 2. 현재 시장 데이터 가져오기
         raw_tickers = await get_all_krw_tickers(session)
@@ -98,17 +82,18 @@ async def run_check():
         }
 
         # 6. 변경점 분석 및 알림 메시지 생성
-        change_messages = analyze_changes(new_state, old_state)
-        notification_message = format_notification(change_messages, new_state)
+        notification_message = analyze_and_format_notification(new_state, old_states)
         
         # 7. 알림 전송
         if notification_message:
             await send_notification(session, notification_message)
+            logger.info("알림 메시지를 생성하여 전송했습니다.")
         else:
-            logger.info("감지된 순위 변동이 없습니다.")
+            # 이 경우는 거의 발생하지 않지만, 만약을 위해 로깅
+            logger.warning("알림 메시지가 생성되지 않았습니다.")
 
         # 8. GCS에 새로운 상태 저장
-        await save_current_state(state=new_state, gcs_client=gcs_client)
+        await save_current_state(new_state, old_states, gcs_client=gcs_client)
 
 
 def main(context):
