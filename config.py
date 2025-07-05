@@ -30,3 +30,10 @@ SIGNIFICANT_RANK_CHANGE_THRESHOLD = 8 # '급변동'으로 간주할 최소 순�
 # 3. 알림 출력 파라미터
 MAX_ALERTS_PER_TYPE = 10         # 유형별(상승/하락/급변동) 최대 알림 개수
 DISPLAY_TOP_N_RANKING = 30       # 최종 요약에 표시할 현재 순위 개수
+
+# 거래대금 급증/급감 분석
+VOLUME_SURGE_THRESHOLD = 50.0   # 50% 이상 거래대금 증가 시 알림
+VOLUME_DROP_THRESHOLD = -30.0   # 30% 이상 거래대금 감소 시 알림
+
+# 순위 낮은 코인의 거래대금 폭증 기준 
+LOW_RANK_VOLUME_SURGE_THRESHOLD = 100.0

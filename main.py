@@ -23,6 +23,7 @@ def process_raw_tickers(raw_tickers):
         market = ticker['market']
         trade_price = ticker.get('trade_price')
         volume_24h = ticker.get('acc_trade_volume_24h')
+        acc_trade_price_24h = ticker.get('acc_trade_price_24h') 
         
         if trade_price is None or volume_24h is None:
             logger.warning(f"데이터 누락: {market}, 가격: {trade_price}, 거래량: {volume_24h}. 계산에서 제외합니다.")
@@ -32,6 +33,7 @@ def process_raw_tickers(raw_tickers):
             "market": market,
             "price": trade_price,
             "trade_volume_24h_krw": trade_price * volume_24h,
+            "acc_trade_price_24h": acc_trade_price_24h,
         }
 
     # 2. 거래대금 기준으로 정렬

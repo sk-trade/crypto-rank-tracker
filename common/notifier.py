@@ -18,6 +18,8 @@ def analyze_and_format_notification(
 
     # 2. 알림 메시지 생성 (변동 사항만)
     change_messages = {
+        "volume_surge": [],
+        "volume_drop": [],
         "trending_up": [],
         "trending_down": [],
         "significant_change": [],
@@ -28,6 +30,7 @@ def analyze_and_format_notification(
     if old_states:
         _analyze_entry_exit(change_messages["entry_exit"], enriched_tickers, old_states)
         _analyze_trends_and_changes(change_messages, enriched_tickers)
+        _analyze_volume_changes(change_messages, enriched_tickers)
 
     # 3. 최종 메시지 포맷팅
     # 이제 이 함수는 변동사항이 없어도 항상 순위표를 포함한 메시지를 생성합니다.
@@ -51,6 +54,21 @@ def _enrich_ticker_data(new_tickers, old_states):
                 data['rank_change'] = 0
         else:
             data['rank_change'] = 0
+
+        # 거래대금 변동율 계산
+        if old_states:
+            last_state_tickers = old_states[-1].get("tickers", {})
+            if market in last_state_tickers:
+                old_volume = last_state_tickers[market].get('acc_trade_price_24h', 0)
+                current_volume = data.get('acc_trade_price_24h', 0)
+                if old_volume and old_volume > 0:
+                    data['volume_change_pct'] = ((current_volume - old_volume) / old_volume) * 100
+                else:
+                    data['volume_change_pct'] = 0
+            else:
+                data['volume_change_pct'] = 0
+        else:
+            data['volume_change_pct'] = 0
 
         # 연속 상승/하락 추세(streak) 계산
         streak = 0
@@ -83,6 +101,42 @@ def _analyze_entry_exit(messages, enriched_tickers, old_states):
     for market in exited:
         old_rank = old_states[-1]['tickers'][market]['rank']
         messages.append(f"❌ {market}: TOP {config.NOTIFY_TOP_N} 에서 이탈 (이전 {old_rank}위)")
+
+def _analyze_volume_changes(messages, enriched_tickers):
+    """🚀 거래대금 급증/급감 분석"""
+    volume_surges = []
+    volume_drops = []
+    
+    for market, data in enriched_tickers.items():
+        volume_change = data.get('volume_change_pct', 0)
+        rank = data.get('rank', 999)
+        
+        # 거래대금 급증 감지
+        if volume_change >= config.VOLUME_SURGE_THRESHOLD:
+            # 순위 낮은 코인의 거래대금 폭증은 더 높은 기준 적용
+            if rank > config.NOTIFY_TOP_N and volume_change >= config.LOW_RANK_VOLUME_SURGE_THRESHOLD:
+                volume_surges.append({
+                    "text": f"🔥 {market}: 거래대금 폭증 +{volume_change:.0f}% ({rank}위, 주목!)",
+                    "sort_key": volume_change
+                })
+            elif rank <= config.NOTIFY_TOP_N: # TOP N 내 코인
+                volume_surges.append({
+                    "text": f"📈 {market}: 거래대금 급증 +{volume_change:.0f}% ({rank}위)",
+                    "sort_key": volume_change
+                })
+
+        # 거래대금 급감 감지
+        elif volume_change <= config.VOLUME_DROP_THRESHOLD:
+            volume_drops.append({
+                "text": f"📉 {market}: 거래대금 급감 {volume_change:.0f}% ({rank}위)",
+                "sort_key": abs(volume_change)
+            })
+
+    if volume_surges:
+        messages["volume_surge"] = sorted(volume_surges, key=lambda x: x['sort_key'], reverse=True)
+    
+    if volume_drops:
+        messages["volume_drop"] = sorted(volume_drops, key=lambda x: x['sort_key'], reverse=True)
 
 def _analyze_trends_and_changes(messages, enriched_tickers):
     """지속적인 추세 및 급변동 분석"""
@@ -129,14 +183,16 @@ def _format_final_message(change_messages: Dict[str, list], enriched_tickers: Di
     # --- 1. 변동 사항 요약 부분 (있을 경우에만 추가) ---
     summary_parts = ["📊 **업비트 거래대금 순위 동향**\n"]
     sections = {
-        "trending_up": "🚀 **지속 상승**",
-        "trending_down": "📉 **지속 하락**",
+        "volume_surge": "🚀 **거래대금 급증**",
+        "trending_up": "📈 **지속 상승**",
         "significant_change": "⚡ **주요 급변동**",
-        "entry_exit": f"✨ **TOP {config.NOTIFY_TOP_N} 변동**"
+        "entry_exit": f"✨ **TOP {config.NOTIFY_TOP_N} 변동**",
+        "trending_down": "📉 **지속 하락**",
+        "volume_drop": "🧊 **거래대금 급감**",
     }
 
     for key, title in sections.items():
-        msg_list = change_messages[key]
+        msg_list = change_messages.get(key, []) 
         if not msg_list:
             continue
         
@@ -160,7 +216,16 @@ def _format_final_message(change_messages: Dict[str, list], enriched_tickers: Di
         key=lambda x: x.get('rank', 999)
     )[:config.DISPLAY_TOP_N_RANKING]
     
-    rank_list_str = "\n".join([f"{t['rank']:>2}. {t['market']}" for t in top_tickers_list])
+    rank_list_parts = []
+    for t in top_tickers_list:
+        rank_change = t.get('rank_change', 0)
+        change_str = ""
+        if rank_change > 0:
+            change_str = f" (↑{rank_change})"
+        elif rank_change < 0:
+            change_str = f" (↓{abs(rank_change)})"
+        rank_list_parts.append(f"{t['rank']:>2}. {t['market']}{change_str}")
+    rank_list_str = "\n".join(rank_list_parts)
     
     # 변동 사항이 있었는지 여부에 따라 헤더와 구분선을 다르게 처리
     if has_changes:
