@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import aiofiles  # 비동기 파일 I/O를 위해 추가
+import asyncio
 from google.cloud import storage
 from typing import Dict, Any, List
 import config
@@ -48,11 +49,11 @@ async def _load_from_gcs(gcs_client: storage.Client) -> List[Dict[str, Any]]:
         bucket = gcs_client.bucket(config.GCS_BUCKET_NAME)
         blob = bucket.blob(config.GCS_STATE_FILE_NAME)
         
-        if not await blob.exists(gcs_client): # 비동기 .exists() 사용
+        if not await asyncio.to_thread(blob.exists):
             logger.info("GCS 상태 파일이 없어 초기 상태로 시작합니다.")
             return []
             
-        data = await blob.download_as_text(client=gcs_client) # 비동기 다운로드
+        data = await asyncio.to_thread(blob.download_as_text)
         states = json.loads(data)
         
         # 단일 dict가 저장된 경우 list로 변환
@@ -71,7 +72,12 @@ async def _save_to_gcs(gcs_client: storage.Client, states: List[Dict[str, Any]])
         blob = bucket.blob(config.GCS_STATE_FILE_NAME)
         state_json = json.dumps(states, ensure_ascii=False, indent=2)
         
-        await blob.upload_from_string(state_json, content_type="application/json", client=gcs_client) # 비동기 업로드
+        await asyncio.to_thread(
+            blob.upload_from_string,
+            state_json,
+            content_type="application/json"
+        )
+        
         logger.info("GCS에 상태 히스토리 저장 완료.")
     except Exception as e:
         logger.error(f"GCS 상태 저장 실패: {e}", exc_info=True)
