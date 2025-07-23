@@ -23,8 +23,13 @@ def process_raw_tickers(raw_tickers: List[Dict[str, Any]]) -> Dict[str, TickerDa
     processed = {}
     for ticker_data in raw_tickers:
         market = ticker_data['market']
+        ticker_data['trade_volume_24h_krw'] = ticker_data.get('acc_trade_price_24h')
         try:
-            processed[market] = TickerData.model_validate(ticker_data)
+            model_instance = TickerData.model_validate(ticker_data)
+            if model_instance.trade_volume_24h_krw is None:
+                logger.warning(f"거래대금 데이터 누락: {market}, 계산에서 제외합니다.")
+                continue
+            processed[market] = model_instance
         except Exception as e:
             logger.warning(f"데이터 파싱 오류: {market}, 데이터: {ticker_data}, 오류: {e}")
             continue
@@ -41,7 +46,6 @@ def process_raw_tickers(raw_tickers: List[Dict[str, Any]]) -> Dict[str, TickerDa
         processed[market].rank = rank
         
     return processed
-
 
 async def run_check():
     """핵심 로직을 실행하는 비동기 함수"""

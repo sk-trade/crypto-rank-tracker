@@ -8,7 +8,7 @@ class TickerData(BaseModel):
     price: Optional[float] = None
     
     # API의 acc_trade_price_24h 필드를 이 필드에 매핑합니다.
-    trade_volume_24h_krw: float = Field(alias="acc_trade_price_24h")
+    trade_volume_24h_krw: Optional[float] = None
     
     # 분석 과정에서 추가되는 필드들
     rank: Optional[int] = None
