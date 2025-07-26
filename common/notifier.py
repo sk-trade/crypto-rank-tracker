@@ -252,12 +252,19 @@ async def send_notification(session: aiohttp.ClientSession, message: str):
         if "YOUR_SLACK_WEBHOOK_URL" in config.WEBHOOK_URL:
              logger.warning("웹훅 URL이 설정되지 않았습니다. 알림을 보내지 않습니다.")
         return
+    
+    # 멘션 유무 확인
+    use_channel_mention = message.strip().startswith("@channel")
         
     # 메시지가 너무 길 경우 4000자로 제한 
     if len(message) > 4000:
         message = message[:3950] + "\n... (메시지가 너무 길어 생략됨)"
         
-    payload = {"text": message} 
+    payload = {"text": message}
+    
+    if use_channel_mention:
+        payload["link_names"] = 1
+    
     try:
         async with session.post(config.WEBHOOK_URL, json=payload, timeout=10) as response:
             if response.ok:
