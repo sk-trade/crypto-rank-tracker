@@ -1,6 +1,7 @@
 import logging
 import aiohttp
 from typing import Dict, Any, List
+import numpy as np
 import config
 from common.models import State, TickerData
 
