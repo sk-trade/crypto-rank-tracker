@@ -1,270 +1,248 @@
+# common/notifier.py
+
 import logging
 import aiohttp
-from typing import Dict, Any, List
+from typing import Dict, List, Any, Tuple
 import numpy as np
+import datetime
+
 import config
-from common.models import State, TickerData
+from common.models import TickerData, AlertHistory
+from common.signals.detector import detect_anomalies
+from common.state_manager import load_alert_history, save_alert_history
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
-def analyze_and_format_notification(
-    new_state: State, 
-    old_states: List[State]
+
+# --- 게이트키퍼 함수 ---
+
+def is_worth_alerting(anomaly: Dict) -> bool:
+    """
+    이 시그널이 알림을 보낼 최소한의 가치가 있는지 판단합니다.
+    이 관문을 통과하지 못하면 어떤 경우에도 알림이 나가지 않습니다.
+    """
+    price_change_abs = abs(anomaly.get('price_change', 0))
+    
+    if price_change_abs < config.ALERT_MIN_PRICE_CHANGE_10M:
+        return False
+    if anomaly.get('rvol', 0) < config.ALERT_MIN_RVOL:
+        return False
+    if anomaly.get('confidence', 0) < config.ALERT_MIN_CONFIDENCE:
+        return False
+        
+    return True
+
+
+# --- 알림 판단 함수 ---
+
+def get_alert_type_and_priority(
+    anomaly: Dict,
+    history: Dict[str, AlertHistory]
+) -> Tuple[str | None, int]:
+    """
+    게이트키퍼를 통과한 시그널의 유형과 우선순위를 판단합니다.
+    """
+    market = anomaly['market']
+    previous_alert = history.get(market)
+
+    # Case 1: 이전 알림이 없음 -> 새로운 이벤트
+    if not previous_alert:
+        return "INITIAL_BREAKOUT", 2
+
+    # Case 2: 이전 알림이 있음 -> 후속 움직임 판단
+    cooldown_delta = datetime.datetime.now(datetime.timezone.utc) - previous_alert.last_alert_timestamp
+    
+    if cooldown_delta.total_seconds() >= config.ALERT_COOLDOWN_MINUTES * 60:
+        # 쿨다운 기간이 지났으면, 다시 새로운 이벤트로 간주
+        return "INITIAL_BREAKOUT", 2
+    else:
+        # 쿨다운 기간 내라면, '의미 있는 지속성'이 있는지 엄격하게 판단
+        current_price = anomaly['current_price']
+        previous_price = previous_alert.last_price
+        additional_change_pct = (current_price / previous_price - 1) * 100
+        
+        is_momentum = abs(additional_change_pct) >= config.SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT
+        
+        if is_momentum:
+            return "MOMENTUM_SUSTAINED", 1
+        
+        logger.debug(f"{market}는 쿨다운 중이며, 의미있는 추가 변동이 없어 건너뜁니다.")
+        return None, 0
+
+
+# --- 메시지 포맷팅 헬퍼 함수 ---
+
+def format_signal_message(
+    signal_type: str,
+    anomaly: Dict,
+    ticker: TickerData,
+    previous_alert: AlertHistory | None,
+    reverse_sector_map: Dict
 ) -> str:
-    """
-    과거 히스토리와 현재 상태를 비교 분석하여 최종 알림 메시지를 생성합니다.
-    의미 있는 변동이 없더라도 현재 순위는 항상 포맷팅하여 반환합니다.
-    """
-    # 데이터 보강: 각 티커에 분석 정보 추가
-    enriched_tickers = _enrich_ticker_data(new_state.tickers, old_states)
-
-    # 알림 메시지 생성 (변동 사항만)
-    change_messages = {
-        "volume_surge": [],
-        "volume_drop": [],
-        "trending_up": [],
-        "trending_down": [],
-        "significant_change": [],
-        "entry_exit": [],
-    }
-
-    # 이전 상태가 있을 경우에만 변동 분석 수행
-    if old_states:
-        _analyze_entry_exit(change_messages["entry_exit"], enriched_tickers, old_states)
-        _analyze_trends_and_changes(change_messages, enriched_tickers)
-        _analyze_volume_changes(change_messages, enriched_tickers)
-
-    # 최종 메시지 포맷팅
-    return _format_final_message(change_messages, enriched_tickers)
-
-
-def _enrich_ticker_data(new_tickers: Dict[str, TickerData], old_states: List[State]) -> Dict[str, TickerData]:
-    """각 티커에 과거 순위, 추세, Z-score 등 분석용 데이터를 추가합니다."""
+    market = anomaly['market']
+    price_change_10m = anomaly['price_change']
+    rvol = anomaly['rvol']
+    tag = reverse_sector_map.get(market, [""])[0]
+    tag_str = f" ({tag})" if tag else ""
     
-    for market, data in new_tickers.items():
-        # 과거 거래대금 및 순위 히스토리 추출
-        volume_history = []
-        rank_history = []
-        for old_state in old_states:
-            if market in old_state.tickers:
-                old_ticker = old_state.tickers[market]
-                volume_history.append(old_ticker.trade_volume_24h_krw)
-                if old_ticker.rank:
-                    rank_history.append(old_ticker.rank)
+    if signal_type == "INITIAL_BREAKOUT":
+        icon = "🔥" if price_change_10m > 0 else "🧊"
+        header = f"{icon} **{market}{tag_str}: 초기 급등/급락 포착**"
+    else: 
+        icon = "📈" if price_change_10m > 0 else "📉"
+        header = f"{icon} **{market}{tag_str}: 모멘텀 지속**"
+
+    phenomenon = f"- **현상:** 최근 10분간 `{price_change_10m:+.2f}%` 변동, RVOL `{rvol:.1f}x`"
+    
+    contexts = []
+    if ticker.price_change_1h is not None:
+        contexts.append(f"1시간 추세 `{ticker.price_change_1h:+.2f}%`")
+    if ticker.is_breaking_1h_high and price_change_10m > 0:
+        contexts.append("`1시간 고점 돌파`")
+    context_str = f"- **맥락:** {', '.join(contexts)}" if contexts else ""
+
+    interpretation = ""
+    if signal_type == "MOMENTUM_SUSTAINED" and previous_alert:
+        total_change_pct = (anomaly['current_price'] / previous_alert.initial_price - 1) * 100
+        elapsed_time = (datetime.datetime.now(datetime.timezone.utc) - previous_alert.initial_timestamp).total_seconds() / 60
+        interpretation = f"- **누적:** 최초 알림 후 `{elapsed_time:.0f}분` 동안 `{total_change_pct:+.2f}%` 변동"
+
+    return "\n".join(filter(None, [header, phenomenon, context_str, interpretation]))
+
+
+# --- 주도 섹터 및 시장 현황 분석 함수 ---
+
+def analyze_leading_sectors(tickers_data: Dict[str, TickerData], SECTORS: Dict) -> List[str]:
+    sector_performance = {}
+    for sector_name, coins in SECTORS.items():
+        returns_1h = [t.price_change_1h for t in [tickers_data.get(c) for c in coins] if t and t.price_change_1h is not None]
+        if len(returns_1h) < 3: continue
+
+        avg_return_1h = np.mean(returns_1h)
+        rising_count = sum(1 for r in returns_1h if r > 0)
         
-        data.rank_history = rank_history
-        
-        # 직전 순위 및 변동폭
-        if rank_history:
-            last_rank = rank_history[-1]
-            if last_rank and data.rank:
-                data.rank_change = last_rank - data.rank # 양수:상승, 음수:하락
-        
-        # 거래대금 Z-score 계산
-        if len(volume_history) >= config.Z_SCORE_LOOKBACK_PERIOD:
-            # 최근 N-1개 과거 데이터와 현재 데이터를 합쳐 Z-score 계산
-            recent_volumes = volume_history[-(config.Z_SCORE_LOOKBACK_PERIOD-1):] + [data.trade_volume_24h_krw]
-            mean_vol = np.mean(recent_volumes)
-            std_vol = np.std(recent_volumes)
+        if avg_return_1h > 1.5 and (rising_count / len(returns_1h)) >= 0.6:
+            sector_performance[sector_name] = {'avg_return': avg_return_1h, 'consistency': f"{rising_count}/{len(returns_1h)} 상승"}
             
-            if std_vol > 0:
-                z_score = (data.trade_volume_24h_krw - mean_vol) / std_vol
-                data.volume_z_score = z_score
+    if not sector_performance:
+        return ["- 주도 섹터 없음"]
+
+    sorted_sectors = sorted(sector_performance.items(), key=lambda item: item[1]['avg_return'], reverse=True)
+    return [f"- **{name} ({perf['consistency']}):** 1시간 평균 `{perf['avg_return']:.2f}%` 상승" for name, perf in sorted_sectors[:3]]
+
+
+# --- 메인 분석 및 포맷팅 함수 ---
+
+async def analyze_and_format_notification(
+    enriched_tickers: Dict[str, TickerData],
+    raw_tickers: List[Dict[str, Any]],
+    current_rankings: Dict[str, int],
+    previous_rankings: Dict[str, int],
+    SECTORS: Dict,
+    REVERSE_SECTOR_MAP: Dict,
+    gcs_client=None
+) -> str:
+    alert_history = await load_alert_history(gcs_client)
+    anomalies_raw = detect_anomalies(enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
+    
+    candidate_anomalies = [a for a in anomalies_raw if is_worth_alerting(a)]
+    
+    final_signals = []
+    for anomaly in candidate_anomalies:
+        anomaly['current_price'] = enriched_tickers[anomaly['market']].candle_history[-1].close_price
         
-        # 연속 상승/하락 추세(streak) 계산
-        streak = 0
-        current_rank = data.rank
-        # None 값을 제외한 유효한 순위 기록만으로 추세 계산
-        history_for_streak = [r for r in data.rank_history if r] + ([current_rank] if current_rank else [])
+        signal_type, priority = get_alert_type_and_priority(anomaly, alert_history)
         
-        if len(history_for_streak) > 1:
-            # 상승 추세 확인
-            if all(history_for_streak[i] > history_for_streak[i+1] for i in range(len(history_for_streak)-1)):
-                streak = len(history_for_streak) - 1
-            # 하락 추세 확인
-            elif all(history_for_streak[i] < history_for_streak[i+1] for i in range(len(history_for_streak)-1)):
-                streak = -(len(history_for_streak) - 1)
-        data.trend_streak = streak
+        if signal_type:
+            anomaly.update({'signal_type': signal_type, 'priority': priority})
+            final_signals.append(anomaly)
+
+            now = datetime.datetime.now(datetime.timezone.utc)
+            current_price = anomaly['current_price']
+            
+            if signal_type == "INITIAL_BREAKOUT":
+                alert_history[anomaly['market']] = AlertHistory(
+                    market=anomaly['market'], last_alert_timestamp=now, last_signal_type=signal_type,
+                    last_price=current_price, last_rvol=anomaly['rvol'],
+                    initial_timestamp=now, initial_price=current_price
+                )
+            elif signal_type == "MOMENTUM_SUSTAINED":
+                alert_history[anomaly['market']].last_alert_timestamp = now
+                alert_history[anomaly['market']].last_signal_type = signal_type
+                alert_history[anomaly['market']].last_price = current_price
+                alert_history[anomaly['market']].last_rvol = anomaly['rvol']
+
+    gainers = sum(1 for t in enriched_tickers.values() if t.price_change_10m is not None and t.price_change_10m > 0)
+    losers = sum(1 for t in enriched_tickers.values() if t.price_change_10m is not None and t.price_change_10m < 0)
+    market_mood_str = "강세" if gainers > losers * 1.2 else "약세" if losers > gainers * 1.2 else "보합"
     
-    return new_tickers
-
-def _analyze_entry_exit(messages: list, enriched_tickers: Dict[str, TickerData], old_states: List[State]):
-    """TOP N 순위권 진입/이탈 분석"""
-    old_top_n_set = {m for m, d in old_states[-1].tickers.items() if d.rank and d.rank <= config.NOTIFY_TOP_N}
-    new_top_n_set = {m for m, d in enriched_tickers.items() if d.rank and d.rank <= config.NOTIFY_TOP_N}
+    total_24h = sum(t.get('acc_trade_price_24h', 0) for t in raw_tickers if t.get('acc_trade_price_24h'))
+    major_24h = sum(t.get('acc_trade_price_24h', 0) for t in raw_tickers if t['market'] in ['KRW-BTC', 'KRW-ETH'] and t.get('acc_trade_price_24h'))
+    major_pct = (major_24h / total_24h * 100) if total_24h > 0 else 0
     
-    entered = new_top_n_set - old_top_n_set
-    exited = old_top_n_set - new_top_n_set
+    leading_sectors = analyze_leading_sectors(enriched_tickers, SECTORS)
 
-    for market in entered:
-        rank = enriched_tickers[market].rank
-        messages.append(f"✨ {market}: TOP {config.NOTIFY_TOP_N} 신규 진입 ({rank}위)")
-
-    for market in exited:
-        old_rank = old_states[-1].tickers[market].rank
-        messages.append(f"❌ {market}: TOP {config.NOTIFY_TOP_N} 에서 이탈 (이전 {old_rank}위)")
-
-def _analyze_volume_changes(messages: Dict[str, list], enriched_tickers: Dict[str, TickerData]):
-    """🚀 Z-score 기반 거래대금 급증/급감 분석"""
-    volume_surges = []
-    volume_drops = []
-    
-    for market, data in enriched_tickers.items():
-        z_score = data.volume_z_score or 0.0
-        
-        # 거래대금 급증 감지 (Z-score 사용)
-        if z_score >= config.VOLUME_SURGE_Z_SCORE_THRESHOLD:
-            volume_surges.append({
-                "text": f"🔥 {market}: 거래대금 폭증 (Z-score: {z_score:.2f}, {data.rank}위)",
-                "sort_key": z_score
-            })
-
-        # 거래대금 급감 감지 (Z-score 사용)
-        elif z_score <= config.VOLUME_DROP_Z_SCORE_THRESHOLD:
-            volume_drops.append({
-                "text": f"🧊 {market}: 거래대금 급감 (Z-score: {z_score:.2f}, {data.rank}위)",
-                "sort_key": abs(z_score)
-            })
-
-    if volume_surges:
-        messages["volume_surge"] = sorted(volume_surges, key=lambda x: x['sort_key'], reverse=True)
-    
-    if volume_drops:
-        messages["volume_drop"] = sorted(volume_drops, key=lambda x: x['sort_key'], reverse=True)
-
-
-def _analyze_trends_and_changes(messages: Dict[str, list], enriched_tickers: Dict[str, TickerData]):
-    """지속적인 추세 및 급변동 분석"""
-    processed_markets = set()
-
-    for market, data in enriched_tickers.items():
-        if not data.rank: continue # 순위가 없는 티커는 분석에서 제외
-
-        # 추세 감지
-        streak = data.trend_streak
-        if abs(streak) >= config.TRENDING_STREAK_THRESHOLD:
-            # 추세 시작점의 순위를 찾기
-            valid_history = [r for r in data.rank_history if r]
-            if len(valid_history) >= abs(streak):
-                oldest_rank = valid_history[-(abs(streak))]
-                current_rank = data.rank
-                if streak > 0: # 상승
-                    messages["trending_up"].append({
-                        "text": f"🚀 {market}: {streak}회 연속 상승 ({oldest_rank}위 → {current_rank}위)",
-                        "sort_key": streak
-                    })
-                else: # 하락
-                    messages["trending_down"].append({
-                        "text": f"📉 {market}: {abs(streak)}회 연속 하락 ({oldest_rank}위 → {current_rank}위)",
-                        "sort_key": abs(streak)
-                    })
-                processed_markets.add(market)
-
-        # 급변동 감지 (추세가 아닌 경우에만)
-        if market not in processed_markets:
-            rank_change = data.rank_change
-            if abs(rank_change) >= config.SIGNIFICANT_RANK_CHANGE_THRESHOLD:
-                old_rank = data.rank + rank_change
-                current_rank = data.rank
-                arrow = "⏫" if rank_change > 0 else "⏬"
-                messages["significant_change"].append({
-                    "text": f"{arrow} {market}: 순위 급변 ({old_rank}위 → {current_rank}위, {rank_change:+}계단)",
-                    "sort_key": abs(rank_change)
-                })
-
-def _format_final_message(change_messages: Dict[str, list], enriched_tickers: Dict[str, TickerData]) -> str:
-    """
-    분석된 변경 사항과 현재 순위표를 조합하여 최종 알림 메시지를 생성합니다.
-    """
-    final_message_parts = []
-    has_changes = False
-
-    # --- 1. 변동 사항 요약 부분 (있을 경우에만 추가) ---
-    summary_parts = ["📊 **업비트 거래대금 순위 동향**\n"]
-    sections = {
-        "volume_surge": "🚀 **거래대금 급증 (Z-score 기반)**",
-        "trending_up": "📈 **지속 상승**",
-        "significant_change": "⚡ **주요 급변동**",
-        "entry_exit": f"✨ **TOP {config.NOTIFY_TOP_N} 변동**",
-        "trending_down": "📉 **지속 하락**",
-        "volume_drop": "🧊 **거래대금 급감 (Z-score 기반)**",
-    }
-
-    for key, title in sections.items():
-        msg_list = change_messages.get(key, []) 
-        if not msg_list:
-            continue
-        
-        has_changes = True # 변동 사항이 하나라도 있음을 표시
-        summary_parts.append(f"\n{title}")
-
-        if msg_list and isinstance(msg_list[0], dict):
-            # sort_key를 기준으로 정렬
-            sorted_msgs = sorted(msg_list, key=lambda x: x['sort_key'], reverse=True)
-            msg_texts = [m['text'] for m in sorted_msgs[:config.MAX_ALERTS_PER_TYPE]]
-            summary_parts.extend(msg_texts)
-        else: # dict가 아닌 단순 문자열 리스트인 경우 (e.g., entry_exit)
-            summary_parts.extend(msg_list[:config.MAX_ALERTS_PER_TYPE])
-
-    # 변동 사항이 있을 경우에만 요약 섹션을 최종 메시지에 추가
-    if has_changes:
-        final_message_parts.extend(summary_parts)
-
-    # --- 2. 현재 순위표 부분 (항상 추가) ---
-    top_tickers_list = sorted(
-        [t for t in enriched_tickers.values() if t.rank], 
-        key=lambda x: x.rank
-    )[:config.DISPLAY_TOP_N_RANKING]
-    
-    rank_list_parts = []
-    for t in top_tickers_list:
-        rank_change = t.rank_change
-        change_str = ""
-        if rank_change > 0:
-            change_str = f" (↑{rank_change})"
-        elif rank_change < 0:
-            change_str = f" (↓{abs(rank_change)})"
-        rank_list_parts.append(f"{t.rank:>2}. {t.market}{change_str}")
-    rank_list_str = "\n".join(rank_list_parts)
-    
-    # 변동 사항이 있었는지 여부에 따라 헤더와 구분선을 다르게 처리
-    if has_changes:
-        # 변동 사항이 있으면, 구분선과 함께 순위표 추가
-        final_message_parts.append(f"\n\n---\n\n🏆 **현재 TOP {config.DISPLAY_TOP_N_RANKING} 순위**\n{rank_list_str}")
-    else:
-        # 변동 사항이 없으면, 순위표가 메인 컨텐츠가 됨
-        final_message_parts.append(f"📊 **현재 거래대금 TOP {config.DISPLAY_TOP_N_RANKING} 순위**\n\n{rank_list_str}")
-
-    # 생성된 메시지가 비어있으면 빈 문자열 반환
-    if not final_message_parts:
+    if not final_signals and not any("주도 섹터 없음" not in s for s in leading_sectors):
+        await save_alert_history(alert_history, gcs_client)
         return ""
-        
-    final_message = "\n".join(final_message_parts)
 
-    # has_changes 플래그가 True일 때만 메시지 맨 앞에 @channel 태그 추가
-    if has_changes:
-        return f"@channel\n{final_message}"
-    else:
-        return final_message
+    message_parts = [f"📊 **업비트 마켓 브리핑 ({datetime.datetime.now().strftime('%H:%M')})**"]
+    
+    market_status_lines = [
+        f"**시장 현황:**",
+        f"- **분위기:** {market_mood_str} (상승 {gainers} : 하락 {losers})",
+        f"- **자금 흐름:** 메이저 {major_pct:.1f}%, 알트 {(100-major_pct):.1f}%"
+    ]
+    message_parts.append("\n".join(market_status_lines))
 
+    if leading_sectors:
+        message_parts.extend(["\n---", "🔥 **주도 섹터 (1시간 기준)**", *leading_sectors])
+
+    if final_signals:
+        final_signals.sort(key=lambda x: x['priority'], reverse=True)
+        message_parts.extend(["\n---", "⚡ **실시간 마켓 이벤트**"])
+        for anomaly in final_signals[:5]:
+            message_parts.append(format_signal_message(
+                anomaly['signal_type'], anomaly, enriched_tickers[anomaly['market']],
+                alert_history.get(anomaly['market']), REVERSE_SECTOR_MAP
+            ))
+
+    top_10_ranked = sorted([(m, r) for m, r in current_rankings.items() if r <= 10], key=lambda item: item[1])
+    rank_strs = []
+    for market, rank in top_10_ranked:
+        prev_rank = previous_rankings.get(market)
+        change_str = ""
+        if prev_rank:
+            change = prev_rank - rank
+            if change > 0: change_str = f" (↑{change})"
+            elif change < 0: change_str = f" (↓{abs(change)})"
+        rank_strs.append(f"{rank}. {market.split('-')[1]}{change_str}")
+    
+    message_parts.append(f"\n---\n🏆 **24h 거래대금 TOP 10:**\n" + " | ".join(rank_strs))
+
+    use_channel_mention = any(s['signal_type'] == 'INITIAL_BREAKOUT' for s in final_signals)
+    
+    final_message = "\n".join(message_parts)
+    await save_alert_history(alert_history, gcs_client)
+    return f"@channel\n{final_message}" if use_channel_mention else final_message
+
+# --- 알림 전송 함수  ---
 async def send_notification(session: aiohttp.ClientSession, message: str):
     """웹훅을 통해 메시지를 보냅니다."""
-    if not message or not config.WEBHOOK_URL or "YOUR_SLACK_WEBHOOK_URL" in config.WEBHOOK_URL:
-        if "YOUR_SLACK_WEBHOOK_URL" in config.WEBHOOK_URL:
+    if not message or not config.WEBHOOK_URL:
+        if not config.WEBHOOK_URL:
              logger.warning("웹훅 URL이 설정되지 않았습니다. 알림을 보내지 않습니다.")
         return
     
-    # 멘션 유무 확인
     use_channel_mention = message.strip().startswith("@channel")
         
-    # 메시지가 너무 길 경우 4000자로 제한 
     if len(message) > 4000:
         message = message[:3950] + "\n... (메시지가 너무 길어 생략됨)"
         
-    payload = {"text": message}
+    payload: Dict[str, Any] = {"text": message}
     
     if use_channel_mention:
-        payload["link_names"] = 1
+        payload["link_names"] = True
     
     try:
         async with session.post(config.WEBHOOK_URL, json=payload, timeout=10) as response:

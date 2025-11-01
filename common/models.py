@@ -1,23 +1,53 @@
+#models
 from pydantic import BaseModel, Field
 from typing import Dict, Optional, List
 import datetime
 
-class TickerData(BaseModel):
-    """개별 티커의 처리된 데이터 모델"""
+class CandleData(BaseModel):
     market: str
-    price: Optional[float] = None
-    
-    # API의 acc_trade_price_24h 필드를 이 필드에 매핑합니다.
-    trade_volume_24h_krw: Optional[float] = None
-    
-    # 분석 과정에서 추가되는 필드들
-    rank: Optional[int] = None
-    rank_history: List[Optional[int]] = []
-    rank_change: int = 0
-    volume_z_score: Optional[float] = 0.0 # 거래대금 Z-score
-    trend_streak: int = 0
+    timestamp: datetime.datetime
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    volume: float
 
-class State(BaseModel):
-    """특정 시점의 전체 시장 상태를 나타내는 모델"""
+class TickerData(BaseModel):
+    """분석 및 저장에 모두 사용되는 단일 티커 모델"""
+    market: str
+    candle_history: List[CandleData] = [] 
+    price_change_10m: Optional[float] = None
+    relative_volume: Optional[float] = None
+    is_breakout: bool = False
+    trend_1h: str = "NEUTRAL"
+    trend_4h: str = "NEUTRAL"
+    bb_status: str = "NORMAL"
+    volatility_tier: str = "NORMAL"
+    rvol_vs_yesterday: Optional[float] = None   
+    volume_acceleration: Optional[float] = None
+    rvol_consistency_score: float = 0.0     
+    price_change_1h: Optional[float] = None
+    price_change_4h: Optional[float] = None
+    rvol_1h_avg: Optional[float] = None
+    is_breaking_1h_high: bool = False
+
+class RankState(BaseModel):
+    """순위 변동 비교용 상태 모델"""
+    last_updated: datetime.datetime
+    rankings: Dict[str, int] = {}
+
+class AnalysisState(BaseModel):
+    """분석 결과 로그 저장용 상태 모델"""
     last_updated: datetime.datetime
     tickers: Dict[str, TickerData]
+    rankings: Dict[str, int] = {}
+
+class AlertHistory(BaseModel):
+    """알림 발송 기록을 저장하는 모델"""
+    market: str
+    last_alert_timestamp: datetime.datetime
+    last_signal_type: str 
+    last_price: float     
+    last_rvol: float       
+    initial_timestamp: datetime.datetime
+    initial_price: float       
