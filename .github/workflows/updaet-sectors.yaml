@@ -1,0 +1,50 @@
+
+name: Update CoinGecko Sectors
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 21 * * *'
+
+jobs:
+  update-sectors:
+    runs-on: ubuntu-latest
+    
+    # GCS에 인증하고 Secret을 사용하기 위한 권한
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    # Poetry 설치 및 의존성 설치 (기존 deploy.yml과 동일)
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+    - name: Install dependencies
+      # --no-root는 라이브러리만 설치, --sync는 pyproject.toml과 정확히 동기화
+      run: poetry install --no-root --sync
+
+    # Google Cloud에 인증 (GCS에 업로드하기 위해 필요)
+    - name: Authenticate to Google Cloud
+      uses: 'google-github-actions/auth@v2'
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+        service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+    # 섹터 업데이트 스크립트 실행
+    - name: Run sector update script
+      run: poetry run python update_sectors.py
+      env:
+        # GitHub Repository Secret에 'CG_API_KEY'라는 이름으로 키를 저장해야 함
+        CG_API_KEY: ${{ secrets.CG_API_KEY }}
+        # GCS 업로드를 위해 GCP 관련 환경 변수도 전달
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }} # 프로젝트 ID가 필요하다면
+        GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
+        STATE_STORAGE_METHOD: ${{ vars.STATE_STORAGE_METHOD }}

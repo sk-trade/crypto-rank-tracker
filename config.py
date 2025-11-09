@@ -1,40 +1,51 @@
+# config.py
+
 import os
 
+# -- ENVIRONMENT & STORAGE CONFIGURATION --
+
 # 저장 방식 선택 ('GCS' 또는 'LOCAL')
-STATE_STORAGE_METHOD = os.environ.get("STATE_STORAGE_METHOD", "LOCAL") 
+STATE_STORAGE_METHOD = os.environ.get("STATE_STORAGE_METHOD", "LOCAL")
 # GCP storage Settings
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
-GCS_STATE_FILE_NAME = "upbit_market_state.json"
+
 # local storage Settings
 LOCAL_STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
-LOCAL_STATE_FILE_NAME = "upbit_market_state.json"
+
+STATE_FILE_NAME = "upbit_market_state.json"
+RANK_STATE_FILE_NAME = "rank_state.json"
+SECTOR_MAP_FILE_NAME = "sectors.json"
+ALERT_HISTORY_FILE_NAME = "alert_history.json"
+
+# -- EXTERNAL API & WEBHOOK CONFIGURATION --
+
+# Coingecko API Key
+CG_API_KEY = os.environ.get("CG_API_KEY")
 
 # Webhook
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-# Application Settings
+# -- APPLICATION SETTINGS --
+
 APP_LOGGER_NAME = "CryptoRankTracker"
 LOG_LEVEL = "INFO"
+STATE_HISTORY_COUNT = 12  # 순위 분석에 사용할 과거 데이터 수
 
-# --- 분석 및 알림 정책 설정 ---
 
-# 1. 분석 파라미터
-STATE_HISTORY_COUNT = 12          # 분석에 사용할 과거 데이터 수 (5회 체크 결과)
-NOTIFY_TOP_N = 30                # '신규 진입/이탈'을 감지할 기준 순위 (TOP 30)
+# -- ANALYSIS & ALERTING POLICY --
 
-# 2. 알림 조건 파라미터
-TRENDING_STREAK_THRESHOLD = 3    # '지속적인 추세'로 간주할 최소 연속 변동 횟수
-SIGNIFICANT_RANK_CHANGE_THRESHOLD = 8 # '급변동'으로 간주할 최소 순위 변동 폭
 
-# 3. 알림 출력 파라미터
-MAX_ALERTS_PER_TYPE = 10         # 유형별(상승/하락/급변동) 최대 알림 개수
-DISPLAY_TOP_N_RANKING = 30       # 최종 요약에 표시할 현재 순위 개수
+# --- 1. Signal Detector Settings (1차 후보군 필터링) ---
+CONFIDENCE_THRESHOLD = 0.2      # 후보군으로 포함될 최소 신뢰도 점수
+ROBUST_Z_SCORE_THRESHOLD = 3.5  # RVOL 이상 현상으로 판단할 최소 Z-score
+DECOUPLING_MIN_DEVIATION_PCT = 2.0 # 강력한 디커플링으로 판단할 최소 편차 (%p)
 
-# Z-score 계산 시 사용할 과거 데이터 개수
-Z_SCORE_LOOKBACK_PERIOD = 20 
+# --- 2. Alert Gatekeeper Policy (최종 알림 발송 조건) ---
+# 아래 기준을 모두 통과해야만 최종 알림이 발송됩니다.
+ALERT_MIN_PRICE_CHANGE_10M = 2.0  # 최소 10분간 2% 이상 가격 변동
+ALERT_MIN_CONFIDENCE = 0.65       # 최소 신뢰도 65% 이상
 
-# 거래대금 급증으로 판단할 Z-score 임계값 
-VOLUME_SURGE_Z_SCORE_THRESHOLD = 2.5
-# 거래대금 급감으로 판단할 Z-score 임계값
-VOLUME_DROP_Z_SCORE_THRESHOLD = -2.0
+# --- 3. Alert Cooldown Policy (알림 반복 방지) ---
+ALERT_COOLDOWN_MINUTES = 60       # 같은 코인은 60분 동안 재알림 금지 (단, 예외 있음)
+SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT = 0.5 # 쿨다운 중 추가 알림을 보낼 최소 변동률

@@ -25,7 +25,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10'
+        python-version: '3.11'
     
     # Poetry 설치 및 설정
     - name: Install Poetry
@@ -50,7 +50,7 @@ jobs:
     
     # Google Cloud에 인증
     - name: Authenticate to Google Cloud
-      uses: 'google-github-actions/auth@v2'  
+      uses: 'google-github-actions/auth@v2' 
       with:
         workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
         service_account: ${{ secrets.GCP_SA_EMAIL }}
@@ -58,16 +58,19 @@ jobs:
     # Google Cloud Functions에 배포
     - name: Deploy Function
       id: deploy
-      uses: 'google-github-actions/deploy-cloud-functions@v2'  
+      uses: 'google-github-actions/deploy-cloud-functions@v3'  
       with:
         name: crypto-rank-tracker          # 배포할 함수 이름
-        runtime: python310                # 파이썬 런타임 버전
+        runtime: python311                # 파이썬 런타임 버전
         entry_point: main                 # 진입점 함수 이름
-        region: us-west1                  # 리전
+        region: asia-northeast1                  # 리전
         source_dir: ./                    # 소스 코드 디렉토리
-        service_account_email: ${{ secrets.GCP_SA_EMAIL }} # 서비스 계정
-        env_vars: |          # 환경 변수 설정
-          STATE_STORAGE_METHOD=GCS
+        service_account: ${{ secrets.GCP_SA_EMAIL }} # 서비스 계정
+        memory: 512M
+        timeout: 540                      # ← 타임아웃 (초 단위)
+        max_instances: 1                  # ← 최대 동시 인스턴스
+        environment_variables: |          # 환경 변수 설정
+          STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD }}
           GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME || 'storage' }}
           WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
         
@@ -75,17 +78,17 @@ jobs:
     - name: Create Cloud Scheduler Job
       run: |
         # Cloud Function URL 가져오기
-        FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --region=us-west1 --gen2 --format="value(serviceConfig.uri)")
-        
+        FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
+
         echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
 
         # 기존 잡 삭제 (없어도 무시)
         gcloud scheduler jobs delete crypto-rank-tracker-scheduler \
-          --location=us-west1 --quiet || true
+          --location=asia-northeast1 --quiet || true
 
         # 새로운 잡 생성
         gcloud scheduler jobs create http crypto-rank-tracker-scheduler \
-          --location=us-west1 \
+          --location=asia-northeast1 \
           --schedule="*/10 * * * *" \
           --uri="$FUNCTION_URL" \
           --http-method=POST \
@@ -98,6 +101,6 @@ jobs:
     - name: Verify deployment
       run: |
         echo "Function deployed successfully!"
-        gcloud functions describe crypto-rank-tracker --region=us-west1 --gen2 --format="value(serviceConfig.uri)"
+        gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)"
         echo "Scheduler job created/updated:"
-        gcloud scheduler jobs describe crypto-rank-tracker-scheduler --location=us-west1
+        gcloud scheduler jobs describe crypto-rank-tracker-scheduler --location=asia-northeast1
