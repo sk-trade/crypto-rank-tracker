@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional
 
 import aiohttp
 from aiolimiter import AsyncLimiter
@@ -15,12 +15,12 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 # --- 상수 및 사용자 정의 예외 ---
 UPBIT_API_BASE_URL = "https://api.upbit.com/v1"
 
+GLOBAL_LIMITER = AsyncLimiter(8, 1) 
 
 class UpbitAPIError(Exception):
     """Upbit API 호출 실패 시 발생하는 사용자 정의 예외입니다."""
 
     pass
-
 
 # --- API 호출 함수 ---
 async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
@@ -56,21 +56,34 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
         raise UpbitAPIError(f"알 수 없는 오류: {e}") from e
 
 
-async def get_minutes_candles(
+async def get_candles(
     session: aiohttp.ClientSession,
     markets: List[str],
-    unit: int = 10,
+    time_unit: Literal["minutes", "days", "weeks", "months"],
     count: int = 200,
+    minutes_unit: Optional[int] = None,
 ) -> Dict[str, List[CandleData]]:
-    """여러 마켓의 분봉 캔들 데이터를 병렬로 가져옵니다."""
+    """
+    지정된 시간 단위(분, 일, 주, 월)에 대한 캔들 데이터를 병렬로 가져옵니다.
+
+    Args:
+        session: aiohttp ClientSession.
+        markets: 마켓 코드 리스트.
+        time_unit: 'minutes', 'days', 'weeks', 'months' 중 하나.
+        count: 요청할 캔들 수.
+        minutes_unit: 분봉일 경우, 분 단위 (e.g., 1, 3, 5, 10, ...).
+    """
     if not markets:
         return {}
 
-    limiter = AsyncLimiter(5, 1)
+    limiter = GLOBAL_LIMITER
 
     async def _fetch_single_market(market: str) -> tuple[str, List[CandleData]]:
         """단일 마켓의 캔들 데이터를 가져오는 내부 헬퍼 함수입니다."""
-        url = f"{UPBIT_API_BASE_URL}/candles/minutes/{unit}"
+        if time_unit == "minutes":
+            url = f"{UPBIT_API_BASE_URL}/candles/minutes/{minutes_unit}"
+        else:
+            url = f"{UPBIT_API_BASE_URL}/candles/{time_unit}"
         params = {"market": market, "count": count}
         max_retries = 3
 

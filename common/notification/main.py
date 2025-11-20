@@ -3,7 +3,7 @@
 import asyncio
 import datetime
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -18,33 +18,23 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
 async def create_and_dispatch_notification(
-    enriched_tickers: Dict[str, TickerData],
     raw_tickers: List[Dict[str, Any]],
+    enriched_tickers: Dict[str, TickerData],
     current_rankings: Dict[str, int],
     previous_rankings: Dict[str, int],
     SECTORS: Dict[str, List[str]],
     REVERSE_SECTOR_MAP: Dict[str, List[str]],
+    alert_history: Dict[str, AlertHistory], 
+    market_regime: Dict[str, Any],
+    final_alerts: Optional[List[Alert]] = None,
     gcs_client=None,
 ) -> None:
-    """전체 알림 생성 및 발송 파이프라인을 실행합니다."""
-    # 1. 상태 로드
-    alert_history = await load_alert_history(gcs_client)
+    """시장 브리핑을 생성하고, 최종 알림이 있을 경우 함께 전송합니다."""
 
-    # 2. 시그널 탐지 및 필터링
-    raw_candidates = detect_anomalies(enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
-    # 시장 전체 이벤트 필터 적용
-    filtered_candidates = filter_market_wide_events(raw_candidates, enriched_tickers)
-
-    # 3. 시그널 분류
-    engine = AlertEngine()
-    final_alerts = engine.process_signals(
-        filtered_candidates, enriched_tickers, alert_history
-    )
-
-    # 4. 메시지 포매팅
+    # 메시지 포매팅
     formatter = NotificationFormatter()
     message = formatter.format_daily_briefing(
-        alerts=final_alerts,
+        alerts=final_alerts or [], # final_alerts가 None이면 빈 리스트 전달
         raw_tickers=raw_tickers,
         enriched_tickers=enriched_tickers,
         current_rankings=current_rankings,
@@ -52,25 +42,29 @@ async def create_and_dispatch_notification(
         SECTORS=SECTORS,
         REVERSE_SECTOR_MAP=REVERSE_SECTOR_MAP,
         alert_history=alert_history,
+        market_regime=market_regime,
     )
-
-    # 5. 알림 전송
+    
+    # 알림 전송
     if not message:
-        logger.info("알림을 보낼 유의미한 시그널이 없습니다.")
-    else:
-        use_channel_mention = False
-        if final_alerts:
-            top_alert = final_alerts[0]
-            if top_alert.priority >= 2 and top_alert.candidate.confidence >= 0.75:
-                use_channel_mention = True
+        logger.info("알림을 보낼 메시지가 없습니다.")
+        return
 
-        final_message = f"@channel\n{message}" if use_channel_mention else message
-        await send_notification(final_message)
-        logger.info("알림 메시지를 생성하여 전송했습니다.")
+    # 우선순위 높은 알림이 있을 때만 @channel 멘션
+    use_channel_mention = False
+    if final_alerts:
+        top_alert = final_alerts[0]
+        if top_alert.priority >= 2: 
+            use_channel_mention = True
 
-    # 6. 상태 저장
-    updated_history = _update_alert_history(alert_history, final_alerts)
-    await save_alert_history(updated_history, gcs_client)
+    final_message = f"@channel\n{message}" if use_channel_mention else message
+    await send_notification(final_message)
+    logger.info("알림 메시지를 생성하여 전송했습니다.")
+
+    # 상태 저장 (알림이 발생했을 때만 히스토리 업데이트)
+    if final_alerts:
+        updated_history = _update_alert_history(alert_history, final_alerts)
+        await save_alert_history(updated_history, gcs_client)
 
 
 def _update_alert_history(

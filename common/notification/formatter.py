@@ -1,6 +1,5 @@
 # common/notification/formatter.py
 
-# common/notification/formatter.py
 """분석된 데이터를 기반으로 사용자에게 보여질 최종 알림 메시지를 생성합니다."""
 
 import datetime
@@ -24,6 +23,7 @@ class NotificationFormatter:
         SECTORS: Dict[str, List[str]],
         REVERSE_SECTOR_MAP: Dict[str, List[str]],
         alert_history: Dict[str, AlertHistory],
+        market_regime: Dict[str, Any],
     ) -> str:
         """시장 브리핑 전체 메시지를 조립합니다."""
         kst = datetime.timezone(datetime.timedelta(hours=9))
@@ -32,16 +32,20 @@ class NotificationFormatter:
         parts = [f"📊 **업비트 마켓 브리핑 ({now_kst.strftime('%H:%M')} KST)**"]
         parts.append(self._format_market_status(raw_tickers, enriched_tickers))
 
-        if leading_sectors_str := self._format_leading_sectors(enriched_tickers, SECTORS):
-            parts.extend(["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str])
+        try:
+            # lightweight_tickers에는 1시간 데이터가 없으므로 예외 처리
+            if leading_sectors_str := self._format_leading_sectors(enriched_tickers, SECTORS):
+                parts.extend(["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str])
+        except Exception:
+            pass
 
         if alerts:
             parts.extend(["\n---", "⚡ **실시간 마켓 이벤트**"])
-            for alert in alerts[:10]:  # 최대 10개 알림
-                previous_alert = alert_history.get(alert.candidate.market)
-                parts.append(
-                    self._format_single_alert(alert, REVERSE_SECTOR_MAP, previous_alert)
-                )
+            for alert in alerts[:10]:
+                parts.append(self._format_single_alert(alert, REVERSE_SECTOR_MAP, market_regime))
+        else:
+            parts.append("\n---")
+            parts.append("✅ 특이사항 없음. 시장을 계속 주시합니다.")
 
         parts.append(self._format_top_10_ranking(current_rankings, previous_rankings))
 
@@ -82,37 +86,84 @@ class NotificationFormatter:
     def _format_leading_sectors(
         self, enriched_tickers: Dict[str, TickerData], SECTORS: Dict[str, List[str]]
     ) -> Optional[str]:
-        """주도 섹터 분석 및 문자열을 생성합니다."""
+        """
+        [Advanced] 시장 대비 초과 수익(Alpha)과 다중 시간대(1H, 4H) 검증을 통한 주도 섹터 발굴
+        """
+        # 시장 전체 평균 (Benchmark) 계산
+        all_changes_1h = [t.price_change_1h for t in enriched_tickers.values() if t.price_change_1h is not None]
+        all_changes_4h = [t.price_change_4h for t in enriched_tickers.values() if t.price_change_4h is not None]
+        
+        if not all_changes_1h or not all_changes_4h: return None
+        
+        market_avg_1h = np.mean(all_changes_1h)
+        market_avg_4h = np.mean(all_changes_4h)
+        
+        # 시장 상황(Regime)에 따른 동적 임계값 설정
+        if market_avg_1h > 0:
+            min_alpha_1h = 2.0  # 상승장: 시장보다 2%p 더 강해야 함
+            header_icon = "🚀"
+            header_text = "주도 섹터 (상승장)"
+        else:
+            min_alpha_1h = 1.5  # 하락장: 1.5%p만 방어해도 훌륭함
+            header_icon = "🛡️"
+            header_text = "방어 섹터 (하락장)"
+
         sector_perf = {}
+        
         for name, coins in SECTORS.items():
-            returns = [
-                t.price_change_1h
-                for c in coins
-                if (t := enriched_tickers.get(c)) and t.price_change_1h is not None
-            ]
-            if len(returns) < 3:
-                continue
+            # 데이터 유효성 체크
+            tickers = [enriched_tickers.get(c) for c in coins if enriched_tickers.get(c)]
+            valid_tickers = [t for t in tickers if t.price_change_1h is not None and t.price_change_4h is not None]
+            
+            if len(valid_tickers) < 4: continue # 최소 4개 종목 이상인 섹터만 분석
+            
+            # 섹터 지표 계산
+            avg_return_1h = np.mean([t.price_change_1h for t in valid_tickers])
+            avg_return_4h = np.mean([t.price_change_4h for t in valid_tickers])
+            avg_rvol = np.mean([t.relative_volume or 1.0 for t in valid_tickers])
+            
+            # Alpha (초과 수익)
+            alpha_1h = avg_return_1h - market_avg_1h
+            alpha_4h = avg_return_4h - market_avg_4h
+            
+            # Breadth (너비) - 대장주 착시 방지
+            beating_market_count = sum(1 for t in valid_tickers if t.price_change_1h > market_avg_1h)
+            breadth_ratio = beating_market_count / len(valid_tickers)
+            
+            # 섹터 크기에 따른 Breadth 기준 차등 
+            min_breadth = 0.6 if len(valid_tickers) >= 10 else 0.75
 
-            avg_return = np.mean(returns)
-            rising_count = sum(1 for r in returns if r > 0)
-
-            if avg_return > 1.5 and (rising_count / len(returns)) >= 0.6:
+            # 필터링 
+            if (
+                alpha_1h > min_alpha_1h and
+                alpha_4h > 0.5 and          
+                avg_rvol > 1.5 and          
+                breadth_ratio >= min_breadth
+            ):
                 sector_perf[name] = {
-                    "avg_return": avg_return,
-                    "consistency": f"{rising_count}/{len(returns)} 상승",
+                    "alpha_1h": alpha_1h,
+                    "alpha_4h": alpha_4h,
+                    "avg_rvol": avg_rvol,
+                    "consistency": f"{beating_market_count}/{len(valid_tickers)}",
+                    "score": alpha_1h * 0.7 + alpha_4h * 0.3
                 }
 
         if not sector_perf:
             return None
 
+        # 점수순 정렬
         sorted_sectors = sorted(
-            sector_perf.items(), key=lambda item: item[1]["avg_return"], reverse=True
+            sector_perf.items(), key=lambda item: item[1]["score"], reverse=True
         )
-        lines = [
-            f"- **{name} ({perf['consistency']}):** 1시간 평균 `{perf['avg_return']:.2f}%` 상승"
-            for name, perf in sorted_sectors[:3]
-        ]
-        return "\n".join(lines)
+        
+        lines = []
+        for name, perf in sorted_sectors[:5]: 
+            lines.append(
+                f"- **{name} ({perf['consistency']}):** "
+                f"Alpha `{perf['alpha_1h']:+.1f}%p` (RVOL {perf['avg_rvol']:.1f}x)"
+            )
+            
+        return f"\n---\n{header_icon} **{header_text}**\n" + "\n".join(lines)
 
     def _format_top_10_ranking(
         self, current_rankings: Dict[str, int], previous_rankings: Dict[str, int]
@@ -140,75 +191,44 @@ class NotificationFormatter:
         self,
         alert: Alert,
         reverse_sector_map: Dict[str, List[str]],
-        previous_alert: Optional[AlertHistory],
+        market_regime: Dict[str, Any],
     ) -> str:
-        """단일 알림에 대한 사용자 친화적인 메시지를 생성합니다."""
+        """단일 알림을 객관적인 Signal Checklist 포맷으로 생성합니다."""
         candidate = alert.candidate
         ticker = alert.ticker_data
         market = candidate.market
         tag = reverse_sector_map.get(market, [""])[0]
 
         signal_map = {
-            "BREAKOUT_START": "초기 돌파 시작", "MOMENTUM_ACCELERATION": "상승 모멘텀 가속",
-            "BREAKDOWN_START": "초기 이탈 시작", "DOWNTREND_ACCELERATION": "하락 모멘텀 가속",
-            "BULL_MOMENTUM_SUSTAINED": "모멘텀 지속", "BULL_MOMENTUM_FAILED": "상승 모멘텀 실패",
-            "BEAR_MOMENTUM_SUSTAINED": "모멘텀 지속", "BEAR_MOMENTUM_FAILED": "하락 모멘텀 실패",
+            "MOMENTUM_ACCELERATION": "상승 모멘텀 가속",
+            "BREAKOUT_START": "초기 돌파 시작",
+            "BREAKDOWN_START": "초기 이탈 시작",
             "UNUSUAL_ACTIVITY": "특이 거래 활동",
         }
         signal_title = signal_map.get(alert.signal_type, "주요 변동")
-        icon = "🔥" if "BULL" in alert.signal_type or "BREAKOUT" in alert.signal_type or "ACCELERATION" in alert.signal_type else "🧊"
-
+        
+        icon = "🔥" if (candidate.price_change or 0) > 0 else "🧊"
         header = (
-            f"{icon} **{market}{f' ({tag})' if tag else ''}: {candidate.price_change:+.1f}%** "
-            f"({signal_title})\n   현재가: `{candidate.current_price:,.4f}`원"
+            f"{icon} **{market.split('-')[1]}{f' ({tag})' if tag else ''}: "
+            f"{signal_title}** (신뢰도: {candidate.confidence:.0%})"
         )
-        features = self._build_alert_features(candidate, ticker)
-        interpretation = self._build_alert_interpretation(alert, previous_alert)
-        risk = f"⚠️ **리스크:** `{'높음' if ticker.volatility_tier in ['VERY_HIGH', 'EXTREME'] else '중간'}` (변동성: {ticker.volatility_tier})"
 
-        return "\n\n".join(filter(None, [header, features, interpretation, risk]))
+        decoupling_score = ticker.decoupling_score
 
-    def _build_alert_features(self, candidate, ticker) -> str:
-        """알림의 주요 특징(거래량, 시장 관계 등) 문자열을 생성합니다."""
-        parts = []
-        z = candidate.rvol_z_score
-        rarity = "★★★ (극도로 이례적)" if z > 7 else "★★☆ (매우 이례적)" if z > 5 else "★☆☆ (이례적)"
-        parts.append(f"• **거래량:** 평소의 `{candidate.rvol:.1f}배` (특이성: {rarity})")
-
-        if ticker.decoupling_score is not None:
-            desc = ""
-            if ticker.decoupling_status == "STRONG_DECOUPLE": desc = "BTC/ETH 역행"
-            elif "AMPLIFIED" in ticker.decoupling_status: desc = "시장 모멘텀 증폭"
-            if desc: parts.append(f"• **시장 관계:** {desc} (`{ticker.decoupling_score:+.1f}%p`)")
-
-        if isinstance(ticker.candle_shape, dict) and ticker.candle_shape.get("type") != "NORMAL":
-            shape_map = {"STRONG_REJECTION_UP": "강한 상방 저항", "STRONG_SUPPORT_DOWN": "강한 하방 지지", "STRONG_MOMENTUM": "강한 모멘텀"}
-            if shape_text := shape_map.get(ticker.candle_shape["type"]):
-                parts.append(f"• **캔들 분석:** `{shape_text}` (신뢰도: {ticker.candle_shape['reliability']})")
+        checklist = [
+            "```",
+            "--- Signal Checklist ---",
+            f"[10min] Price Change    : {candidate.price_change:+.2f}%",
+            f"[10min] RVOL            : {candidate.rvol:.1f}x (Z-Score: {candidate.rvol_z_score:.1f})",
+            f"[ 1hr ] Trend           : {ticker.trend_1h_stable}",
+            f"[Daily] Above MA50      : {ticker.is_above_ma50_daily}",
+            f"[Daily] Above MA200     : {ticker.is_above_ma200_daily}",
+            f"[Market] Regime        : {market_regime.get('regime', 'N/A')}",
+        ]
+        if decoupling_score is not None:
+                checklist.append(f"[Market] Decoupling    : {decoupling_score:+.1f}%p vs BTC")
         
-        if candidate.contexts: parts.append(f"• **추가 맥락:** {', '.join(candidate.contexts)}")
-        return "\n".join(parts)
-
-    def _build_alert_interpretation(self, alert, previous_alert) -> str:
-        """알림에 대한 종합 해석 문자열을 생성합니다."""
-        parts = []
-        ticker = alert.ticker_data
-        candidate = alert.candidate
-        market_short = candidate.market.split("-")[1]
-
-        if ticker.decoupling_status == "STRONG_DECOUPLE" and ticker.decoupling_score > 0:
-            parts.append(f"시장의 조용한 흐름에도 불구하고, **{market_short}에만 집중된 강력한 매수세**가 유입된 것으로 보입니다.")
+        checklist.append("```")
         
-        if isinstance(ticker.candle_shape, dict) and ticker.candle_shape.get("reliability") == "HIGH":
-            shape_type = ticker.candle_shape.get("type")
-            if shape_type == "STRONG_MOMENTUM": parts.append("거래량을 동반한 꽉 찬 양봉은 현재 상승 방향에 대한 시장의 강한 확신을 보여줍니다.")
-            elif shape_type == "STRONG_SUPPORT_DOWN": parts.append("하락 시도가 강력한 매수세에 의해 차단되며, 단기적인 저점 방어에 성공한 모습입니다.")
+        return "\n".join([header] + checklist)
 
-        if candidate.rvol_z_score > 5.0: parts.append("통계적으로 매우 이례적인 거래량은 기관 또는 고래의 개입을 강하게 시사합니다.")
-
-        if "SUSTAINED" in alert.signal_type and previous_alert:
-            change = (candidate.current_price / previous_alert.initial_price - 1) * 100
-            elapsed = (datetime.datetime.now(datetime.timezone.utc) - previous_alert.initial_timestamp).total_seconds() / 60
-            parts.append(f"최초 알림 후 `{elapsed:.0f}분` 동안 모멘텀이 이어져 `{change:+.2f}%` 누적 변동되었습니다.")
-        
-        return "**[종합 해석]**\n" + "\n".join(f"→ {p}" for p in parts) if parts else ""

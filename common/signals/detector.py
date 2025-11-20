@@ -14,6 +14,7 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 def detect_anomalies(
     enriched_tickers: Dict[str, TickerData],
+    current_rankings: Dict[str, int], 
     SECTORS: Dict[str, List[str]],
     REVERSE_SECTOR_MAP: Dict[str, List[str]],
 ) -> List[SignalCandidate]:
@@ -30,12 +31,11 @@ def detect_anomalies(
         if mad > 0:
             for ticker in enriched_tickers.values():
                 if ticker.relative_volume is not None:
-                    # MAD를 사용한 강건한 Z-score 계산
                     ticker.rvol_z_score = (
                         ticker.relative_volume - median_rvol
                     ) / (1.4826 * mad)
 
-    # 2. 현재 거래량의 백분위수 계산 (거래량 수준 평가용)
+    # 현재 거래량의 백분위수 계산 (거래량 수준 평가용)
     current_volumes = {
         market: ticker.candle_history[-1].volume
         for market, ticker in enriched_tickers.items()
@@ -43,23 +43,20 @@ def detect_anomalies(
     }
     volume_series = pd.Series(current_volumes)
 
-    # 3. 각 티커를 순회하며 시그널 후보 생성
+    # 각 티커를 순회하며 시그널 후보 생성
     candidates = []
     for market, ticker in enriched_tickers.items():
-        if not (
-            ticker.rvol_z_score and ticker.rvol_z_score > config.ROBUST_Z_SCORE_THRESHOLD
-        ):
+        z_score = ticker.rvol_z_score or 0
+        price_change = abs(ticker.price_change_10m or 0)
+        rank = current_rankings.get(market, 999)
+
+        if z_score > 5.0 and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE:
+            continue
+        if z_score <= config.ROBUST_Z_SCORE_THRESHOLD and price_change < config.ALERT_MIN_PRICE_CHANGE_10M:
             continue
 
-        volume_percentile = (
-            (volume_series < current_volumes.get(market, 0)).mean()
-            if not volume_series.empty
-            else 0.5
-        )
-        sector_corr = calculate_sector_correlation(
-            market, enriched_tickers, SECTORS, REVERSE_SECTOR_MAP
-        )
-        confidence = calculate_confidence_score(ticker, sector_corr, volume_percentile)
+        sector_corr = calculate_sector_correlation(market, enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
+        confidence = calculate_confidence_score(ticker, sector_corr, rank)
 
         if confidence >= config.CONFIDENCE_THRESHOLD:
             contexts = _build_contexts(ticker)
@@ -75,7 +72,6 @@ def detect_anomalies(
             candidates.append(candidate)
 
     return sorted(candidates, key=lambda x: x.confidence, reverse=True)
-
 
 def _build_contexts(ticker: TickerData) -> List[str]:
     """TickerData를 기반으로 시그널에 대한 컨텍스트 문자열 리스트를 생성합니다."""
@@ -135,62 +131,60 @@ def calculate_sector_correlation(
     return max(0, (correlation - 0.5) * 2)
 
 
-def calculate_confidence_score(
-    ticker: TickerData, sector_corr: float, volume_percentile: float
-) -> float:
-    """다양한 지표를 가중 합산하여 시그널의 신뢰도 점수를 0과 1 사이로 계산합니다."""
+def calculate_confidence_score(ticker: TickerData, sector_corr: float, rank: int) -> float:
+    """
+    코인의 순위(체급)에 따라 목표치를 다르게 적용하여 점수를 매깁니다.
+    - 메이저: 작은 변동에도 높은 점수 부여
+    - 잡코인: 큰 변동이 있어야 점수 부여
+    """
     score = 0.0
-    weights = {
-        "z_score_base": 0.35,
-        "trend_alignment": 0.20,
-        "price_volume_corr": 0.15,
-        "decoupling_bonus": 0.15,
-        "candle_shape_bonus": 0.10,
-        "sector_corr_bonus": 0.10,
-        "bb_bonus": 0.10,
-        "consistency_bonus": 0.10,
-    }
-
+    
+    z_score = ticker.rvol_z_score or 0
     price_change_abs = abs(ticker.price_change_10m or 0)
-    z_score = ticker.rvol_z_score or 0.0
+    
+    # 순위에 따른 목표 가격 변동폭 설정
+    if rank <= config.RANK_THRESHOLD_MAJOR:
+        target_price_change = config.MAJOR_MIN_PRICE_CHANGE
+    elif rank <= config.RANK_THRESHOLD_MID:
+        target_price_change = config.MID_MIN_PRICE_CHANGE
+    else:
+        target_price_change = config.MINOR_MIN_PRICE_CHANGE
 
-    # --- 1. 핵심 점수 항목 ---
-    score += min((z_score / 10.0), 1.0) * weights["z_score_base"]
-    if ticker.trend_1h == "UP" and ticker.trend_4h == "UP":
-        score += weights["trend_alignment"]
-    elif ticker.trend_1h == "UP":
-        score += weights["trend_alignment"] * 0.5
-    if price_change_abs > 1.0 and z_score > 3.5:
-        score += min(price_change_abs / 5.0, 1.0) * weights["price_volume_corr"]
+    # 가격 모멘텀 점수 (최대 0.4)
+    # 목표치를 초과 달성할수록 점수가 높아짐 (비율로 계산)
+    
+    momentum_ratio = price_change_abs / target_price_change
+    if momentum_ratio >= 1.0:
+        score += 0.2 # 목표 달성 시 기본 0.2 확보
+        # 목표의 2배 달성 시 추가 0.2 (최대 0.4)
+        score += min((momentum_ratio - 1.0) * 0.2, 0.2)
+    else:
+        # 목표 미달 시 비율만큼 점수 (0 ~ 0.2)
+        score += momentum_ratio * 0.2
+    
+    # 거래량 폭발 (최대 0.2)
+    # Z-Score는 통계적 수치라 순위 상관없이 절대평가 가능 (Cap 10.0 기준)
+    score += min(z_score / 20.0, 0.2) 
 
-    # --- 2. 보너스 점수 항목 ---
-    if ticker.decoupling_status == "STRONG_DECOUPLE":
-        score += min(abs(ticker.decoupling_score or 0) / 5.0, 1.0) * weights["decoupling_bonus"]
-    elif "AMPLIFIED" in ticker.decoupling_status:
-        score += min(abs(ticker.decoupling_score or 0) / 5.0, 1.0) * weights["decoupling_bonus"] * 0.5
-    if isinstance(ticker.candle_shape, dict) and ticker.candle_shape.get("reliability") in ["HIGH", "MEDIUM"]:
-        shape_type = ticker.candle_shape.get("type")
-        if shape_type == "STRONG_MOMENTUM":
-            score += weights["candle_shape_bonus"]
-        elif shape_type == "STRONG_SUPPORT_DOWN":
-            score += weights["candle_shape_bonus"] * 0.7
-    score += sector_corr * weights["sector_corr_bonus"]
-    if ticker.bb_status == "BREAKOUT_UPPER":
-        score += weights["bb_bonus"]
-    elif ticker.bb_status == "SQUEEZE":
-        score += weights["bb_bonus"] * 0.5
-    score += ticker.rvol_consistency_score * weights["consistency_bonus"]
+    # 추세 정렬 (최대 0.2)
+    if (ticker.price_change_10m or 0) > 0:
+        if ticker.trend_1h_stable == "UP": score += 0.1
+        if ticker.is_above_ma50_daily: score += 0.1
+    elif (ticker.price_change_10m or 0) < 0:
+        if ticker.trend_1h_stable == "DOWN": score += 0.1
+        if not ticker.is_above_ma50_daily: score += 0.1
 
-    # --- 3. 조정 및 페널티 ---
-    if volume_percentile > 0.8:
-        score += 0.05
-    elif volume_percentile < 0.2:
-        score -= 0.10
-    if ticker.volatility_tier == "EXTREME" and price_change_abs > 10:
-        score *= 0.8
+    # 보너스 (섹터, 디커플링)
+    score += sector_corr * 0.1
+    
+    if ticker.decoupling_score and abs(ticker.decoupling_score) > config.DECOUPLING_MIN_DEVIATION_PCT:
+        score += 0.1
+        
+    # 페널티 (변동성 없는 거래량 - Wash Trading)
+    if z_score > 3.0 and price_change_abs < config.WASH_TRADING_MIN_PRICE_CHANGE:
+        score -= 0.3 
 
-    return min(max(score, 0), 1.0)
-
+    return min(max(score, 0.0), 0.95)
 
 def filter_market_wide_events(
     candidates: List[SignalCandidate], enriched_tickers: Dict[str, TickerData]

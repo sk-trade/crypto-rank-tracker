@@ -35,17 +35,38 @@ STATE_HISTORY_COUNT = 12  # 순위 분석에 사용할 과거 데이터 수
 
 # -- ANALYSIS & ALERTING POLICY --
 
+# [통계 보정 설정]
+MAX_Z_SCORE_CAP = 10.0          # Z-Score 상한선 (통계 왜곡 방지)
+MIN_MAD_FLOOR = 0.001           # Z-Score 분모 0 방지
 
-# --- 1. Signal Detector Settings (1차 후보군 필터링) ---
-CONFIDENCE_THRESHOLD = 0.2      # 후보군으로 포함될 최소 신뢰도 점수
-ROBUST_Z_SCORE_THRESHOLD = 3.5  # RVOL 이상 현상으로 판단할 최소 Z-score
-DECOUPLING_MIN_DEVIATION_PCT = 2.0 # 강력한 디커플링으로 판단할 최소 편차 (%p)
+# [Wash Trading 필터]
+# 거래량 제한
+WASH_TRADING_MIN_PRICE_CHANGE = 0.5 
 
-# --- 2. Alert Gatekeeper Policy (최종 알림 발송 조건) ---
-# 아래 기준을 모두 통과해야만 최종 알림이 발송됩니다.
-ALERT_MIN_PRICE_CHANGE_10M = 2.0  # 최소 10분간 2% 이상 가격 변동
-ALERT_MIN_CONFIDENCE = 0.65       # 최소 신뢰도 65% 이상
+# [Dynamic Thresholds - 순위별 차등 적용]
+# 메이저 (Top 50)
+RANK_THRESHOLD_MAJOR = 50
+MAJOR_MIN_PRICE_CHANGE = 1.5
+MAJOR_MIN_Z_SCORE = 3.0
 
-# --- 3. Alert Cooldown Policy (알림 반복 방지) ---
-ALERT_COOLDOWN_MINUTES = 60       # 같은 코인은 60분 동안 재알림 금지 (단, 예외 있음)
-SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT = 0.5 # 쿨다운 중 추가 알림을 보낼 최소 변동률
+# 중위권 (Top 50 ~ 100)
+RANK_THRESHOLD_MID = 100
+MID_MIN_PRICE_CHANGE = 2.5
+MID_MIN_Z_SCORE = 4.0
+
+# 하위권 (Top 100 밖 - 잡코인)
+MINOR_MIN_PRICE_CHANGE = 5.0  # 5% 이상 급등해야 인정
+MINOR_MIN_Z_SCORE = 5.0       # 거래량도 확실해야 함
+
+# [1차 필터링 공통]
+CONFIDENCE_THRESHOLD = 0.5      
+ROBUST_Z_SCORE_THRESHOLD = 3.0  
+DECOUPLING_MIN_DEVIATION_PCT = 3.0 
+
+# [2차 알림 게이트키퍼]
+ALERT_MIN_PRICE_CHANGE_10M = 0.8  # 최소 변동폭 (스캘핑 마지노선)
+ALERT_MIN_CONFIDENCE = 0.70       
+
+# [쿨다운]
+ALERT_COOLDOWN_MINUTES = 60       
+SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT = 1.0

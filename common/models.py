@@ -23,8 +23,7 @@ class TickerData(BaseModel):
 
     market: str
     candle_history: List[CandleData] = []
-    price_change_10m: Optional[float] = None
-    relative_volume: Optional[float] = None
+    
     is_breakout: bool = False
     trend_1h: str = "NEUTRAL"
     trend_4h: str = "NEUTRAL"
@@ -33,17 +32,29 @@ class TickerData(BaseModel):
     rvol_vs_yesterday: Optional[float] = None
     volume_acceleration: Optional[float] = None
     rvol_consistency_score: float = 0.0
-    price_change_1h: Optional[float] = None
-    price_change_4h: Optional[float] = None
     rvol_1h_avg: Optional[float] = None
     is_breaking_1h_high: bool = False
+    
+    # --- 기본 분석용 ---
+    price_change_10m: Optional[float] = None
+    relative_volume: Optional[float] = None
     rvol_z_score: Optional[float] = None
-    decoupling_status: str = "COUPLED"  # e.g., "COUPLED", "STRONG_DECOUPLE"
-    decoupling_score: Optional[float] = None
-    candle_shape: Dict[str, Any] = Field(
-        default_factory=dict
-    )  # e.g., {'type': 'STRONG_MOMENTUM', 'reliability': 'HIGH'}
+    price_change_1h: Optional[float] = None
+    price_change_4h: Optional[float] = None
+    
 
+    # --- 심층 분석용 필드  ---
+    decoupling_status: str = "COUPLED"
+    decoupling_score: Optional[float] = None
+    hourly_candles: List[CandleData] = [] 
+    daily_candles: List[CandleData] = []
+    
+    trend_1h_stable: str = "NEUTRAL"
+    is_above_ma50_daily: bool = False
+    is_above_ma200_daily: bool = False
+    final_confidence: Optional[float] = None
+
+    candle_shape: Dict[str, Any] = Field(default_factory=dict)
 
 class SignalCandidate(BaseModel):
     """1차 분석을 통해 생성된 잠재적 시그널 후보입니다."""
