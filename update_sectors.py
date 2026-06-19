@@ -149,13 +149,15 @@ async def main():
         logging.info("1. Upbit KRW 마켓 목록 가져오기...")
         upbit_markets = await get_upbit_krw_markets(session)
         if not upbit_markets:
-            return
+            logging.error("Upbit KRW 마켓 목록이 비어 있습니다.")
+            raise RuntimeError("Upbit KRW 마켓 목록 조회 결과가 비어 있습니다.")
         logging.info(f"   -> {len(upbit_markets)}개 KRW 마켓 확인.")
 
         logging.info("2. CoinGecko 전체 코인 목록 가져오기...")
         cg_symbol_to_id = await get_coingecko_coins_list(session)
         if not cg_symbol_to_id:
-            return
+            logging.error("CoinGecko 코인 목록이 비어 있습니다.")
+            raise RuntimeError("CoinGecko 코인 목록 조회 결과가 비어 있습니다.")
         logging.info(f"   -> {len(cg_symbol_to_id)}개 코인 ID 확인.")
 
         logging.info(f"3. {len(upbit_markets)}개 마켓에 대한 자동 태깅 시작...")
@@ -173,6 +175,7 @@ async def main():
             logging.info(f"'{config.SECTOR_MAP_FILE_NAME}' 파일 저장 완료 ({storage_type}).")
         except Exception as e:
             logging.error(f"'{config.SECTOR_MAP_FILE_NAME}' 파일 저장 중 오류 발생: {e}")
+            raise
 
         _print_summary(sector_map, start_time)
 

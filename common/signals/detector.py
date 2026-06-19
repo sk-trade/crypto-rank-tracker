@@ -65,7 +65,7 @@ def detect_anomalies(
                 confidence=confidence,
                 price_change=ticker.price_change_10m or 0.0,
                 rvol=ticker.relative_volume or 0.0,
-                rvol_z_score=ticker.rvol_z_score,
+                rvol_z_score=ticker.rvol_z_score or 0.0,
                 contexts=contexts,
                 current_price=ticker.candle_history[-1].close_price,
             )
@@ -191,6 +191,9 @@ def filter_market_wide_events(
 ) -> List[SignalCandidate]:
     """시장 전체가 급등/급락하는 이벤트와 개별 종목의 이상 현상을 구분합니다."""
     total = len(enriched_tickers)
+    if total == 0:
+        return candidates
+
     strong_gainers = sum(
         1
         for t in enriched_tickers.values()

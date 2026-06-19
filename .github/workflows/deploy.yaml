@@ -2,109 +2,146 @@ name: Deploy to Google Cloud Functions
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
-  deploy:
+  verify:
     runs-on: ubuntu-latest
-   
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run python -m pytest
+
+      - name: Compile Python sources
+        run: uv run python -m compileall main.py config.py common tests
+
+      - name: Build package
+        run: uv build
+
+  deploy:
+    needs: verify
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+
     # GCP에 인증하기 위한 권한 설정
     permissions:
       contents: 'read'
       id-token: 'write'
-    
+
     steps:
-    # GitHub 리포지토리의 코드를 가져옴
-    - name: Checkout repository
-      uses: actions/checkout@v4  
-    
-    # Python 환경 설정
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    # uv 설치
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
+      # GitHub 리포지토리의 코드를 가져옴
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    # uv 캐시 활성화
-    - name: Restore uv cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/uv
-        key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-uv-
+      # Python 환경 설정
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
 
-    # uv로 의존성 동기화
-    - name: Install dependencies
-      run: uv sync --frozen
+      # uv 설치
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
 
-    # uv에서 requirements.txt 생성 (GCF 배포용)
-    - name: Generate requirements.txt
-      run: |
-        uv export --format requirements-txt --output-file requirements.txt
-        echo "Generated requirements.txt:"
-        cat requirements.txt
-    
-    # Google Cloud에 인증
-    - name: Authenticate to Google Cloud
-      uses: 'google-github-actions/auth@v2' 
-      with:
-        workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-        service_account: ${{ secrets.GCP_SA_EMAIL }}
-    
-    # Google Cloud Functions에 배포
-    - name: Deploy Function
-      id: deploy
-      uses: 'google-github-actions/deploy-cloud-functions@v3'  
-      with:
-        name: crypto-rank-tracker          # 배포할 함수 이름
-        runtime: python311                # 파이썬 런타임 버전
-        entry_point: main                 # 진입점 함수 이름
-        region: asia-northeast1                  # 리전
-        source_dir: ./                    # 소스 코드 디렉토리
-        service_account: ${{ secrets.GCP_SA_EMAIL }} # 서비스 계정
-        memory: 512M
-        timeout: 540                      # ← 타임아웃 (초 단위)
-        max_instances: 1                  # ← 최대 동시 인스턴스
-        environment_variables: |          # 환경 변수 설정
-          STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD }}
-          GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME || 'storage' }}
-          WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
-        
-    # Cloud Scheduler 설정 (10분마다 실행)
-    - name: Create Cloud Scheduler Job
-      run: |
-        # Cloud Function URL 가져오기
-        FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
+      # uv 캐시 활성화
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
 
-        echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
+      # uv로 의존성 동기화
+      - name: Install dependencies
+        run: uv sync --frozen
 
-        # 기존 잡 삭제 (없어도 무시)
-        gcloud scheduler jobs delete crypto-rank-tracker-scheduler \
-          --location=asia-northeast1 --quiet || true
+      # uv에서 requirements.txt 생성 (GCF 배포용)
+      - name: Generate requirements.txt
+        run: |
+          uv export --format requirements-txt --no-dev --output-file requirements.txt
+          echo "Generated requirements.txt:"
+          cat requirements.txt
 
-        # 새로운 잡 생성
-        gcloud scheduler jobs create http crypto-rank-tracker-scheduler \
-          --location=asia-northeast1 \
-          --schedule="*/10 * * * *" \
-          --uri="$FUNCTION_URL" \
-          --http-method=POST \
-          --oidc-service-account-email=${{ secrets.GCP_SA_EMAIL }} \
-          --attempt-deadline=15m \
-          --time-zone="Asia/Seoul" \
-          --description="10분마다 업비트 랭킹 체크"
+      # Google Cloud에 인증
+      - name: Authenticate to Google Cloud
+        uses: 'google-github-actions/auth@v2'
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
 
-    # 배포 결과 확인
-    - name: Verify deployment
-      run: |
-        echo "Function deployed successfully!"
-        gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)"
-        echo "Scheduler job created/updated:"
-        gcloud scheduler jobs describe crypto-rank-tracker-scheduler --location=asia-northeast1
+      # Google Cloud Functions에 배포
+      - name: Deploy Function
+        id: deploy
+        uses: 'google-github-actions/deploy-cloud-functions@v3'
+        with:
+          name: crypto-rank-tracker          # 배포할 함수 이름
+          runtime: python311                # 파이썬 런타임 버전
+          entry_point: main                 # 진입점 함수 이름
+          region: asia-northeast1                  # 리전
+          source_dir: ./                    # 소스 코드 디렉토리
+          service_account: ${{ secrets.GCP_SA_EMAIL }} # 서비스 계정
+          memory: 512M
+          timeout: 540                      # ← 타임아웃 (초 단위)
+          max_instances: 1                  # ← 최대 동시 인스턴스
+          environment_variables: |          # 환경 변수 설정
+            STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD }}
+            GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME || 'storage' }}
+            WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+
+      # Cloud Scheduler 설정 (10분마다 실행)
+      - name: Create Cloud Scheduler Job
+        run: |
+          # Cloud Function URL 가져오기
+          FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
+
+          echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
+
+          # 기존 잡 삭제 (없어도 무시)
+          gcloud scheduler jobs delete crypto-rank-tracker-scheduler \
+            --location=asia-northeast1 --quiet || true
+
+          # 새로운 잡 생성
+          gcloud scheduler jobs create http crypto-rank-tracker-scheduler \
+            --location=asia-northeast1 \
+            --schedule="*/10 * * * *" \
+            --uri="$FUNCTION_URL" \
+            --http-method=POST \
+            --oidc-service-account-email=${{ secrets.GCP_SA_EMAIL }} \
+            --attempt-deadline=15m \
+            --time-zone="Asia/Seoul" \
+            --description="10분마다 업비트 랭킹 체크"
+
+      # 배포 결과 확인
+      - name: Verify deployment
+        run: |
+          echo "Function deployed successfully!"
+          gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)"
+          echo "Scheduler job created/updated:"
+          gcloud scheduler jobs describe crypto-rank-tracker-scheduler --location=asia-northeast1
