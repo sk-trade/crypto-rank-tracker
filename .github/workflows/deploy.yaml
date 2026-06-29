@@ -112,7 +112,7 @@ jobs:
           max_instances: 1                  # ← 최대 동시 인스턴스
           environment_variables: |          # 환경 변수 설정
             STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD }}
-            GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME || 'storage' }}
+            GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
             WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
 
       # Cloud Scheduler 설정 (10분마다 실행)

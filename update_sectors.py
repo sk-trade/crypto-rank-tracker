@@ -129,6 +129,8 @@ async def tag_market(
 
 async def main():
     """스크립트의 메인 실행 함수입니다."""
+    config.validate_storage_config()
+
     start_time = datetime.now()
     gcs_client = None
 

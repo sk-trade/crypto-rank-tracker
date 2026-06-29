@@ -56,7 +56,8 @@ def detect_anomalies(
             continue
 
         sector_corr = calculate_sector_correlation(market, enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
-        confidence = calculate_confidence_score(ticker, sector_corr, rank)
+        base_confidence = calculate_confidence_score(ticker, sector_corr, rank)
+        confidence = ticker.final_confidence if ticker.final_confidence is not None else base_confidence
 
         if confidence >= config.CONFIDENCE_THRESHOLD:
             contexts = _build_contexts(ticker)

@@ -36,6 +36,8 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 async def run_check():
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
+    config.validate_storage_config()
+
     gcs_client = None
     if config.STATE_STORAGE_METHOD == "GCS":
         try:

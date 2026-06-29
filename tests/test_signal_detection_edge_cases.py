@@ -49,3 +49,24 @@ def test_detect_anomalies_allows_missing_rvol_z_score_for_price_only_candidate()
             current_price=110.0,
         )
     ]
+
+
+def test_detect_anomalies_uses_deep_dive_final_confidence_when_available():
+    ticker = TickerData(
+        market="KRW-BTC",
+        candle_history=[_candle(price=110.0, volume=2500.0)],
+        price_change_10m=1.6,
+        relative_volume=4.5,
+        rvol_z_score=3.5,
+        final_confidence=0.82,
+    )
+
+    candidates = detect_anomalies(
+        {"KRW-BTC": ticker},
+        {"KRW-BTC": 1},
+        {},
+        {},
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].confidence == 0.82

@@ -7,9 +7,9 @@ Scheduled tracker for Upbit KRW market ranking and anomaly reporting. The servic
 Set these environment variables for runtime behavior:
 
 - `STATE_STORAGE_METHOD`: state backend selector used by the service.
-- `GCS_BUCKET_NAME`: bucket name for state storage when GCS-backed state is enabled.
+- `GCS_BUCKET_NAME`: required bucket name when `STATE_STORAGE_METHOD=GCS`.
 - `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery.
-- `CG_API_KEY`: CoinGecko API key used for market data requests.
+- `CG_API_KEY`: CoinGecko API key used by the sector updater.
 - `GCP_PROJECT_ID`: Google Cloud project identifier used by deployment/runtime integration.
 
 ## Local setup
@@ -35,13 +35,13 @@ uv build
 Run the main service entrypoint with:
 
 ```bash
-python main.py
+uv run python main.py
 ```
 
 Run the sector updater with:
 
 ```bash
-python update_sectors.py
+uv run python update_sectors.py
 ```
 
 Both commands can trigger live network traffic and service side effects. They may read external market APIs, write state, and send webhook requests depending on configuration. Use them only when those effects are intended.
@@ -51,7 +51,7 @@ Both commands can trigger live network traffic and service side effects. They ma
 GitHub Actions is used for deployment flow control:
 
 - Pull requests run verification only.
-- Manual deployment is allowed only from `main`.
+- Pushes to `main` and manual `workflow_dispatch` runs from `main` deploy after verification.
 - The deployment target is Cloud Function `crypto-rank-tracker` in `asia-northeast1`.
 - Cloud Scheduler runs every 10 minutes.
 - The deploy workflow exports requirements without development dependencies.
