@@ -104,8 +104,14 @@ class AlertEngine:
             additional_change_pct = (current_price / previous_price - 1) * 100
 
             if abs(additional_change_pct) >= config.SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT:
-                was_bullish = "BREAKOUT" in previous_alert.last_signal_type or "ACCELERATION" in previous_alert.last_signal_type
-                was_bearish = "BREAKDOWN" in previous_alert.last_signal_type or "DOWNTREND" in previous_alert.last_signal_type
+                was_bullish = previous_alert.last_signal_type in {
+                    "BREAKOUT_START",
+                    "MOMENTUM_ACCELERATION",
+                }
+                was_bearish = previous_alert.last_signal_type in {
+                    "BREAKDOWN_START",
+                    "DOWNTREND_ACCELERATION",
+                }
 
                 if was_bullish and additional_change_pct > 0:
                     return "BULL_MOMENTUM_SUSTAINED", 1
