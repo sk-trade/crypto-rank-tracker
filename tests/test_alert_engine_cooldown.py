@@ -16,11 +16,11 @@ def _history(signal_type: str, last_price: float, now: datetime.datetime) -> Ale
     )
 
 
-def _candidate(current_price: float) -> SignalCandidate:
+def _candidate(current_price: float, price_change: float = 1.2) -> SignalCandidate:
     return SignalCandidate(
         market="KRW-BTC",
         confidence=0.75,
-        price_change=0.0,
+        price_change=price_change,
         rvol=1.0,
         rvol_z_score=1.0,
         contexts=[],
@@ -34,6 +34,34 @@ def _ticker() -> TickerData:
         candle_history=[],
         price_change_10m=0.0,
         price_change_1h=0.0,
+    )
+
+
+def _process_signal_type(previous_signal_type: str, current_price: float) -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    alerts = AlertEngine().process_signals(
+        candidates=[_candidate(current_price)],
+        enriched_tickers={"KRW-BTC": _ticker()},
+        history={
+            "KRW-BTC": _history(previous_signal_type, 100.0, now),
+        },
+    )
+
+    assert len(alerts) == 1
+    return alerts[0].signal_type
+
+
+def test_process_signals_classifies_downtrend_follow_up_as_bear_sustained():
+    assert (
+        _process_signal_type("DOWNTREND_ACCELERATION", 98.0)
+        == "BEAR_MOMENTUM_SUSTAINED"
+    )
+
+
+def test_process_signals_classifies_momentum_reversal_as_bull_failed():
+    assert (
+        _process_signal_type("MOMENTUM_ACCELERATION", 97.0)
+        == "BULL_MOMENTUM_FAILED"
     )
 
 
