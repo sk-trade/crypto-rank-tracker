@@ -107,10 +107,14 @@ class AlertEngine:
                 was_bullish = previous_alert.last_signal_type in {
                     "BREAKOUT_START",
                     "MOMENTUM_ACCELERATION",
+                    "BULL_MOMENTUM_SUSTAINED",
+                    "BULL_MOMENTUM_FAILED",
                 }
                 was_bearish = previous_alert.last_signal_type in {
                     "BREAKDOWN_START",
                     "DOWNTREND_ACCELERATION",
+                    "BEAR_MOMENTUM_SUSTAINED",
+                    "BEAR_MOMENTUM_FAILED",
                 }
 
                 if was_bullish and additional_change_pct > 0:

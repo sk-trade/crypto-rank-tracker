@@ -65,6 +65,34 @@ def test_process_signals_classifies_momentum_reversal_as_bull_failed():
     )
 
 
+def test_process_signals_classifies_followup_bull_sustained_as_bull_sustained():
+    assert (
+        _process_signal_type("BULL_MOMENTUM_SUSTAINED", 104.0)
+        == "BULL_MOMENTUM_SUSTAINED"
+    )
+
+
+def test_process_signals_classifies_followup_bull_failed_as_bull_failed():
+    assert (
+        _process_signal_type("BULL_MOMENTUM_FAILED", 97.0)
+        == "BULL_MOMENTUM_FAILED"
+    )
+
+
+def test_process_signals_classifies_followup_bear_sustained_as_bear_sustained():
+    assert (
+        _process_signal_type("BEAR_MOMENTUM_SUSTAINED", 96.0)
+        == "BEAR_MOMENTUM_SUSTAINED"
+    )
+
+
+def test_process_signals_classifies_followup_bear_failed_as_bear_failed():
+    assert (
+        _process_signal_type("BEAR_MOMENTUM_FAILED", 102.0)
+        == "BEAR_MOMENTUM_FAILED"
+    )
+
+
 def test_prior_downtrend_acceleration_with_continued_lower_price_is_bear_sustained():
     now = datetime.datetime.now(datetime.timezone.utc)
     engine = AlertEngine()
