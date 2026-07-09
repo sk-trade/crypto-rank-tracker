@@ -36,16 +36,19 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 async def run_check():
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
+    config.validate_storage_config()
+
     gcs_client = None
     if config.STATE_STORAGE_METHOD == "GCS":
         try:
             from google.cloud import storage
             gcs_client = storage.Client()
             logger.info("GCS 저장 모드로 실행됩니다.")
-        except ImportError:
-            logger.critical("GCS 모드로 설정되었으나 'google-cloud-storage' 라이브러리가 설치되지 않았습니다.")
-            logger.critical("pip install google-cloud-storage 명령어로 설치해주세요.")
-            return
+        except ImportError as e:
+            raise RuntimeError(
+                "GCS 모드로 설정되었으나 'google-cloud-storage' 라이브러리가 설치되지 않았습니다. "
+                "pip install google-cloud-storage 명령어로 설치해주세요."
+            ) from e
     else:
         logger.info("로컬 파일 저장 모드로 실행됩니다.")
 
@@ -105,8 +108,13 @@ async def run_check():
             # PHASE 3: 알림 생성
             final_alerts = []
             if candidate_markets: 
+                detection_universe = {
+                    market: enriched_tickers[market]
+                    for market in candidate_markets
+                    if market in enriched_tickers
+                }
                 candidates_list = detect_anomalies(
-                    enriched_tickers, 
+                    detection_universe, 
                     current_rankings,  
                     sectors, 
                     reverse_sector_map

@@ -19,21 +19,7 @@ def detect_anomalies(
     REVERSE_SECTOR_MAP: Dict[str, List[str]],
 ) -> List[SignalCandidate]:
     """기술적 지표가 계산된 TickerData를 분석하여 잠재적 시그널 후보 목록을 생성합니다."""
-    # 1. 모든 티커의 RVOL에 대한 강건한 Z-score 계산 (이상치 탐지용)
-    all_rvols = [
-        t.relative_volume
-        for t in enriched_tickers.values()
-        if t.relative_volume is not None and t.relative_volume > 0
-    ]
-    if len(all_rvols) > 20:
-        median_rvol = np.median(all_rvols)
-        mad = np.median(np.abs(all_rvols - median_rvol))  # Median Absolute Deviation
-        if mad > 0:
-            for ticker in enriched_tickers.values():
-                if ticker.relative_volume is not None:
-                    ticker.rvol_z_score = (
-                        ticker.relative_volume - median_rvol
-                    ) / (1.4826 * mad)
+    # Z-score는 scanner에서 이미 계산됨. detector는 읽기만 한다.
 
     # 현재 거래량의 백분위수 계산 (거래량 수준 평가용)
     current_volumes = {
@@ -56,7 +42,8 @@ def detect_anomalies(
             continue
 
         sector_corr = calculate_sector_correlation(market, enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
-        confidence = calculate_confidence_score(ticker, sector_corr, rank)
+        base_confidence = calculate_confidence_score(ticker, sector_corr, rank)
+        confidence = ticker.final_confidence if ticker.final_confidence is not None else base_confidence
 
         if confidence >= config.CONFIDENCE_THRESHOLD:
             contexts = _build_contexts(ticker)
@@ -65,7 +52,7 @@ def detect_anomalies(
                 confidence=confidence,
                 price_change=ticker.price_change_10m or 0.0,
                 rvol=ticker.relative_volume or 0.0,
-                rvol_z_score=ticker.rvol_z_score,
+                rvol_z_score=ticker.rvol_z_score or 0.0,
                 contexts=contexts,
                 current_price=ticker.candle_history[-1].close_price,
             )
@@ -111,7 +98,7 @@ def calculate_sector_correlation(
     sector_changes = [
         t.price_change_10m
         for coin in sector_coins
-        if (t := enriched_tickers.get(coin)) and t.price_change_10m is not None
+        if coin != market and (t := enriched_tickers.get(coin)) and t.price_change_10m is not None
     ]
     if len(sector_changes) < 3:
         return 0.0
@@ -169,10 +156,10 @@ def calculate_confidence_score(ticker: TickerData, sector_corr: float, rank: int
     # 추세 정렬 (최대 0.2)
     if (ticker.price_change_10m or 0) > 0:
         if ticker.trend_1h_stable == "UP": score += 0.1
-        if ticker.is_above_ma50_daily: score += 0.1
+        if ticker.is_above_ma50_daily is True: score += 0.1
     elif (ticker.price_change_10m or 0) < 0:
         if ticker.trend_1h_stable == "DOWN": score += 0.1
-        if not ticker.is_above_ma50_daily: score += 0.1
+        if ticker.is_above_ma50_daily is False: score += 0.1
 
     # 보너스 (섹터, 디커플링)
     score += sector_corr * 0.1
@@ -191,6 +178,9 @@ def filter_market_wide_events(
 ) -> List[SignalCandidate]:
     """시장 전체가 급등/급락하는 이벤트와 개별 종목의 이상 현상을 구분합니다."""
     total = len(enriched_tickers)
+    if total == 0:
+        return candidates
+
     strong_gainers = sum(
         1
         for t in enriched_tickers.values()

@@ -33,6 +33,12 @@ LOG_LEVEL = "INFO"
 STATE_HISTORY_COUNT = 12  # 순위 분석에 사용할 과거 데이터 수
 
 
+def validate_storage_config() -> None:
+    """Fail early when the selected state backend is missing required settings."""
+    if STATE_STORAGE_METHOD == "GCS" and not GCS_BUCKET_NAME:
+        raise RuntimeError("GCS_BUCKET_NAME is required when STATE_STORAGE_METHOD=GCS")
+
+
 # -- ANALYSIS & ALERTING POLICY --
 
 # [통계 보정 설정]

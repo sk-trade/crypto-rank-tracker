@@ -50,8 +50,8 @@ class TickerData(BaseModel):
     daily_candles: List[CandleData] = []
     
     trend_1h_stable: str = "NEUTRAL"
-    is_above_ma50_daily: bool = False
-    is_above_ma200_daily: bool = False
+    is_above_ma50_daily: Optional[bool] = None
+    is_above_ma200_daily: Optional[bool] = None
     final_confidence: Optional[float] = None
 
     candle_shape: Dict[str, Any] = Field(default_factory=dict)

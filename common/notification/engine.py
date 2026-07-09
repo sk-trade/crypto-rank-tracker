@@ -91,7 +91,8 @@ class AlertEngine:
                     if price_change_1h < -2.0
                     else ("BREAKDOWN_START", 3)
                 )
-            return "UNUSUAL_ACTIVITY", 1
+
+            return None, 0
 
         # --- Case 2: 후속 움직임 (쿨다운 기간 내) ---
         else:
@@ -104,8 +105,18 @@ class AlertEngine:
             additional_change_pct = (current_price / previous_price - 1) * 100
 
             if abs(additional_change_pct) >= config.SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT:
-                was_bullish = "BREAKOUT" in previous_alert.last_signal_type or "ACCELERATION" in previous_alert.last_signal_type
-                was_bearish = "BREAKDOWN" in previous_alert.last_signal_type or "DOWNTREND" in previous_alert.last_signal_type
+                was_bullish = previous_alert.last_signal_type in {
+                    "BREAKOUT_START",
+                    "MOMENTUM_ACCELERATION",
+                    "BULL_MOMENTUM_SUSTAINED",
+                    "BULL_MOMENTUM_FAILED",
+                }
+                was_bearish = previous_alert.last_signal_type in {
+                    "BREAKDOWN_START",
+                    "DOWNTREND_ACCELERATION",
+                    "BEAR_MOMENTUM_SUSTAINED",
+                    "BEAR_MOMENTUM_FAILED",
+                }
 
                 if was_bullish and additional_change_pct > 0:
                     return "BULL_MOMENTUM_SUSTAINED", 1

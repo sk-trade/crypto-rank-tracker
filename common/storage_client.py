@@ -13,19 +13,26 @@ import config
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
+class StateNotFound(Exception):
+    pass
+
+
+class StateLoadError(Exception):
+    pass
+
+
 async def load_json(
     filename: str, gcs_client=None
 ) -> Optional[Union[List, Dict]]:
-    """설정에 따라 GCS 또는 로컬에서 JSON 파일을 로드합니다."""
-    try:
-        if config.STATE_STORAGE_METHOD == "GCS" and gcs_client:
-            return await _load_json_from_gcs(gcs_client, filename)
-        else:
-            filepath = os.path.join(config.LOCAL_STATE_DIR, filename)
-            return await _load_json_from_local(filepath)
-    except Exception as e:
-        logger.warning(f"파일 로드 실패 ({filename}): {e}")
-        return None
+    """설정에 따라 GCS 또는 로컬에서 JSON 파일을 로드합니다.
+    
+    파일이 없으면 None을 반환합니다.
+    로드 실패(JSON 파싱 오류, 권한 오류, 네트워크 오류 등)는 예외를 던집니다.
+    """
+    if config.STATE_STORAGE_METHOD == "GCS" and gcs_client:
+        return await _load_json_from_gcs(gcs_client, filename)
+    filepath = os.path.join(config.LOCAL_STATE_DIR, filename)
+    return await _load_json_from_local(filepath)
 
 
 async def save_json(filename: str, data: Union[List, Dict], gcs_client=None):
@@ -44,16 +51,24 @@ async def _load_json_from_gcs(
     gcs_client, filename: str
 ) -> Optional[Union[List, Dict]]:
     """GCS에서 JSON 파일을 로드하는 헬퍼 함수입니다."""
+    bucket = gcs_client.bucket(config.GCS_BUCKET_NAME)
+    blob = bucket.blob(filename)
+
     try:
-        bucket = gcs_client.bucket(config.GCS_BUCKET_NAME)
-        blob = bucket.blob(filename)
-        if not await asyncio.to_thread(blob.exists):
-            return None
+        exists = await asyncio.to_thread(blob.exists)
+    except Exception as e:
+        raise StateLoadError(f"GCS 파일 존재 여부 확인 실패 ({filename}): {e}") from e
+
+    if not exists:
+        return None
+
+    try:
         data = await asyncio.to_thread(blob.download_as_text)
         return json.loads(data)
-    except Exception:
-        logger.warning(f"GCS 파일({filename}) 로드 실패 또는 파일 없음.")
-        return None
+    except json.JSONDecodeError as e:
+        raise StateLoadError(f"GCS JSON 파싱 실패 ({filename}): {e}") from e
+    except Exception as e:
+        raise StateLoadError(f"GCS 파일 로드 실패 ({filename}): {e}") from e
 
 
 async def _save_json_to_gcs(gcs_client, filename: str, data: Union[List, Dict]):
@@ -80,9 +95,10 @@ async def _load_json_from_local(filepath: str) -> Optional[Union[List, Dict]]:
         async with aiofiles.open(filepath, mode="r", encoding="utf-8") as f:
             content = await f.read()
         return json.loads(content)
-    except Exception:
-        logger.warning(f"로컬 파일({filepath}) 로드 실패 또는 파일 없음.")
-        return None
+    except json.JSONDecodeError as e:
+        raise StateLoadError(f"로컬 JSON 파싱 실패 ({filepath}): {e}") from e
+    except Exception as e:
+        raise StateLoadError(f"로컬 파일 로드 실패 ({filepath}): {e}") from e
 
 
 async def _save_json_to_local(filepath: str, data: Union[List, Dict]):

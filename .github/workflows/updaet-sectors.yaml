@@ -24,12 +24,21 @@ jobs:
       with:
         python-version: '3.11'
         
-    # Poetry 설치 및 의존성 설치 (기존 deploy.yml과 동일)
-    - name: Install Poetry
-      uses: snok/install-poetry@v1
+    # uv 설치 및 의존성 설치
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+
+    - name: Restore uv cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/uv
+        key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-uv-
+
     - name: Install dependencies
-      # --no-root는 라이브러리만 설치, --sync는 pyproject.toml과 정확히 동기화
-      run: poetry install --no-root --sync
+      run: uv sync --frozen
 
     # Google Cloud에 인증 (GCS에 업로드하기 위해 필요)
     - name: Authenticate to Google Cloud
@@ -40,7 +49,7 @@ jobs:
 
     # 섹터 업데이트 스크립트 실행
     - name: Run sector update script
-      run: poetry run python update_sectors.py
+      run: uv run python update_sectors.py
       env:
         # GitHub Repository Secret에 'CG_API_KEY'라는 이름으로 키를 저장해야 함
         CG_API_KEY: ${{ secrets.CG_API_KEY }}

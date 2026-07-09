@@ -1,11 +1,19 @@
 # common/notification/main
 
 import asyncio
+import dataclasses
 import datetime
 import logging
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+
+
+@dataclasses.dataclass
+class DispatchResult:
+    sent: bool
+    reason: Optional[str] = None
+    status_code: Optional[int] = None
 
 import config
 from common.models import Alert, AlertHistory, TickerData
@@ -58,7 +66,12 @@ async def create_and_dispatch_notification(
             use_channel_mention = True
 
     final_message = f"@channel\n{message}" if use_channel_mention else message
-    await send_notification(final_message)
+    dispatch_result = await send_notification(final_message)
+    
+    if not dispatch_result.sent:
+        logger.warning("알림 전송 실패 (%s): history 저장 생략", dispatch_result.reason)
+        return
+
     logger.info("알림 메시지를 생성하여 전송했습니다.")
 
     # 상태 저장 (알림이 발생했을 때만 히스토리 업데이트)
@@ -101,11 +114,11 @@ def _update_alert_history(
     return history
 
 
-async def send_notification(message: str):
-    """웹훅을 통해 메시지를 보냅니다."""
+async def send_notification(message: str) -> DispatchResult:
+    """웹훅을 통해 메시지를 보냅니다. 전송 결과를 반환합니다."""
     if not config.WEBHOOK_URL:
         logger.warning("웹훅 URL이 설정되지 않았습니다. 알림을 보내지 않습니다.")
-        return
+        return DispatchResult(sent=False, reason="WEBHOOK_URL not configured")
 
     payload: Dict[str, Any] = {"text": message}
     if message.strip().startswith("@channel"):
@@ -118,9 +131,13 @@ async def send_notification(message: str):
             ) as response:
                 if response.ok:
                     logger.info("웹훅 알림 전송 성공.")
+                    return DispatchResult(sent=True)
                 else:
+                    error_text = await response.text()
                     logger.error(
-                        f"웹훅 전송 실패 ({response.status}): {await response.text()}"
+                        f"웹훅 전송 실패 ({response.status}): {error_text}"
                     )
+                    return DispatchResult(sent=False, reason=f"HTTP {response.status}", status_code=response.status)
     except Exception as e:
         logger.error(f"웹훅 전송 중 예외 발생: {e}", exc_info=True)
+        return DispatchResult(sent=False, reason=str(e))

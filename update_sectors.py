@@ -129,6 +129,8 @@ async def tag_market(
 
 async def main():
     """스크립트의 메인 실행 함수입니다."""
+    config.validate_storage_config()
+
     start_time = datetime.now()
     gcs_client = None
 
@@ -138,10 +140,12 @@ async def main():
 
             gcs_client = storage.Client()
             logging.info("GCS 저장 모드로 실행됩니다.")
-        except ImportError:
-            logging.error("GCS 모듈이 설치되지 않았습니다. 로컬 저장으로 대체합니다.")
+        except ImportError as e:
+            raise RuntimeError(
+                "GCS 모드로 설정되었으나 google-cloud-storage 라이브러리가 설치되지 않았습니다."
+            ) from e
         except Exception as e:
-            logging.error(f"GCS 클라이언트 초기화 실패: {e}. 로컬 파일 저장으로 대체합니다.")
+            raise RuntimeError(f"GCS 클라이언트 초기화 실패: {e}") from e
     else:
         logging.info("로컬 파일 저장 모드로 실행됩니다.")
 
@@ -149,13 +153,15 @@ async def main():
         logging.info("1. Upbit KRW 마켓 목록 가져오기...")
         upbit_markets = await get_upbit_krw_markets(session)
         if not upbit_markets:
-            return
+            logging.error("Upbit KRW 마켓 목록이 비어 있습니다.")
+            raise RuntimeError("Upbit KRW 마켓 목록 조회 결과가 비어 있습니다.")
         logging.info(f"   -> {len(upbit_markets)}개 KRW 마켓 확인.")
 
         logging.info("2. CoinGecko 전체 코인 목록 가져오기...")
         cg_symbol_to_id = await get_coingecko_coins_list(session)
         if not cg_symbol_to_id:
-            return
+            logging.error("CoinGecko 코인 목록이 비어 있습니다.")
+            raise RuntimeError("CoinGecko 코인 목록 조회 결과가 비어 있습니다.")
         logging.info(f"   -> {len(cg_symbol_to_id)}개 코인 ID 확인.")
 
         logging.info(f"3. {len(upbit_markets)}개 마켓에 대한 자동 태깅 시작...")
@@ -173,6 +179,7 @@ async def main():
             logging.info(f"'{config.SECTOR_MAP_FILE_NAME}' 파일 저장 완료 ({storage_type}).")
         except Exception as e:
             logging.error(f"'{config.SECTOR_MAP_FILE_NAME}' 파일 저장 중 오류 발생: {e}")
+            raise
 
         _print_summary(sector_map, start_time)
 

@@ -53,10 +53,10 @@ def calculate_robust_confidence(ticker: TickerData, market_regime: Dict[str, Any
     
     if is_bullish_signal:
         if ticker.trend_1h_stable == "UP": trend_score += 0.15
-        if ticker.is_above_ma50_daily: trend_score += 0.15
+        if ticker.is_above_ma50_daily is True: trend_score += 0.15
     else: 
         if ticker.trend_1h_stable == "DOWN": trend_score += 0.15
-        if not ticker.is_above_ma50_daily: trend_score += 0.15
+        if ticker.is_above_ma50_daily is False: trend_score += 0.15
         
     # 2. 시장 체제(Regime) 적합성
     regime = market_regime.get("regime", "UNKNOWN")
