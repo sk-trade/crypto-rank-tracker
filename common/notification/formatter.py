@@ -208,7 +208,6 @@ class NotificationFormatter:
             "BULL_MOMENTUM_FAILED": "상승 모멘텀 실패",
             "BEAR_MOMENTUM_SUSTAINED": "하락 모멘텀 지속",
             "BEAR_MOMENTUM_FAILED": "하락 모멘텀 실패",
-            "UNUSUAL_ACTIVITY": "특이 거래 활동",
         }
         signal_title = signal_map.get(alert.signal_type, "주요 변동")
         

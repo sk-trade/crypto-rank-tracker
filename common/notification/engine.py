@@ -91,7 +91,8 @@ class AlertEngine:
                     if price_change_1h < -2.0
                     else ("BREAKDOWN_START", 3)
                 )
-            return "UNUSUAL_ACTIVITY", 1
+
+            return None, 0
 
         # --- Case 2: 후속 움직임 (쿨다운 기간 내) ---
         else:

@@ -140,10 +140,12 @@ async def main():
 
             gcs_client = storage.Client()
             logging.info("GCS 저장 모드로 실행됩니다.")
-        except ImportError:
-            logging.error("GCS 모듈이 설치되지 않았습니다. 로컬 저장으로 대체합니다.")
+        except ImportError as e:
+            raise RuntimeError(
+                "GCS 모드로 설정되었으나 google-cloud-storage 라이브러리가 설치되지 않았습니다."
+            ) from e
         except Exception as e:
-            logging.error(f"GCS 클라이언트 초기화 실패: {e}. 로컬 파일 저장으로 대체합니다.")
+            raise RuntimeError(f"GCS 클라이언트 초기화 실패: {e}") from e
     else:
         logging.info("로컬 파일 저장 모드로 실행됩니다.")
 
