@@ -94,7 +94,7 @@ jobs:
         uses: 'google-github-actions/auth@v2'
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SA_EMAIL }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA_EMAIL }}
 
       # Google Cloud Functions에 배포
       - name: Deploy Function
@@ -106,10 +106,11 @@ jobs:
           entry_point: main                 # 진입점 함수 이름
           region: asia-northeast1                  # 리전
           source_dir: ./                    # 소스 코드 디렉토리
-          service_account: ${{ secrets.GCP_SA_EMAIL }} # 서비스 계정
+          service_account: ${{ secrets.GCP_RUNTIME_SA_EMAIL }}
           memory: 512M
-          timeout: 540                      # ← 타임아웃 (초 단위)
-          max_instances: 1                  # ← 최대 동시 인스턴스
+          service_timeout: 540s
+          max_instance_count: 1
+          max_instance_request_concurrency: 1
           environment_variables: |          # 환경 변수 설정
             STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD }}
             GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
@@ -123,20 +124,21 @@ jobs:
 
           echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
 
-          # 기존 잡 삭제 (없어도 무시)
-          gcloud scheduler jobs delete crypto-rank-tracker-scheduler \
-            --location=asia-northeast1 --quiet || true
-
-          # 새로운 잡 생성
-          gcloud scheduler jobs create http crypto-rank-tracker-scheduler \
-            --location=asia-northeast1 \
-            --schedule="*/10 * * * *" \
-            --uri="$FUNCTION_URL" \
-            --http-method=POST \
-            --oidc-service-account-email=${{ secrets.GCP_SA_EMAIL }} \
-            --attempt-deadline=15m \
-            --time-zone="Asia/Seoul" \
+          SCHEDULER_ARGS=(
+            --location=asia-northeast1
+            --schedule="*/10 * * * *"
+            --uri="$FUNCTION_URL"
+            --http-method=POST
+            --oidc-service-account-email=${{ secrets.GCP_SCHEDULER_SA_EMAIL }}
+            --oidc-token-audience="$FUNCTION_URL"
+            --attempt-deadline=15m
+            --time-zone="Asia/Seoul"
             --description="10분마다 업비트 랭킹 체크"
+          )
+
+          if ! gcloud scheduler jobs update http crypto-rank-tracker-scheduler "${SCHEDULER_ARGS[@]}"; then
+            gcloud scheduler jobs create http crypto-rank-tracker-scheduler "${SCHEDULER_ARGS[@]}"
+          fi
 
       # 배포 결과 확인
       - name: Verify deployment

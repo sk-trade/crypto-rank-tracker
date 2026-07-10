@@ -55,6 +55,12 @@ GitHub Actions is used for deployment flow control:
 - The deployment target is Cloud Function `crypto-rank-tracker` in `asia-northeast1`.
 - Cloud Scheduler runs every 10 minutes.
 - The deploy workflow exports requirements without development dependencies.
+- Configure distinct GitHub Secrets for `GCP_DEPLOYER_SA_EMAIL`, `GCP_RUNTIME_SA_EMAIL`,
+  and `GCP_SCHEDULER_SA_EMAIL`. The deployer authenticates GitHub Actions, the runtime
+  account accesses application resources, and the Scheduler account invokes the function.
+- The Gen2 function is deployed with a 540-second service timeout, one maximum instance,
+  and one request per instance. Scheduler updates are idempotent and use the function URL
+  as their OIDC audience.
 
 ## Operational notes
 
