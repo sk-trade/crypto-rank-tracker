@@ -33,6 +33,15 @@ def test_formatter_labels_bearish_acceleration_alert():
     assert "하락 모멘텀 가속" in _header_for("DOWNTREND_ACCELERATION")
 
 
+def test_data_quality_alert_does_not_claim_the_market_has_no_events():
+    message = NotificationFormatter().format_data_quality_alert(
+        ["10-minute candle coverage 1/2 (50.0%) is below the 95% minimum."]
+    )
+
+    assert "데이터 품질 장애" in message
+    assert "특이사항 없음" not in message
+
+
 def test_formatter_labels_cooldown_follow_up_alerts():
     expected_titles = {
         "BULL_MOMENTUM_SUSTAINED": "상승 모멘텀 지속",

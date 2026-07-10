@@ -31,6 +31,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 APP_LOGGER_NAME = "CryptoRankTracker"
 LOG_LEVEL = "INFO"
 STATE_HISTORY_COUNT = 12  # 순위 분석에 사용할 과거 데이터 수
+CANDLE_SUCCESS_RATE_MINIMUM = 0.95
 
 
 def validate_storage_config() -> None:

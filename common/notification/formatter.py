@@ -13,6 +13,19 @@ from common.models import Alert, AlertHistory, TickerData
 class NotificationFormatter:
     """분석된 데이터와 알림 객체를 기반으로 사용자 메시지를 생성하는 클래스입니다."""
 
+    def format_data_quality_alert(self, issues: List[str]) -> str:
+        """Format an operational incident without presenting market analysis as valid."""
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        now_kst = datetime.datetime.now(kst)
+        details = "\n".join(f"- {issue}" for issue in issues)
+        return "\n".join(
+            [
+                f"🚨 **시장 데이터 품질 장애 ({now_kst.strftime('%H:%M')} KST)**",
+                "이번 스캔의 시장 데이터가 기준에 미달해 시그널과 일반 브리핑을 생성하지 않았습니다.",
+                details,
+            ]
+        )
+
     def format_daily_briefing(
         self,
         alerts: List[Alert],

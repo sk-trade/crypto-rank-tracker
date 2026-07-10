@@ -18,7 +18,7 @@ from common.analysis.deep_dive import (
     calculate_robust_confidence,
 )
 from common.models import Alert, RankState, SignalCandidate
-from common.notification.main import create_and_dispatch_notification
+from common.notification.main import create_and_dispatch_notification, dispatch_data_quality_alert
 from common.sector_loader import load_and_process_sectors
 from common.state_manager import load_alert_history, load_rank_state_history, save_rank_state_history
 from common.upbit_client import (
@@ -53,6 +53,25 @@ def filter_markets_with_complete_deep_dive_data(
             ", ".join(blocked_markets[:10]),
         )
     return valid_markets
+
+
+def assess_scan_data_quality(
+    all_markets: list[str], candles_10m: dict, minimum_success_rate: float
+) -> list[str]:
+    """Return operationally actionable reasons why a scan cannot produce signals."""
+    if not all_markets:
+        return ["KRW market universe is empty."]
+
+    successful_markets = len(candles_10m)
+    success_rate = successful_markets / len(all_markets)
+    issues = []
+    if success_rate < minimum_success_rate:
+        issues.append(
+            f"10-minute candle coverage {successful_markets}/{len(all_markets)} ({success_rate:.1%}) is below the {minimum_success_rate:.0%} minimum."
+        )
+    if "KRW-BTC" not in candles_10m:
+        issues.append("KRW-BTC completed 10-minute candles are missing or stale.")
+    return issues
 
 
 async def run_check():
@@ -93,6 +112,13 @@ async def run_check():
                 count=200,
                 as_of=scan_started_at,
             )
+            data_quality_issues = assess_scan_data_quality(
+                all_markets, candles_10m, config.CANDLE_SUCCESS_RATE_MINIMUM
+            )
+            if data_quality_issues:
+                logger.error("Skipping scan due to data quality: %s", "; ".join(data_quality_issues))
+                await dispatch_data_quality_alert(data_quality_issues)
+                return
             current_rankings = calculate_rankings(raw_tickers)
             lightweight_tickers = process_lightweight_indicators(candles_10m, raw_tickers_map)
             candidate_markets = select_candidates_for_deep_dive(lightweight_tickers, current_rankings, raw_tickers_map)

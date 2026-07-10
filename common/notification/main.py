@@ -25,6 +25,17 @@ from common.state_manager import load_alert_history, save_alert_history
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
+async def dispatch_data_quality_alert(issues: List[str]) -> DispatchResult:
+    """Notify operators that market data is unusable without emitting a market briefing."""
+    message = NotificationFormatter().format_data_quality_alert(issues)
+    result = await send_notification(message)
+    if result.sent:
+        logger.warning("Data-quality incident notification sent: %s", "; ".join(issues))
+    else:
+        logger.error("Data-quality incident notification was not sent (%s): %s", result.reason, "; ".join(issues))
+    return result
+
+
 async def create_and_dispatch_notification(
     raw_tickers: List[Dict[str, Any]],
     enriched_tickers: Dict[str, TickerData],
