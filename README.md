@@ -11,6 +11,7 @@ Set these environment variables for runtime behavior:
 - `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery.
 - `CG_API_KEY`: CoinGecko API key used by the sector updater.
 - `GCP_PROJECT_ID`: Google Cloud project identifier used by deployment/runtime integration.
+- `CG_SYMBOL_OVERRIDES`: optional JSON object mapping an ambiguous lower-case symbol to an explicit CoinGecko id, for example `{"pay":"tenx"}`. Ambiguous symbols without a valid override are left untagged.
 
 ## Local setup
 
@@ -45,6 +46,13 @@ uv run python update_sectors.py
 ```
 
 Both commands can trigger live network traffic and service side effects. They may read external market APIs, write state, and send webhook requests depending on configuration. Use them only when those effects are intended.
+
+## Signal Safety
+
+- The scanner fetches 3,025 completed 10-minute candles per market to establish a three-week same-weekday/time volume baseline. Incomplete history, missing conditional samples, or unavailable orderbooks block signals rather than falling back to a weaker rule.
+- Candidate execution checks require sufficient 24-hour turnover, two-sided orderbook depth for the configured KRW notional, acceptable spread/slippage, and movement that covers estimated round-trip costs.
+- Local state is stored under `state/`. Rank snapshots retain the most recent `STATE_HISTORY_COUNT` entries; malformed state files fail explicitly rather than silently resetting history.
+- The baseline model, threshold selector, and shadow-promotion policies are offline evaluation tools. They do not replace production alerts until frozen shadow-operation criteria are met.
 
 ## Deployment
 
