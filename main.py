@@ -34,6 +34,27 @@ logging.basicConfig(
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
+def filter_markets_with_complete_deep_dive_data(
+    candidate_markets: list[str],
+    candles_60m: dict,
+    candles_daily: dict,
+) -> list[str]:
+    """Block candidates that lack any required higher-timeframe history."""
+    valid_markets = [
+        market
+        for market in candidate_markets
+        if market in candles_60m and market in candles_daily
+    ]
+    blocked_markets = sorted(set(candidate_markets) - set(valid_markets))
+    if blocked_markets:
+        logger.warning(
+            "Blocking %d candidate(s) because 60-minute or daily candle coverage failed: %s",
+            len(blocked_markets),
+            ", ".join(blocked_markets[:10]),
+        )
+    return valid_markets
+
+
 async def run_check():
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
     config.validate_storage_config()
@@ -55,6 +76,7 @@ async def run_check():
     try:
         async with aiohttp.ClientSession() as session:
             # 공통 준비 단계
+            scan_started_at = datetime.datetime.now(datetime.timezone.utc)
             old_rank_states = await load_rank_state_history(gcs_client)
             previous_rankings = old_rank_states[-1].rankings if old_rank_states else {}
             sectors, reverse_sector_map = await load_and_process_sectors(gcs_client)
@@ -63,7 +85,14 @@ async def run_check():
             raw_tickers = await get_all_krw_tickers(session)
             all_markets = [ticker["market"] for ticker in raw_tickers]
             raw_tickers_map = {ticker["market"]: ticker for ticker in raw_tickers}
-            candles_10m = await get_candles(session, all_markets, time_unit="minutes", minutes_unit=10, count=200)
+            candles_10m = await get_candles(
+                session,
+                all_markets,
+                time_unit="minutes",
+                minutes_unit=10,
+                count=200,
+                as_of=scan_started_at,
+            )
             current_rankings = calculate_rankings(raw_tickers)
             lightweight_tickers = process_lightweight_indicators(candles_10m, raw_tickers_map)
             candidate_markets = select_candidates_for_deep_dive(lightweight_tickers, current_rankings, raw_tickers_map)
@@ -83,11 +112,29 @@ async def run_check():
                 markets_to_fetch = list(set(candidate_markets + ["KRW-BTC", "KRW-ETH"]))
                 
                 tasks = [
-                    get_candles(session, markets_to_fetch, time_unit="minutes", minutes_unit=60, count=200),
-                    get_candles(session, markets_to_fetch, time_unit="days", count=200),
+                    get_candles(
+                        session,
+                        markets_to_fetch,
+                        time_unit="minutes",
+                        minutes_unit=60,
+                        count=200,
+                        as_of=scan_started_at,
+                    ),
+                    get_candles(
+                        session,
+                        markets_to_fetch,
+                        time_unit="days",
+                        count=200,
+                        as_of=scan_started_at,
+                    ),
                 ]
                 results = await asyncio.gather(*tasks)
                 candles_60m, candles_daily = results[0], results[1]
+                candidate_markets = filter_markets_with_complete_deep_dive_data(
+                    candidate_markets, candles_60m, candles_daily
+                )
+                if not candidate_markets:
+                    logger.warning("No candidates passed higher-timeframe candle integrity checks.")
 
                 deep_dive_enriched = enrich_deep_dive_tickers(
                     {m: t for m, t in lightweight_tickers.items() if m in markets_to_fetch},

@@ -1,8 +1,10 @@
 #common/upbit_client
 
 import asyncio
+import datetime
 import logging
 from typing import Any, Dict, List, Literal, Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiolimiter import AsyncLimiter
@@ -16,11 +18,72 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 UPBIT_API_BASE_URL = "https://api.upbit.com/v1"
 
 GLOBAL_LIMITER = AsyncLimiter(8, 1) 
+KST = ZoneInfo("Asia/Seoul")
 
 class UpbitAPIError(Exception):
     """Upbit API 호출 실패 시 발생하는 사용자 정의 예외입니다."""
 
     pass
+
+
+def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
+    """Interpret Upbit's UTC timestamp strings consistently as aware UTC values."""
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=datetime.timezone.utc)
+    return timestamp.astimezone(datetime.timezone.utc)
+
+
+def _expected_candle_starts(
+    time_unit: Literal["minutes", "days", "weeks", "months"],
+    count: int,
+    minutes_unit: Optional[int],
+    as_of: datetime.datetime,
+) -> List[datetime.datetime]:
+    """Return the ordered grid of fully closed Upbit candle start times."""
+    now_utc = _as_utc(as_of)
+    if time_unit == "minutes":
+        if not minutes_unit:
+            raise ValueError("minutes_unit is required for minute candles")
+        interval = datetime.timedelta(minutes=minutes_unit)
+        elapsed = now_utc - datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        current_start = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) + (
+            elapsed // interval
+        ) * interval
+        latest_completed = current_start - interval
+    elif time_unit == "days":
+        local_today = now_utc.astimezone(KST).replace(hour=0, minute=0, second=0, microsecond=0)
+        latest_completed = (local_today - datetime.timedelta(days=1)).astimezone(datetime.timezone.utc)
+        interval = datetime.timedelta(days=1)
+    else:
+        raise ValueError(f"Unsupported candle integrity grid: {time_unit}")
+
+    first = latest_completed - interval * (count - 1)
+    return [first + interval * index for index in range(count)]
+
+
+def normalize_completed_candles(
+    candles: List[CandleData],
+    time_unit: Literal["minutes", "days", "weeks", "months"],
+    count: int,
+    minutes_unit: Optional[int] = None,
+    as_of: Optional[datetime.datetime] = None,
+) -> List[CandleData]:
+    """Reindex to the complete candle grid, rejecting partial or gapped histories."""
+    expected_starts = _expected_candle_starts(
+        time_unit, count, minutes_unit, as_of or datetime.datetime.now(datetime.timezone.utc)
+    )
+    candles_by_start: Dict[datetime.datetime, CandleData] = {}
+    for candle in candles:
+        timestamp = _as_utc(candle.timestamp)
+        if timestamp in candles_by_start:
+            return []
+        candle.timestamp = timestamp
+        candles_by_start[timestamp] = candle
+
+    reindexed = [candles_by_start.get(timestamp) for timestamp in expected_starts]
+    if any(candle is None for candle in reindexed):
+        return []
+    return [candle for candle in reindexed if candle is not None]
 
 # --- API 호출 함수 ---
 async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
@@ -62,6 +125,7 @@ async def get_candles(
     time_unit: Literal["minutes", "days", "weeks", "months"],
     count: int = 200,
     minutes_unit: Optional[int] = None,
+    as_of: Optional[datetime.datetime] = None,
 ) -> Dict[str, List[CandleData]]:
     """
     지정된 시간 단위(분, 일, 주, 월)에 대한 캔들 데이터를 병렬로 가져옵니다.
@@ -118,7 +182,11 @@ async def get_candles(
                             CandleData.model_validate(
                                 {
                                     "market": r["market"],
-                                    "timestamp": r["candle_date_time_utc"],
+                                    "timestamp": _as_utc(
+                                        datetime.datetime.fromisoformat(
+                                            r["candle_date_time_utc"].replace("Z", "+00:00")
+                                        )
+                                    ),
                                     "open_price": r["opening_price"],
                                     "high_price": r["high_price"],
                                     "low_price": r["low_price"],
@@ -128,9 +196,24 @@ async def get_candles(
                             )
                             for r in raw_candles
                         ]
-
-                        candles.sort(key=lambda c: c.timestamp)
-                        return market, candles
+                        complete_candles = normalize_completed_candles(
+                            candles,
+                            time_unit=time_unit,
+                            count=count,
+                            minutes_unit=minutes_unit,
+                            as_of=as_of,
+                        )
+                        if len(complete_candles) != count:
+                            logger.warning(
+                                "%s: rejected candle history due to incomplete, duplicate, or off-grid data "
+                                "(unit=%s, expected=%d, received=%d).",
+                                market,
+                                time_unit,
+                                count,
+                                len(candles),
+                            )
+                            return market, []
+                        return market, complete_candles
 
             except aiohttp.ClientError as e:
                 logger.warning(
