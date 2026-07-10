@@ -90,6 +90,36 @@ class AnalysisState(BaseModel):
     rankings: Dict[str, int] = {}
 
 
+class ScanEvent(BaseModel):
+    """Immutable pre-decision record for one market in one scan."""
+
+    event_id: str
+    observed_at: datetime.datetime
+    market: str
+    feature_snapshot: Dict[str, Any]
+    candidate_eligible: bool
+    rejection_reasons: List[str]
+    final_decision: str
+    model_version: str
+    direction: Optional[str] = None
+    signal_score: Optional[float] = None
+    signal_candle_start: Optional[datetime.datetime] = None
+
+
+class ScanOutcome(BaseModel):
+    """Post-hoc evaluation record joined to an immutable scan event by event_id."""
+
+    event_id: str
+    market: str
+    entry_candle_start: datetime.datetime
+    exit_candle_start: datetime.datetime
+    entry_price: float
+    exit_price: float
+    directional_net_return: float
+    mfe: float
+    mae: float
+
+
 class AlertHistory(BaseModel):
     """알림 쿨다운을 관리하기 위한 발송 기록 모델입니다."""
 

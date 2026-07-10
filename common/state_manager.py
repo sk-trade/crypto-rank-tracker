@@ -7,7 +7,7 @@ import os
 from typing import Dict, List
 
 import config
-from common.models import AlertHistory, AnalysisState, RankState
+from common.models import AlertHistory, AnalysisState, RankState, ScanEvent, ScanOutcome
 from common.storage_client import load_json, save_json
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
@@ -54,6 +54,38 @@ def get_daily_log_filename() -> str:
     """오늘 날짜 기반의 로그 파일 이름을 반환합니다."""
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     return f"analysis_log_{today}.json"
+
+
+def _get_daily_filename(prefix: str) -> str:
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    return f"{prefix}_{today}.json"
+
+
+async def _append_records(filename: str, records: List[ScanEvent] | List[ScanOutcome], gcs_client=None):
+    existing = await load_json(filename, gcs_client)
+    if not isinstance(existing, list):
+        existing = []
+    existing.extend(record.model_dump(mode="json") for record in records)
+    await save_json(filename, existing, gcs_client)
+
+
+async def append_scan_events(events: List[ScanEvent], gcs_client=None):
+    await _append_records(_get_daily_filename("scan_events"), events, gcs_client)
+
+
+async def append_scan_outcomes(outcomes: List[ScanOutcome], gcs_client=None):
+    await _append_records(_get_daily_filename("scan_outcomes"), outcomes, gcs_client)
+
+
+async def load_pending_scan_events(gcs_client=None) -> List[ScanEvent]:
+    data = await load_json("pending_scan_events.json", gcs_client)
+    return [ScanEvent.model_validate(item) for item in data] if isinstance(data, list) else []
+
+
+async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
+    await save_json(
+        "pending_scan_events.json", [event.model_dump(mode="json") for event in events], gcs_client
+    )
 
 
 async def save_analysis_log(state: AnalysisState, gcs_client=None):

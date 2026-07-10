@@ -1,6 +1,7 @@
 # common/analysis/scanner.py
 
 import logging
+from dataclasses import dataclass
 from typing import Dict, List
 import numpy as np
 
@@ -8,6 +9,12 @@ import config
 from common.models import TickerData # 기존 모델 재사용
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    eligible: bool
+    rejection_reasons: List[str]
 
 def process_lightweight_indicators(
     candles_10m: Dict[str, List], 
@@ -74,7 +81,15 @@ def select_candidates_for_deep_dive(
     """
     config에 설정된 동적 임계값을 적용하여 후보군을 선정합니다.
     """
-    candidates = []
+    decisions = evaluate_candidate_eligibility(lightweight_tickers, current_rankings)
+    return [market for market, decision in decisions.items() if decision.eligible]
+
+
+def evaluate_candidate_eligibility(
+    lightweight_tickers: Dict[str, TickerData], current_rankings: Dict[str, int]
+) -> Dict[str, CandidateDecision]:
+    """Evaluate every ticker and retain explicit reasons for rejected candidates."""
+    decisions = {}
     for market, ticker in lightweight_tickers.items():
         
         z_score = ticker.rvol_z_score or 0
@@ -104,16 +119,27 @@ def select_candidates_for_deep_dive(
 
         # Wash Trading 방지
         if z_score > 5.0 and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE:
+            decisions[market] = CandidateDecision(False, ["suspected_wash_trading"])
             continue
 
         # 메이저는 유연하게, 잡코인은 엄격하게
         if is_strict_mode:
             # 잡코인/중위권: 거래량과 가격이 동시에 터져야 함
             if has_volume_spike and has_price_spike:
-                candidates.append(market)
+                decisions[market] = CandidateDecision(True, [])
+            else:
+                reasons = []
+                if not has_volume_spike:
+                    reasons.append("volume_anomaly_below_threshold")
+                if not has_price_spike:
+                    reasons.append("price_move_below_threshold")
+                decisions[market] = CandidateDecision(False, reasons)
         else:
             # 메이저: 둘 중 하나만 터져도 감지 (선취매 혹은 뉴스 반응)
             if has_volume_spike or has_price_spike:
-                candidates.append(market)
-            
-    return candidates
+                decisions[market] = CandidateDecision(True, [])
+            else:
+                decisions[market] = CandidateDecision(
+                    False, ["volume_and_price_move_below_threshold"]
+                )
+    return decisions

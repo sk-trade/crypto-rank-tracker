@@ -11,15 +11,27 @@ import functions_framework
 
 import config
 from common.analysis.utils import calculate_rankings
-from common.analysis.scanner import process_lightweight_indicators, select_candidates_for_deep_dive
+from common.analysis.scanner import (
+    evaluate_candidate_eligibility,
+    process_lightweight_indicators,
+)
 from common.analysis.deep_dive import ( 
     enrich_deep_dive_tickers,
     get_market_regime,
 )
 from common.models import Alert, RankState, SignalCandidate
+from common.event_log import build_scan_events, resolve_scan_outcomes
 from common.notification.main import create_and_dispatch_notification, dispatch_data_quality_alert
 from common.sector_loader import load_and_process_sectors
-from common.state_manager import load_alert_history, load_rank_state_history, save_rank_state_history
+from common.state_manager import (
+    append_scan_events,
+    append_scan_outcomes,
+    load_alert_history,
+    load_pending_scan_events,
+    load_rank_state_history,
+    save_pending_scan_events,
+    save_rank_state_history,
+)
 from common.upbit_client import (
     UpbitAPIError,
     get_all_krw_tickers,
@@ -116,11 +128,33 @@ async def run_check():
             )
             if data_quality_issues:
                 logger.error("Skipping scan due to data quality: %s", "; ".join(data_quality_issues))
+                await append_scan_events(
+                    build_scan_events(
+                        scan_started_at,
+                        all_markets,
+                        {},
+                        {},
+                        [],
+                        [],
+                        data_quality_issues=data_quality_issues,
+                        raw_tickers_by_market=raw_tickers_map,
+                    ),
+                    gcs_client,
+                )
                 await dispatch_data_quality_alert(data_quality_issues)
                 return
+
+            pending_events = await load_pending_scan_events(gcs_client)
+            resolved_outcomes, pending_events = resolve_scan_outcomes(pending_events, candles_10m)
+            if resolved_outcomes:
+                await append_scan_outcomes(resolved_outcomes, gcs_client)
+            await save_pending_scan_events(pending_events, gcs_client)
             current_rankings = calculate_rankings(raw_tickers)
             lightweight_tickers = process_lightweight_indicators(candles_10m, raw_tickers_map)
-            candidate_markets = select_candidates_for_deep_dive(lightweight_tickers, current_rankings, raw_tickers_map)
+            candidate_decisions = evaluate_candidate_eligibility(lightweight_tickers, current_rankings)
+            candidate_markets = [
+                market for market, decision in candidate_decisions.items() if decision.eligible
+            ]
             
             if not candidate_markets:
                 logger.info("심층 분석 대상이 없습니다. Phase 2를 건너뜁니다.")
@@ -174,6 +208,7 @@ async def run_check():
 
             # PHASE 3: 알림 생성
             final_alerts = []
+            candidates_list = []
             if candidate_markets: 
                 detection_universe = {
                     market: enriched_tickers[market]
@@ -203,6 +238,21 @@ async def run_check():
                 raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
                 previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
                 final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime, gcs_client=gcs_client
+            )
+
+            scan_events = build_scan_events(
+                scan_started_at,
+                all_markets,
+                lightweight_tickers,
+                candidate_decisions,
+                candidate_markets,
+                final_alerts,
+                candidates_list,
+                raw_tickers_by_market=raw_tickers_map,
+            )
+            await append_scan_events(scan_events, gcs_client)
+            await save_pending_scan_events(
+                pending_events + [event for event in scan_events if event.direction], gcs_client
             )
 
             new_rank_state = RankState(last_updated=datetime.datetime.now(datetime.timezone.utc), rankings=current_rankings)
