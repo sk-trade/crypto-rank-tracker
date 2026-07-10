@@ -15,7 +15,6 @@ from common.analysis.scanner import process_lightweight_indicators, select_candi
 from common.analysis.deep_dive import ( 
     enrich_deep_dive_tickers,
     get_market_regime,
-    calculate_robust_confidence,
 )
 from common.models import Alert, RankState, SignalCandidate
 from common.notification.main import create_and_dispatch_notification, dispatch_data_quality_alert
@@ -172,11 +171,6 @@ async def run_check():
 
                 market_regime = get_market_regime(enriched_tickers)
                 logger.info(f"현재 시장 체제: {market_regime.get('regime', 'UNKNOWN')}")
-
-                for market in candidate_markets:
-                    ticker = enriched_tickers.get(market)
-                    if not ticker: continue
-                    ticker.final_confidence = calculate_robust_confidence(ticker, market_regime)
 
             # PHASE 3: 알림 생성
             final_alerts = []

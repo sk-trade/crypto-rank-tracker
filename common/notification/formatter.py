@@ -227,7 +227,7 @@ class NotificationFormatter:
         icon = "🔥" if (candidate.price_change or 0) > 0 else "🧊"
         header = (
             f"{icon} **{market.split('-')[1]}{f' ({tag})' if tag else ''}: "
-            f"{signal_title}** (신뢰도: {candidate.confidence:.0%})"
+            f"{signal_title}** (Signal score: {candidate.signal_score:.2f})"
         )
 
         decoupling_score = ticker.decoupling_score

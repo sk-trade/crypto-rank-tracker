@@ -41,49 +41,6 @@ def get_market_regime(enriched_tickers: Dict[str, TickerData]) -> Dict[str, Any]
     return {"regime": "MEAN_REVERSION"}
 
 
-def calculate_robust_confidence(ticker: TickerData, market_regime: Dict[str, Any]) -> float:
-    """
-    Detector에서 계산된 confidence를 시장 상황(Regime)과 상위 시간대 추세에 맞춰 최종 보정합니다.
-    """
-    base_score = 0.5 # 기본 점수
-    
-    # 1. 상위 시간대 추세 (Trend Alignment)
-    trend_score = 0.0
-    is_bullish_signal = (ticker.price_change_10m or 0) > 0
-    
-    if is_bullish_signal:
-        if ticker.trend_1h_stable == "UP": trend_score += 0.15
-        if ticker.is_above_ma50_daily is True: trend_score += 0.15
-    else: 
-        if ticker.trend_1h_stable == "DOWN": trend_score += 0.15
-        if ticker.is_above_ma50_daily is False: trend_score += 0.15
-        
-    # 2. 시장 체제(Regime) 적합성
-    regime = market_regime.get("regime", "UNKNOWN")
-    regime_multiplier = 1.0
-    
-    if regime == "MEAN_REVERSION":
-        if ticker.bb_status != "SQUEEZE":
-            regime_multiplier = 0.8
-    elif regime == "TRENDING_BULL":
-        if is_bullish_signal: regime_multiplier = 1.2
-        else: regime_multiplier = 0.6
-    elif regime == "TRENDING_BEAR":
-        if not is_bullish_signal: regime_multiplier = 1.2
-        else: regime_multiplier = 0.6
-        
-    # 3. 최종 점수 합산
-    # (Z-Score 점수 + 가격 변동 점수 + 추세 점수) * Regime 보정
-    
-    z_score_part = min((ticker.rvol_z_score or 0) / 20.0, 0.2) # Max 0.2
-    price_part = 0.0
-    if abs(ticker.price_change_10m or 0) > 1.5: price_part = 0.2
-    
-    final_score = (base_score + z_score_part + price_part + trend_score) * regime_multiplier
-    
-    return min(final_score, 0.95)
-
-
 def enrich_deep_dive_tickers(
     deep_dive_subset: Dict[str, TickerData],
     candles_60m: Dict[str, List],

@@ -19,7 +19,7 @@ def _history(signal_type: str, last_price: float, now: datetime.datetime) -> Ale
 def _candidate(current_price: float, price_change: float = 1.2) -> SignalCandidate:
     return SignalCandidate(
         market="KRW-BTC",
-        confidence=0.75,
+        signal_score=0.75,
         price_change=price_change,
         rvol=1.0,
         rvol_z_score=1.0,

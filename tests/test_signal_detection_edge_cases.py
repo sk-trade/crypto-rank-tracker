@@ -1,7 +1,13 @@
 import datetime
 
+import pytest
+
 from common.models import CandleData, SignalCandidate, TickerData
-from common.signals.detector import detect_anomalies, filter_market_wide_events
+from common.signals.detector import (
+    calculate_signal_score,
+    detect_anomalies,
+    filter_market_wide_events,
+)
 
 
 def _candle(price: float = 100.0, volume: float = 1000.0) -> CandleData:
@@ -41,7 +47,7 @@ def test_detect_anomalies_allows_missing_rvol_z_score_for_price_only_candidate()
     assert candidates == [
         SignalCandidate(
             market="KRW-BTC",
-            confidence=candidates[0].confidence,
+            signal_score=candidates[0].signal_score,
             price_change=6.5,
             rvol=0.0,
             rvol_z_score=0.0,
@@ -51,14 +57,13 @@ def test_detect_anomalies_allows_missing_rvol_z_score_for_price_only_candidate()
     ]
 
 
-def test_detect_anomalies_uses_deep_dive_final_confidence_when_available():
+def test_detect_anomalies_uses_the_single_calculated_signal_score():
     ticker = TickerData(
         market="KRW-BTC",
         candle_history=[_candle(price=110.0, volume=2500.0)],
-        price_change_10m=1.6,
+        price_change_10m=6.5,
         relative_volume=4.5,
-        rvol_z_score=3.5,
-        final_confidence=0.82,
+        rvol_z_score=5.0,
     )
 
     candidates = detect_anomalies(
@@ -69,4 +74,17 @@ def test_detect_anomalies_uses_deep_dive_final_confidence_when_available():
     )
 
     assert len(candidates) == 1
-    assert candidates[0].confidence == 0.82
+    assert candidates[0].signal_score == pytest.approx(0.6)
+
+
+def test_signal_score_is_not_capped_at_an_arbitrary_value():
+    ticker = TickerData(
+        market="KRW-BTC",
+        price_change_10m=10.0,
+        rvol_z_score=20.0,
+        trend_1h_stable="UP",
+        is_above_ma50_daily=True,
+        decoupling_score=4.0,
+    )
+
+    assert calculate_signal_score(ticker, sector_corr=1.0, rank=1) == pytest.approx(1.0)

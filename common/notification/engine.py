@@ -52,10 +52,10 @@ class AlertEngine:
         return sorted(alerts, key=lambda x: x.priority, reverse=True)
 
     def _is_worth_alerting(self, candidate: SignalCandidate) -> bool:
-        """시그널이 알림을 보낼 최소 기준(가격변동, 신뢰도)을 충족하는지 확인합니다."""
+        """시그널이 알림을 보낼 최소 기준(가격변동, signal score)을 충족하는지 확인합니다."""
         if abs(candidate.price_change) < config.ALERT_MIN_PRICE_CHANGE_10M:
             return False
-        if candidate.confidence < config.ALERT_MIN_CONFIDENCE:
+        if candidate.signal_score < config.ALERT_MIN_SIGNAL_SCORE:
             return False
         return True
 

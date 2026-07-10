@@ -52,15 +52,13 @@ class TickerData(BaseModel):
     trend_1h_stable: str = "NEUTRAL"
     is_above_ma50_daily: Optional[bool] = None
     is_above_ma200_daily: Optional[bool] = None
-    final_confidence: Optional[float] = None
-
     candle_shape: Dict[str, Any] = Field(default_factory=dict)
 
 class SignalCandidate(BaseModel):
     """1차 분석을 통해 생성된 잠재적 시그널 후보입니다."""
 
     market: str
-    confidence: float
+    signal_score: float
     price_change: float
     rvol: float
     rvol_z_score: float

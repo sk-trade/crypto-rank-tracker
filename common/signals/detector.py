@@ -42,14 +42,13 @@ def detect_anomalies(
             continue
 
         sector_corr = calculate_sector_correlation(market, enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
-        base_confidence = calculate_confidence_score(ticker, sector_corr, rank)
-        confidence = ticker.final_confidence if ticker.final_confidence is not None else base_confidence
+        signal_score = calculate_signal_score(ticker, sector_corr, rank)
 
-        if confidence >= config.CONFIDENCE_THRESHOLD:
+        if signal_score >= config.SIGNAL_SCORE_CANDIDATE_MINIMUM:
             contexts = _build_contexts(ticker)
             candidate = SignalCandidate(
                 market=market,
-                confidence=confidence,
+                signal_score=signal_score,
                 price_change=ticker.price_change_10m or 0.0,
                 rvol=ticker.relative_volume or 0.0,
                 rvol_z_score=ticker.rvol_z_score or 0.0,
@@ -58,7 +57,7 @@ def detect_anomalies(
             )
             candidates.append(candidate)
 
-    return sorted(candidates, key=lambda x: x.confidence, reverse=True)
+    return sorted(candidates, key=lambda x: x.signal_score, reverse=True)
 
 def _build_contexts(ticker: TickerData) -> List[str]:
     """TickerData를 기반으로 시그널에 대한 컨텍스트 문자열 리스트를 생성합니다."""
@@ -118,7 +117,7 @@ def calculate_sector_correlation(
     return max(0, (correlation - 0.5) * 2)
 
 
-def calculate_confidence_score(ticker: TickerData, sector_corr: float, rank: int) -> float:
+def calculate_signal_score(ticker: TickerData, sector_corr: float, rank: int) -> float:
     """
     코인의 순위(체급)에 따라 목표치를 다르게 적용하여 점수를 매깁니다.
     - 메이저: 작은 변동에도 높은 점수 부여
@@ -171,7 +170,7 @@ def calculate_confidence_score(ticker: TickerData, sector_corr: float, rank: int
     if z_score > 3.0 and price_change_abs < config.WASH_TRADING_MIN_PRICE_CHANGE:
         score -= 0.3 
 
-    return min(max(score, 0.0), 0.95)
+    return max(score, 0.0)
 
 def filter_market_wide_events(
     candidates: List[SignalCandidate], enriched_tickers: Dict[str, TickerData]

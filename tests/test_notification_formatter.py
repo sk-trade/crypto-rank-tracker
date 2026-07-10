@@ -6,7 +6,7 @@ def _alert(signal_type: str, price_change: float = -2.5) -> Alert:
     return Alert(
         candidate=SignalCandidate(
             market="KRW-BTC",
-            confidence=0.75,
+            signal_score=0.75,
             price_change=price_change,
             rvol=2.0,
             rvol_z_score=1.5,
@@ -31,6 +31,13 @@ def _header_for(signal_type: str, price_change: float = -2.5) -> str:
 
 def test_formatter_labels_bearish_acceleration_alert():
     assert "하락 모멘텀 가속" in _header_for("DOWNTREND_ACCELERATION")
+
+
+def test_formatter_labels_an_uncalibrated_signal_score_without_a_percentage():
+    header = _header_for("BREAKOUT_START")
+
+    assert "Signal score: 0.75" in header
+    assert "신뢰도" not in header
 
 
 def test_data_quality_alert_does_not_claim_the_market_has_no_events():
