@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -20,6 +21,7 @@ UPBIT_MARKET_URL = "https://api.upbit.com/v1/market/all"
 CG_BASE_URL = "https://api.coingecko.com/api/v3"
 CG_COINS_LIST_URL = f"{CG_BASE_URL}/coins/list"
 CG_COIN_DETAIL_URL = f"{CG_BASE_URL}/coins/"
+CG_SYMBOL_OVERRIDES = json.loads(__import__("os").environ.get("CG_SYMBOL_OVERRIDES", "{}"))
 
 
 # --- RateLimiter 클래스 ---
@@ -62,8 +64,8 @@ async def get_upbit_krw_markets(session: aiohttp.ClientSession) -> Dict[str, str
         return {}
 
 
-async def get_coingecko_coins_list(session: aiohttp.ClientSession) -> Dict[str, str]:
-    """CoinGecko의 모든 코인 목록(symbol -> id)을 가져옵니다."""
+async def get_coingecko_coins_list(session: aiohttp.ClientSession) -> Dict[str, List[str]]:
+    """Return every CoinGecko id for a symbol; never silently choose a collision."""
     try:
         await rate_limiter.wait()
 
@@ -71,7 +73,10 @@ async def get_coingecko_coins_list(session: aiohttp.ClientSession) -> Dict[str, 
         async with session.get(CG_COINS_LIST_URL, headers=headers) as response:
             response.raise_for_status()
             coins = await response.json()
-            return {c["symbol"].lower(): c["id"] for c in coins}
+            mapping: Dict[str, List[str]] = {}
+            for coin in coins:
+                mapping.setdefault(coin["symbol"].lower(), []).append(coin["id"])
+            return mapping
     except Exception as e:
         logging.error(f"CoinGecko 코인 목록 조회 실패: {e}")
         return {}
@@ -113,11 +118,17 @@ async def tag_market(
     session: aiohttp.ClientSession,
     symbol: str,
     market_name: str,
-    cg_symbol_to_id: Dict[str, str],
+    cg_symbol_to_id: Dict[str, List[str]],
 ) -> Tuple[str, List[str]]:
     """단일 Upbit 마켓에 CoinGecko 카테고리를 태깅합니다."""
     if symbol in cg_symbol_to_id:
-        coin_id = cg_symbol_to_id[symbol]
+        candidates = cg_symbol_to_id[symbol]
+        coin_id = CG_SYMBOL_OVERRIDES.get(symbol)
+        if coin_id and coin_id not in candidates:
+            return market_name, ["Untagged", "Override_Invalid"]
+        if not coin_id and len(candidates) != 1:
+            return market_name, ["Untagged", "CG_Symbol_Ambiguous"]
+        coin_id = coin_id or candidates[0]
         categories = await get_coin_categories(session, coin_id)
         if categories is not None:
             return market_name, categories if categories else ["Untagged", "No_Category"]
