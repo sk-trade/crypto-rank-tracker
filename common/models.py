@@ -73,6 +73,7 @@ class Alert(BaseModel):
     ticker_data: TickerData  # 포매팅 시 참고할 상세 데이터
     signal_type: str
     priority: int
+    structure_level: Optional[float] = None
 
 
 class RankState(BaseModel):
@@ -130,3 +131,5 @@ class AlertHistory(BaseModel):
     last_rvol: float
     initial_timestamp: datetime.datetime
     initial_price: float
+    structure_level: Optional[float] = None
+    structure_direction: Optional[str] = None

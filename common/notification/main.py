@@ -115,13 +115,18 @@ def _update_alert_history(
                 last_rvol=candidate.rvol,
                 initial_timestamp=now,
                 initial_price=candidate.current_price,
+                structure_level=alert.structure_level,
+                structure_direction=("bullish" if signal_type == "BREAKOUT_START" else "bearish"),
             )
-        elif "SUSTAINED" in signal_type or "FAILED" in signal_type:
+        elif "ACCELERATION" in signal_type or "FAILED" in signal_type:
             if market in history:
                 history[market].last_alert_timestamp = now
                 history[market].last_signal_type = signal_type
                 history[market].last_price = candidate.current_price
                 history[market].last_rvol = candidate.rvol
+                if "FAILED" in signal_type:
+                    history[market].structure_level = None
+                    history[market].structure_direction = None
     return history
 
 

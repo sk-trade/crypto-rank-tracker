@@ -5,6 +5,7 @@ from common.notification.engine import AlertEngine
 
 
 def _history(signal_type: str, last_price: float, now: datetime.datetime) -> AlertHistory:
+    bearish = "BEAR" in signal_type or "DOWNTREND" in signal_type or "BREAKDOWN" in signal_type
     return AlertHistory(
         market="KRW-BTC",
         last_alert_timestamp=now - datetime.timedelta(minutes=30),
@@ -13,6 +14,8 @@ def _history(signal_type: str, last_price: float, now: datetime.datetime) -> Ale
         last_rvol=1.0,
         initial_timestamp=now - datetime.timedelta(hours=2),
         initial_price=last_price,
+        structure_level=100.0,
+        structure_direction="bearish" if bearish else "bullish",
     )
 
 
@@ -51,10 +54,10 @@ def _process_signal_type(previous_signal_type: str, current_price: float) -> str
     return alerts[0].signal_type
 
 
-def test_process_signals_classifies_downtrend_follow_up_as_bear_sustained():
+def test_process_signals_classifies_downtrend_follow_up_as_acceleration():
     assert (
         _process_signal_type("DOWNTREND_ACCELERATION", 98.0)
-        == "BEAR_MOMENTUM_SUSTAINED"
+        == "DOWNTREND_ACCELERATION"
     )
 
 
@@ -68,7 +71,7 @@ def test_process_signals_classifies_momentum_reversal_as_bull_failed():
 def test_process_signals_classifies_followup_bull_sustained_as_bull_sustained():
     assert (
         _process_signal_type("BULL_MOMENTUM_SUSTAINED", 104.0)
-        == "BULL_MOMENTUM_SUSTAINED"
+        == "MOMENTUM_ACCELERATION"
     )
 
 
@@ -82,7 +85,7 @@ def test_process_signals_classifies_followup_bull_failed_as_bull_failed():
 def test_process_signals_classifies_followup_bear_sustained_as_bear_sustained():
     assert (
         _process_signal_type("BEAR_MOMENTUM_SUSTAINED", 96.0)
-        == "BEAR_MOMENTUM_SUSTAINED"
+        == "DOWNTREND_ACCELERATION"
     )
 
 
@@ -93,11 +96,11 @@ def test_process_signals_classifies_followup_bear_failed_as_bear_failed():
     )
 
 
-def test_prior_downtrend_acceleration_with_continued_lower_price_is_bear_sustained():
+def test_prior_downtrend_acceleration_with_continued_lower_price_is_acceleration():
     now = datetime.datetime.now(datetime.timezone.utc)
     engine = AlertEngine()
 
-    signal_type, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._get_alert_type_and_priority(
         candidate=_candidate(98.0),
         ticker=_ticker(),
         history={
@@ -105,14 +108,14 @@ def test_prior_downtrend_acceleration_with_continued_lower_price_is_bear_sustain
         },
     )
 
-    assert signal_type == "BEAR_MOMENTUM_SUSTAINED"
+    assert signal_type == "DOWNTREND_ACCELERATION"
 
 
 def test_prior_downtrend_acceleration_with_rebound_is_bear_failed():
     now = datetime.datetime.now(datetime.timezone.utc)
     engine = AlertEngine()
 
-    signal_type, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._get_alert_type_and_priority(
         candidate=_candidate(102.0),
         ticker=_ticker(),
         history={
@@ -123,11 +126,11 @@ def test_prior_downtrend_acceleration_with_rebound_is_bear_failed():
     assert signal_type == "BEAR_MOMENTUM_FAILED"
 
 
-def test_prior_momentum_acceleration_with_continued_upside_is_bull_sustained():
+def test_prior_momentum_acceleration_with_continued_upside_is_acceleration():
     now = datetime.datetime.now(datetime.timezone.utc)
     engine = AlertEngine()
 
-    signal_type, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._get_alert_type_and_priority(
         candidate=_candidate(102.0),
         ticker=_ticker(),
         history={
@@ -135,14 +138,14 @@ def test_prior_momentum_acceleration_with_continued_upside_is_bull_sustained():
         },
     )
 
-    assert signal_type == "BULL_MOMENTUM_SUSTAINED"
+    assert signal_type == "MOMENTUM_ACCELERATION"
 
 
 def test_prior_momentum_acceleration_with_reversal_down_is_bull_failed():
     now = datetime.datetime.now(datetime.timezone.utc)
     engine = AlertEngine()
 
-    signal_type, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._get_alert_type_and_priority(
         candidate=_candidate(97.0),
         ticker=_ticker(),
         history={
