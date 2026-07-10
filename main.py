@@ -86,6 +86,14 @@ def assess_scan_data_quality(
     return issues
 
 
+def filter_candidates_by_market_regime(candidate_markets: list[str], market_regime: dict) -> list[str]:
+    """Fail closed when BTC data cannot establish a valid market regime."""
+    if market_regime.get("regime") == "UNKNOWN":
+        logger.warning("Blocking candidates because BTC market regime is UNKNOWN.")
+        return []
+    return candidate_markets
+
+
 async def run_check(execution_id: str | None = None):
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
     config.validate_storage_config()
@@ -213,6 +221,9 @@ async def run_check(execution_id: str | None = None):
 
                 market_regime = get_market_regime(enriched_tickers)
                 logger.info(f"현재 시장 체제: {market_regime.get('regime', 'UNKNOWN')}")
+                candidate_markets = filter_candidates_by_market_regime(
+                    candidate_markets, market_regime
+                )
 
             # PHASE 3: 알림 생성
             final_alerts = []

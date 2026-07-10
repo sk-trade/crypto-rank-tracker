@@ -14,31 +14,43 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 def get_market_regime(enriched_tickers: Dict[str, TickerData]) -> Dict[str, Any]:
     """BTC의 1시간봉 데이터로 현재 시장 체제를 분석합니다."""
     btc_ticker = enriched_tickers.get("KRW-BTC")
-    if not btc_ticker or not btc_ticker.hourly_candles or len(btc_ticker.hourly_candles) < 24:
+    required_candles = max(config.REGIME_ATR_LONG_PERIOD + 1, config.REGIME_RSI_PERIOD + 1)
+    if not btc_ticker or len(btc_ticker.hourly_candles) < required_candles:
         return {"regime": "UNKNOWN"}
 
-    hourly_closes = np.array([c.close_price for c in btc_ticker.hourly_candles])
-    returns = np.diff(np.log(hourly_closes))
-    
-    # 변동성 (ATR 단순화)
-    atr_24h = np.mean([c.high_price - c.low_price for c in btc_ticker.hourly_candles[-24:]])
-    atr_6h = np.mean([c.high_price - c.low_price for c in btc_ticker.hourly_candles[-6:]])
+    candles = btc_ticker.hourly_candles
+    closes = np.array([candle.close_price for candle in candles])
+    changes = np.diff(closes)
+    recent_changes = changes[-config.REGIME_RSI_PERIOD :]
+    average_gain = np.mean(np.maximum(recent_changes, 0))
+    average_loss = np.mean(np.maximum(-recent_changes, 0))
+    if average_loss == 0:
+        rsi = 100.0 if average_gain > 0 else 50.0
+    else:
+        rsi = 100 - (100 / (1 + average_gain / average_loss))
+
+    true_ranges = np.array(
+        [
+            max(
+                candle.high_price - candle.low_price,
+                abs(candle.high_price - previous.close_price),
+                abs(candle.low_price - previous.close_price),
+            )
+            for previous, candle in zip(candles, candles[1:])
+        ]
+    )
+    atr_24h = np.mean(true_ranges[-config.REGIME_ATR_LONG_PERIOD :])
+    atr_6h = np.mean(true_ranges[-config.REGIME_ATR_SHORT_PERIOD :])
     vol_ratio = atr_6h / atr_24h if atr_24h > 0 else 1.0
-    
-    # 모멘텀 (RSI 단순화)
-    gains = returns[returns > 0].sum()
-    losses = -returns[returns < 0].sum()
-    rs = (gains / 24) / (losses / 24) if losses > 0 else 100
-    rsi = 100 - (100 / (1 + rs))
 
     if vol_ratio > 1.8:
-        return {"regime": "HIGH_VOLATILITY"}
+        return {"regime": "HIGH_VOLATILITY", "rsi": rsi, "atr_ratio": vol_ratio}
     if rsi > 60 and vol_ratio < 1.5:
-        return {"regime": "TRENDING_BULL"}
+        return {"regime": "TRENDING_BULL", "rsi": rsi, "atr_ratio": vol_ratio}
     if rsi < 40 and vol_ratio < 1.5:
-        return {"regime": "TRENDING_BEAR"}
+        return {"regime": "TRENDING_BEAR", "rsi": rsi, "atr_ratio": vol_ratio}
     
-    return {"regime": "MEAN_REVERSION"}
+    return {"regime": "MEAN_REVERSION", "rsi": rsi, "atr_ratio": vol_ratio}
 
 
 def enrich_deep_dive_tickers(
