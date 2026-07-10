@@ -74,6 +74,13 @@ DECOUPLING_MIN_DEVIATION_PCT = 3.0
 ALERT_MIN_PRICE_CHANGE_10M = 0.8  # 최소 변동폭 (스캘핑 마지노선)
 ALERT_MIN_SIGNAL_SCORE = 0.70
 
+# [Evaluation target]
+# Signals are evaluated from the next fully completed 10-minute bar's opening
+# price over one hour. Costs are a fixed pre-trade estimate, not a fee quote.
+PRIMARY_HOLDING_PERIOD_MINUTES = 60
+PRIMARY_EXECUTION_TIMEFRAME_MINUTES = 10
+ESTIMATED_ROUND_TRIP_COST_BPS = 10.0
+
 # [쿨다운]
 ALERT_COOLDOWN_MINUTES = 60       
 SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT = 1.0
