@@ -98,6 +98,7 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
             krw_markets = [
                 m["market"] for m in markets_data if m["market"].startswith("KRW-")
             ]
+            warnings = {m["market"]: m.get("market_warning") for m in markets_data}
 
         if not krw_markets:
             raise UpbitAPIError("KRW 마켓 목록을 가져오지 못했습니다.")
@@ -110,6 +111,8 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
             tickers = await response.json()
             if not tickers:
                 raise UpbitAPIError("티커 정보를 가져오지 못했습니다.")
+            for ticker in tickers:
+                ticker["market_warning"] = warnings.get(ticker["market"])
             return tickers
 
     except aiohttp.ClientError as e:
@@ -118,6 +121,22 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
     except Exception as e:
         logger.error(f"Upbit API 예상치 못한 오류 (get_all_krw_tickers): {e}")
         raise UpbitAPIError(f"알 수 없는 오류: {e}") from e
+
+
+async def get_orderbooks(session: aiohttp.ClientSession, markets: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Fetch orderbook snapshots; callers must fail closed for missing markets."""
+    if not markets:
+        return {}
+    try:
+        async with GLOBAL_LIMITER:
+            async with session.get(
+                f"{UPBIT_API_BASE_URL}/orderbook", params={"markets": ",".join(markets)}, timeout=15
+            ) as response:
+                response.raise_for_status()
+                return {book["market"]: book for book in await response.json()}
+    except (aiohttp.ClientError, ValueError) as error:
+        logger.warning("Orderbook collection failed: %s", error)
+        return {}
 
 
 async def get_candles(

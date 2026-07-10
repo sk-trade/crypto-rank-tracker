@@ -12,9 +12,11 @@ import functions_framework
 import config
 from common.analysis.utils import calculate_rankings
 from common.analysis.scanner import (
+    CandidateDecision,
     evaluate_candidate_eligibility,
     process_lightweight_indicators,
 )
+from common.execution import assess_execution
 from common.analysis.deep_dive import ( 
     enrich_deep_dive_tickers,
     get_market_regime,
@@ -37,6 +39,7 @@ from common.upbit_client import (
     UpbitAPIError,
     get_all_krw_tickers,
     get_candles,
+    get_orderbooks,
 )
 
 # --- 로거 설정 ---
@@ -171,6 +174,19 @@ async def run_check(execution_id: str | None = None):
             candidate_markets = [
                 market for market, decision in candidate_decisions.items() if decision.eligible
             ]
+            if candidate_markets:
+                orderbooks = await get_orderbooks(session, candidate_markets)
+                for market in candidate_markets:
+                    execution = assess_execution(
+                        lightweight_tickers[market], raw_tickers_map.get(market), orderbooks.get(market)
+                    )
+                    lightweight_tickers[market].execution_spread_bps = execution.spread_bps
+                    lightweight_tickers[market].expected_slippage_bps = execution.expected_slippage_bps
+                    if not execution.executable:
+                        candidate_decisions[market] = CandidateDecision(False, execution.rejection_reasons)
+                candidate_markets = [
+                    market for market, decision in candidate_decisions.items() if decision.eligible
+                ]
             
             if not candidate_markets:
                 logger.info("심층 분석 대상이 없습니다. Phase 2를 건너뜁니다.")

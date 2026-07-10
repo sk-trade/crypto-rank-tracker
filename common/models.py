@@ -46,6 +46,8 @@ class TickerData(BaseModel):
     price_surprise: Optional[float] = None
     rolling_turnover: Optional[float] = None
     liquidity_tier: str = "UNKNOWN"
+    execution_spread_bps: Optional[float] = None
+    expected_slippage_bps: Optional[float] = None
     
 
     # --- 심층 분석용 필드  ---
