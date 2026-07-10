@@ -45,6 +45,9 @@ def validate_storage_config() -> None:
 # [통계 보정 설정]
 MAX_Z_SCORE_CAP = 10.0          # Z-Score 상한선 (통계 왜곡 방지)
 MIN_MAD_FLOOR = 0.001           # Z-Score 분모 0 방지
+CONDITIONAL_VOLUME_MIN_SAMPLES = 3
+# Three prior weekly observations plus the decision bar at a 10-minute cadence.
+CONDITIONAL_VOLUME_HISTORY_BARS = 3_025
 
 # [Wash Trading 필터]
 # 거래량 제한

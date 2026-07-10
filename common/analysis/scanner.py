@@ -62,6 +62,40 @@ def _assign_liquidity_tiers(tickers: Dict[str, TickerData]) -> None:
         else:
             ticker.liquidity_tier = "LOW"
 
+
+def _robust_z_score(value: float, baseline: List[float]) -> float | None:
+    if len(baseline) < config.CONDITIONAL_VOLUME_MIN_SAMPLES:
+        return None
+    median = float(np.median(baseline))
+    mad = float(np.median(np.abs(np.array(baseline) - median)))
+    return min((value - median) / (1.4826 * max(mad, config.MIN_MAD_FLOOR)), config.MAX_Z_SCORE_CAP)
+
+
+def _conditional_log_rvol_z_score(candle_list: List) -> float | None:
+    """Compare a bar only with the same weekday and clock slot in earlier weeks."""
+    latest = candle_list[-1]
+    if latest.volume <= 0:
+        return None
+    slot = (latest.timestamp.weekday(), latest.timestamp.hour, latest.timestamp.minute)
+    prior = [
+        np.log(candle.volume)
+        for candle in candle_list[:-1]
+        if candle.volume > 0
+        and (candle.timestamp.weekday(), candle.timestamp.hour, candle.timestamp.minute) == slot
+    ]
+    return _robust_z_score(float(np.log(latest.volume)), prior)
+
+
+def _assign_cross_sectional_log_rvol_z_scores(tickers: Dict[str, TickerData]) -> None:
+    values = {
+        market: float(np.log(ticker.relative_volume))
+        for market, ticker in tickers.items()
+        if ticker.relative_volume and ticker.relative_volume > 0
+    }
+    baseline = list(values.values())
+    for market, value in values.items():
+        tickers[market].cross_sectional_log_rvol_z_score = _robust_z_score(value, baseline)
+
 def process_lightweight_indicators(
     candles_10m: Dict[str, List], 
     raw_tickers_map: Dict[str, Dict]
@@ -115,10 +149,12 @@ def process_lightweight_indicators(
                 
                 raw_z = (ticker.relative_volume - median_rvol) / (1.4826 * effective_mad)
                 ticker.rvol_z_score = min(raw_z, config.MAX_Z_SCORE_CAP)
+        ticker.conditional_log_rvol_z_score = _conditional_log_rvol_z_score(candle_list)
 
         lightweight_tickers[market] = ticker
 
     _assign_liquidity_tiers(lightweight_tickers)
+    _assign_cross_sectional_log_rvol_z_scores(lightweight_tickers)
     return lightweight_tickers
 
 
@@ -141,7 +177,8 @@ def evaluate_candidate_eligibility(
     decisions = {}
     for market, ticker in lightweight_tickers.items():
         
-        z_score = ticker.rvol_z_score or 0
+        conditional_z_score = ticker.conditional_log_rvol_z_score
+        z_score = conditional_z_score or 0
         price_change = abs(ticker.price_change_10m or 0)
         price_surprise = ticker.price_surprise
         liquidity_tier = ticker.liquidity_tier
@@ -151,6 +188,9 @@ def evaluate_candidate_eligibility(
 
         if price_surprise is None or liquidity_tier == "UNKNOWN":
             decisions[market] = CandidateDecision(False, ["price_surprise_unavailable"])
+            continue
+        if conditional_z_score is None:
+            decisions[market] = CandidateDecision(False, ["conditional_volume_history_unavailable"])
             continue
 
         # 필터 조건 확인

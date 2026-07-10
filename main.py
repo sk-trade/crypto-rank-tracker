@@ -136,7 +136,7 @@ async def run_check(execution_id: str | None = None):
                 all_markets,
                 time_unit="minutes",
                 minutes_unit=10,
-                count=200,
+                count=config.CONDITIONAL_VOLUME_HISTORY_BARS,
                 as_of=scan_started_at,
             )
             data_quality_issues = assess_scan_data_quality(

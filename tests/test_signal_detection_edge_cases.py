@@ -33,6 +33,7 @@ def test_detect_anomalies_allows_missing_rvol_z_score_for_price_only_candidate()
         price_change_10m=6.5,
         price_surprise=3.25,
         liquidity_tier="HIGH",
+        conditional_log_rvol_z_score=0.0,
         relative_volume=None,
         rvol_z_score=None,
         trend_1h_stable="UP",
@@ -66,6 +67,7 @@ def test_detect_anomalies_uses_the_single_calculated_signal_score():
         price_change_10m=6.5,
         price_surprise=3.25,
         liquidity_tier="HIGH",
+        conditional_log_rvol_z_score=5.0,
         relative_volume=4.5,
         rvol_z_score=5.0,
     )

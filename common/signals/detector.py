@@ -32,7 +32,11 @@ def detect_anomalies(
     # 각 티커를 순회하며 시그널 후보 생성
     candidates = []
     for market, ticker in enriched_tickers.items():
-        z_score = ticker.rvol_z_score or 0
+        # Candidate selection already requires this metric; retain that contract here.
+        conditional_z_score = ticker.conditional_log_rvol_z_score
+        if conditional_z_score is None:
+            continue
+        z_score = conditional_z_score
         price_change = abs(ticker.price_change_10m or 0)
         price_surprise = ticker.price_surprise
 
@@ -53,7 +57,7 @@ def detect_anomalies(
                 signal_score=signal_score,
                 price_change=ticker.price_change_10m or 0.0,
                 rvol=ticker.relative_volume or 0.0,
-                rvol_z_score=ticker.rvol_z_score or 0.0,
+                rvol_z_score=conditional_z_score,
                 contexts=contexts,
                 current_price=ticker.candle_history[-1].close_price,
             )

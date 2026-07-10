@@ -39,6 +39,8 @@ class TickerData(BaseModel):
     price_change_10m: Optional[float] = None
     relative_volume: Optional[float] = None
     rvol_z_score: Optional[float] = None
+    conditional_log_rvol_z_score: Optional[float] = None
+    cross_sectional_log_rvol_z_score: Optional[float] = None
     price_change_1h: Optional[float] = None
     price_change_4h: Optional[float] = None
     price_surprise: Optional[float] = None

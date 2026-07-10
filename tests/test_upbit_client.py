@@ -1,7 +1,8 @@
 import datetime
+import asyncio
 
 from common.models import CandleData
-from common.upbit_client import normalize_completed_candles
+from common.upbit_client import get_candles, normalize_completed_candles
 from main import filter_markets_with_complete_deep_dive_data
 
 
@@ -61,3 +62,57 @@ def test_deep_dive_gate_blocks_a_candidate_missing_either_timeframe():
         {"KRW-BTC": [], "KRW-ETH": []},
         {"KRW-BTC": [], "KRW-XRP": []},
     ) == ["KRW-BTC"]
+
+
+class _Response:
+    status = 200
+    headers = {}
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    async def json(self):
+        return self.payload
+
+
+class _Session:
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.calls = []
+
+    def get(self, _url, params, timeout):
+        self.calls.append(params)
+        return _Response(self.pages.pop(0))
+
+
+def _raw_candle(timestamp: datetime.datetime) -> dict:
+    return {
+        "market": "KRW-BTC", "candle_date_time_utc": timestamp.isoformat().replace("+00:00", "Z"),
+        "opening_price": 100.0, "high_price": 101.0, "low_price": 99.0,
+        "trade_price": 100.0, "candle_acc_trade_volume": 1.0,
+    }
+
+
+def test_get_candles_paginates_before_normalizing_the_complete_grid():
+    as_of = datetime.datetime(2026, 6, 18, 12, 6, tzinfo=UTC)
+    latest = datetime.datetime(2026, 6, 18, 11, 50, tzinfo=UTC)
+    chronological = [latest - datetime.timedelta(minutes=10 * offset) for offset in range(200, -1, -1)]
+    newest_first = list(reversed([_raw_candle(timestamp) for timestamp in chronological]))
+    session = _Session([newest_first[:200], newest_first[200:]])
+
+    result = asyncio.run(get_candles(session, ["KRW-BTC"], "minutes", 201, 10, as_of))
+
+    assert len(result["KRW-BTC"]) == 201
+    assert len(session.calls) == 2
+    assert session.calls[0]["count"] == 200
+    assert session.calls[1]["count"] == 1
+    assert "to" in session.calls[1]

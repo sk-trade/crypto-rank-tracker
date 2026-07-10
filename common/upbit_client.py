@@ -19,6 +19,7 @@ UPBIT_API_BASE_URL = "https://api.upbit.com/v1"
 
 GLOBAL_LIMITER = AsyncLimiter(8, 1) 
 KST = ZoneInfo("Asia/Seoul")
+MAX_CANDLES_PER_REQUEST = 200
 
 class UpbitAPIError(Exception):
     """Upbit API 호출 실패 시 발생하는 사용자 정의 예외입니다."""
@@ -148,87 +149,79 @@ async def get_candles(
             url = f"{UPBIT_API_BASE_URL}/candles/minutes/{minutes_unit}"
         else:
             url = f"{UPBIT_API_BASE_URL}/candles/{time_unit}"
-        params = {"market": market, "count": count}
         max_retries = 3
+        raw_candles = []
+        remaining = count
+        to: datetime.datetime | None = None
 
-        for attempt in range(max_retries):
-            try:
-                async with limiter:
-                    async with session.get(url, params=params, timeout=10) as response:
-                        if response.status == 429:
-                            retry_after = int(response.headers.get("Retry-After", 1))
-                            logger.warning(
-                                f"{market}: 429 Rate Limit. {retry_after}초 대기 (시도 {attempt + 1}/{max_retries})"
-                            )
-                            await asyncio.sleep(retry_after)
-                            continue
+        while remaining:
+            params = {"market": market, "count": min(remaining, MAX_CANDLES_PER_REQUEST)}
+            if to:
+                params["to"] = to.strftime("%Y-%m-%dT%H:%M:%SZ")
+            page = None
+            for attempt in range(max_retries):
+                try:
+                    async with limiter:
+                        async with session.get(url, params=params, timeout=10) as response:
+                            if response.status == 429:
+                                retry_after = int(response.headers.get("Retry-After", 1))
+                                logger.warning(
+                                    f"{market}: 429 Rate Limit. {retry_after}초 대기 (시도 {attempt + 1}/{max_retries})"
+                                )
+                                await asyncio.sleep(retry_after)
+                                continue
+                            if 500 <= response.status < 600:
+                                wait_time = 2**attempt
+                                logger.warning(
+                                    f"{market}: {response.status} 서버 에러. {wait_time}초 대기 (시도 {attempt + 1}/{max_retries})"
+                                )
+                                await asyncio.sleep(wait_time)
+                                continue
+                            response.raise_for_status()
+                            page = await response.json()
+                    if page:
+                        break
 
-                        if 500 <= response.status < 600:
-                            wait_time = 2**attempt
-                            logger.warning(
-                                f"{market}: {response.status} 서버 에러. {wait_time}초 대기 (시도 {attempt + 1}/{max_retries})"
-                            )
-                            await asyncio.sleep(wait_time)
-                            continue
-
-                        response.raise_for_status()
-                        raw_candles = await response.json()
-
-                        if not raw_candles:
-                            logger.warning(f"{market}의 캔들 데이터가 비어 있습니다.")
-                            return market, []
-
-                        candles = [
-                            CandleData.model_validate(
-                                {
-                                    "market": r["market"],
-                                    "timestamp": _as_utc(
-                                        datetime.datetime.fromisoformat(
-                                            r["candle_date_time_utc"].replace("Z", "+00:00")
-                                        )
-                                    ),
-                                    "open_price": r["opening_price"],
-                                    "high_price": r["high_price"],
-                                    "low_price": r["low_price"],
-                                    "close_price": r["trade_price"],
-                                    "volume": r["candle_acc_trade_volume"],
-                                }
-                            )
-                            for r in raw_candles
-                        ]
-                        complete_candles = normalize_completed_candles(
-                            candles,
-                            time_unit=time_unit,
-                            count=count,
-                            minutes_unit=minutes_unit,
-                            as_of=as_of,
-                        )
-                        if len(complete_candles) != count:
-                            logger.warning(
-                                "%s: rejected candle history due to incomplete, duplicate, or off-grid data "
-                                "(unit=%s, expected=%d, received=%d).",
-                                market,
-                                time_unit,
-                                count,
-                                len(candles),
-                            )
-                            return market, []
-                        return market, complete_candles
-
-            except aiohttp.ClientError as e:
-                logger.warning(
-                    f"{market}: 네트워크 오류 (시도 {attempt + 1}/{max_retries}): {e}"
-                )
-                if attempt == max_retries - 1:
-                    logger.error(f"{market}: 최종 재시도 실패 (네트워크 오류).")
+                except aiohttp.ClientError as e:
+                    logger.warning(
+                        f"{market}: 네트워크 오류 (시도 {attempt + 1}/{max_retries}): {e}"
+                    )
+                    if attempt == max_retries - 1:
+                        logger.error(f"{market}: 최종 재시도 실패 (네트워크 오류).")
+                        return market, []
+                    await asyncio.sleep(2**attempt)
+                except Exception as e:
+                    logger.error(f"{market}: 캔들 데이터 처리 중 예상치 못한 오류: {e}")
                     return market, []
-                await asyncio.sleep(2**attempt)
-            except Exception as e:
-                logger.error(f"{market}: 캔들 데이터 처리 중 예상치 못한 오류: {e}")
-                return market, []
 
-        logger.error(f"{market}: 최대 재시도 횟수({max_retries})를 초과했습니다.")
-        return market, []
+            if not page:
+                logger.error(f"{market}: 최대 재시도 횟수({max_retries})를 초과했습니다.")
+                return market, []
+            raw_candles.extend(page)
+            remaining -= len(page)
+            if len(page) < params["count"]:
+                logger.warning(f"{market}: requested {count} candles but history ended early.")
+                return market, []
+            oldest = min(
+                datetime.datetime.fromisoformat(item["candle_date_time_utc"].replace("Z", "+00:00"))
+                for item in page
+            )
+            to = _as_utc(oldest)
+
+        candles = [
+            CandleData.model_validate({
+                "market": item["market"],
+                "timestamp": _as_utc(datetime.datetime.fromisoformat(item["candle_date_time_utc"].replace("Z", "+00:00"))),
+                "open_price": item["opening_price"], "high_price": item["high_price"],
+                "low_price": item["low_price"], "close_price": item["trade_price"],
+                "volume": item["candle_acc_trade_volume"],
+            }) for item in raw_candles
+        ]
+        complete_candles = normalize_completed_candles(candles, time_unit, count, minutes_unit, as_of)
+        if len(complete_candles) != count:
+            logger.warning("%s: rejected incomplete, duplicate, or off-grid paginated candle history.", market)
+            return market, []
+        return market, complete_candles
 
     tasks = [_fetch_single_market(m) for m in markets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
