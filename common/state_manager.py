@@ -1,6 +1,7 @@
 #common/state_manager
 import asyncio
 import datetime
+import fcntl
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from common.models import AlertHistory, AnalysisState, RankState, ScanEvent, Sca
 from common.storage_client import load_json, save_json
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
+IDEMPOTENCY_STATE_FILE_NAME = "processed_scan_keys.json"
 
 
 # --- 순위 상태 관리 ---
@@ -86,6 +88,88 @@ async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
     await save_json(
         "pending_scan_events.json", [event.model_dump(mode="json") for event in events], gcs_client
     )
+
+
+async def claim_scan_key(scan_key: str, execution_id: str | None = None, gcs_client=None) -> bool:
+    """Atomically claim a completed-candle scan key before any side effects occur."""
+    if config.STATE_STORAGE_METHOD == "GCS" and gcs_client:
+        return await _claim_scan_key_in_gcs(scan_key, execution_id, gcs_client)
+    return await asyncio.to_thread(_claim_scan_key_locally, scan_key, execution_id)
+
+
+def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
+    os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
+    lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
+    state_path = os.path.join(config.LOCAL_STATE_DIR, IDEMPOTENCY_STATE_FILE_NAME)
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                with open(state_path, encoding="utf-8") as state_file:
+                    state = json.load(state_file)
+            except FileNotFoundError:
+                state = {"claims": []}
+            claims = state.get("claims", []) if isinstance(state, dict) else []
+            if any(claim.get("scan_key") == scan_key for claim in claims):
+                return False
+            claims.append(
+                {
+                    "scan_key": scan_key,
+                    "execution_id": execution_id,
+                    "claimed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                }
+            )
+            state = {"claims": claims[-config.IDEMPOTENCY_KEY_HISTORY_LIMIT :]}
+            temporary_path = f"{state_path}.tmp"
+            with open(temporary_path, "w", encoding="utf-8") as state_file:
+                json.dump(state, state_file, ensure_ascii=False)
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.replace(temporary_path, state_path)
+            return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_client) -> bool:
+    """Use object generations so competing Cloud Function instances cannot both claim a key."""
+    try:
+        from google.api_core.exceptions import PreconditionFailed
+    except ImportError as error:
+        raise RuntimeError("google-cloud-storage is required for GCS idempotency") from error
+
+    blob = gcs_client.bucket(config.GCS_BUCKET_NAME).blob(IDEMPOTENCY_STATE_FILE_NAME)
+    for _ in range(5):
+        exists = await asyncio.to_thread(blob.exists)
+        if exists:
+            raw_state = await asyncio.to_thread(blob.download_as_text)
+            state = json.loads(raw_state)
+            await asyncio.to_thread(blob.reload)
+            generation = int(blob.generation)
+        else:
+            state = {"claims": []}
+            generation = 0
+        claims = state.get("claims", []) if isinstance(state, dict) else []
+        if any(claim.get("scan_key") == scan_key for claim in claims):
+            return False
+        claims.append(
+            {
+                "scan_key": scan_key,
+                "execution_id": execution_id,
+                "claimed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+        )
+        try:
+            await asyncio.to_thread(
+                blob.upload_from_string,
+                json.dumps({"claims": claims[-config.IDEMPOTENCY_KEY_HISTORY_LIMIT :]}, ensure_ascii=False),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            return True
+        except PreconditionFailed:
+            continue
+    raise RuntimeError("Could not atomically claim scan key after concurrent updates")
 
 
 async def save_analysis_log(state: AnalysisState, gcs_client=None):

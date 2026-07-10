@@ -26,6 +26,7 @@ from common.sector_loader import load_and_process_sectors
 from common.state_manager import (
     append_scan_events,
     append_scan_outcomes,
+    claim_scan_key,
     load_alert_history,
     load_pending_scan_events,
     load_rank_state_history,
@@ -85,7 +86,7 @@ def assess_scan_data_quality(
     return issues
 
 
-async def run_check():
+async def run_check(execution_id: str | None = None):
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
     config.validate_storage_config()
 
@@ -107,6 +108,13 @@ async def run_check():
         async with aiohttp.ClientSession() as session:
             # 공통 준비 단계
             scan_started_at = datetime.datetime.now(datetime.timezone.utc)
+            scan_close_at = scan_started_at.replace(second=0, microsecond=0) - datetime.timedelta(
+                minutes=scan_started_at.minute % config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
+            )
+            scan_key = f"completed-candle:{scan_close_at.isoformat()}"
+            if not await claim_scan_key(scan_key, execution_id=execution_id, gcs_client=gcs_client):
+                logger.warning("Skipping duplicate scheduled scan for %s", scan_key)
+                return
             old_rank_states = await load_rank_state_history(gcs_client)
             previous_rankings = old_rank_states[-1].rankings if old_rank_states else {}
             sectors, reverse_sector_map = await load_and_process_sectors(gcs_client)
@@ -287,7 +295,9 @@ def main(request):
     """
     logger.info("업비트 순위 확인 작업 시작 (Cloud Function).")
     try:
-        asyncio.run(run_check())
+        headers = getattr(request, "headers", {}) if request is not None else {}
+        execution_id = headers.get("X-CloudScheduler-Execution-ID")
+        asyncio.run(run_check(execution_id=execution_id))
     except Exception as e:
         logger.critical(f"작업 실행 중 심각한 오류 발생: {e}", exc_info=True)
         return ("Internal Server Error", 500)

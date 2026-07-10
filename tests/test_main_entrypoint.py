@@ -8,7 +8,7 @@ from common.models import CandleData
 
 
 def test_cloud_function_entrypoint_returns_ok_when_run_check_succeeds(monkeypatch):
-    async def run_check_success():
+    async def run_check_success(execution_id=None):
         return None
 
     monkeypatch.setattr(app, "run_check", run_check_success)
@@ -17,7 +17,7 @@ def test_cloud_function_entrypoint_returns_ok_when_run_check_succeeds(monkeypatc
 
 
 def test_cloud_function_entrypoint_returns_500_when_run_check_fails(monkeypatch):
-    async def run_check_failure():
+    async def run_check_failure(execution_id=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(app, "run_check", run_check_failure)
@@ -27,6 +27,7 @@ def test_cloud_function_entrypoint_returns_500_when_run_check_fails(monkeypatch)
 
 def test_run_check_dispatches_data_quality_incident_and_skips_market_briefing(monkeypatch):
     monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
     monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
     monkeypatch.setattr(
         app,
@@ -48,6 +49,18 @@ def test_run_check_dispatches_data_quality_incident_and_skips_market_briefing(mo
     data_quality_alert.assert_awaited_once()
     market_briefing.assert_not_awaited()
     app.save_rank_state_history.assert_not_awaited()
+
+
+def test_run_check_skips_all_side_effects_when_the_completed_candle_is_claimed(monkeypatch):
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=False))
+    market_loader = AsyncMock()
+    monkeypatch.setattr(app, "get_all_krw_tickers", market_loader)
+
+    import asyncio
+
+    asyncio.run(app.run_check())
+
+    market_loader.assert_not_awaited()
 
 
 def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypatch):
@@ -77,6 +90,7 @@ def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypat
         {"market": "KRW-ETH", "acc_trade_price_24h": 1.0},
     ]
     monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
     monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
     monkeypatch.setattr(app, "get_all_krw_tickers", AsyncMock(return_value=raw_tickers))
     monkeypatch.setattr(

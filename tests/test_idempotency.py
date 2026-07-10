@@ -1,0 +1,22 @@
+import asyncio
+import json
+
+import config
+from common import state_manager
+
+
+def test_local_scan_claim_is_atomic_and_preserves_execution_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+
+    async def claim_twice():
+        return await asyncio.gather(
+            state_manager.claim_scan_key("completed-candle:2026-06-18T00:10:00+00:00", "run-a"),
+            state_manager.claim_scan_key("completed-candle:2026-06-18T00:10:00+00:00", "run-b"),
+        )
+
+    claims = asyncio.run(claim_twice())
+
+    assert sorted(claims) == [False, True]
+    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    assert len(state["claims"]) == 1
+    assert state["claims"][0]["execution_id"] in {"run-a", "run-b"}
