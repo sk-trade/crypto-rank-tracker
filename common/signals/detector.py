@@ -34,15 +34,17 @@ def detect_anomalies(
     for market, ticker in enriched_tickers.items():
         z_score = ticker.rvol_z_score or 0
         price_change = abs(ticker.price_change_10m or 0)
-        rank = current_rankings.get(market, 999)
+        price_surprise = ticker.price_surprise
 
         if z_score > 5.0 and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE:
             continue
-        if z_score <= config.ROBUST_Z_SCORE_THRESHOLD and price_change < config.ALERT_MIN_PRICE_CHANGE_10M:
+        if price_surprise is None:
+            continue
+        if z_score <= config.ROBUST_Z_SCORE_THRESHOLD and price_surprise < config.price_surprise_minimum(ticker.liquidity_tier):
             continue
 
         sector_corr = calculate_sector_correlation(market, enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
-        signal_score = calculate_signal_score(ticker, sector_corr, rank)
+        signal_score = calculate_signal_score(ticker, sector_corr)
 
         if signal_score >= config.SIGNAL_SCORE_CANDIDATE_MINIMUM:
             contexts = _build_contexts(ticker)
@@ -117,29 +119,21 @@ def calculate_sector_correlation(
     return max(0, (correlation - 0.5) * 2)
 
 
-def calculate_signal_score(ticker: TickerData, sector_corr: float, rank: int) -> float:
+def calculate_signal_score(ticker: TickerData, sector_corr: float, rank: int | None = None) -> float:
     """
-    코인의 순위(체급)에 따라 목표치를 다르게 적용하여 점수를 매깁니다.
-    - 메이저: 작은 변동에도 높은 점수 부여
-    - 잡코인: 큰 변동이 있어야 점수 부여
+    사전 시점의 변동성 정규화 가격 surprise와 유동성 구간으로 점수를 매깁니다.
     """
     score = 0.0
     
     z_score = ticker.rvol_z_score or 0
     price_change_abs = abs(ticker.price_change_10m or 0)
-    
-    # 순위에 따른 목표 가격 변동폭 설정
-    if rank <= config.RANK_THRESHOLD_MAJOR:
-        target_price_change = config.MAJOR_MIN_PRICE_CHANGE
-    elif rank <= config.RANK_THRESHOLD_MID:
-        target_price_change = config.MID_MIN_PRICE_CHANGE
-    else:
-        target_price_change = config.MINOR_MIN_PRICE_CHANGE
+    price_surprise = ticker.price_surprise or 0.0
+    target_price_surprise = config.price_surprise_minimum(ticker.liquidity_tier)
 
     # 가격 모멘텀 점수 (최대 0.4)
     # 목표치를 초과 달성할수록 점수가 높아짐 (비율로 계산)
     
-    momentum_ratio = price_change_abs / target_price_change
+    momentum_ratio = price_surprise / target_price_surprise
     if momentum_ratio >= 1.0:
         score += 0.2 # 목표 달성 시 기본 0.2 확보
         # 목표의 2배 달성 시 추가 0.2 (최대 0.4)

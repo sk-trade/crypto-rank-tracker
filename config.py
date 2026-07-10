@@ -50,20 +50,25 @@ MIN_MAD_FLOOR = 0.001           # Z-Score 분모 0 방지
 # 거래량 제한
 WASH_TRADING_MIN_PRICE_CHANGE = 0.5 
 
-# [Dynamic Thresholds - 순위별 차등 적용]
-# 메이저 (Top 50)
-RANK_THRESHOLD_MAJOR = 50
-MAJOR_MIN_PRICE_CHANGE = 1.5
-MAJOR_MIN_Z_SCORE = 3.0
+# [Pre-fitted candidate policy]
+# These parameters are fixed for validation; revisions require the validation workflow.
+# Every value uses only candles completed before the current decision candle.
+PRICE_SURPRISE_LOOKBACK_BARS = 144
+PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS = 30
+ROLLING_TURNOVER_LOOKBACK_BARS = 144
+LIQUIDITY_TIER_QUANTILES = (0.33, 0.67)
+PRICE_SURPRISE_MINIMUMS = {"HIGH": 2.0, "MEDIUM": 2.5, "LOW": 3.0}
+RVOL_Z_SCORE_MINIMUMS = {"HIGH": 3.0, "MEDIUM": 4.0, "LOW": 5.0}
 
-# 중위권 (Top 50 ~ 100)
-RANK_THRESHOLD_MID = 100
-MID_MIN_PRICE_CHANGE = 2.5
-MID_MIN_Z_SCORE = 4.0
 
-# 하위권 (Top 100 밖 - 잡코인)
-MINOR_MIN_PRICE_CHANGE = 5.0  # 5% 이상 급등해야 인정
-MINOR_MIN_Z_SCORE = 5.0       # 거래량도 확실해야 함
+def price_surprise_minimum(liquidity_tier: str) -> float:
+    """Return the fixed policy threshold for a pre-decision liquidity tier."""
+    return PRICE_SURPRISE_MINIMUMS.get(liquidity_tier, PRICE_SURPRISE_MINIMUMS["LOW"])
+
+
+def rvol_z_score_minimum(liquidity_tier: str) -> float:
+    """Return the fixed policy threshold for a pre-decision liquidity tier."""
+    return RVOL_Z_SCORE_MINIMUMS.get(liquidity_tier, RVOL_Z_SCORE_MINIMUMS["LOW"])
 
 # [1차 필터링 공통]
 SIGNAL_SCORE_CANDIDATE_MINIMUM = 0.5

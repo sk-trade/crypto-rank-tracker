@@ -16,6 +16,52 @@ class CandidateDecision:
     eligible: bool
     rejection_reasons: List[str]
 
+
+def _historical_price_surprise(candle_list: List) -> float | None:
+    """Standardize the latest return using only earlier completed-bar returns."""
+    required = config.PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS + 2
+    if len(candle_list) < required:
+        return None
+
+    historical = candle_list[-(config.PRICE_SURPRISE_LOOKBACK_BARS + 1):-1]
+    returns = [
+        (current.close_price / previous.close_price - 1) * 100
+        for previous, current in zip(historical, historical[1:])
+        if previous.close_price > 0
+    ]
+    if len(returns) < config.PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS:
+        return None
+    volatility = float(np.std(returns, ddof=1))
+    if volatility <= 0:
+        return None
+    latest_return = (candle_list[-1].close_price / candle_list[-2].close_price - 1) * 100
+    return abs(latest_return) / volatility
+
+
+def _rolling_turnover(candle_list: List) -> float | None:
+    """Use prior-bar notional turnover so tiering cannot see the current event."""
+    prior_candles = candle_list[-(config.ROLLING_TURNOVER_LOOKBACK_BARS + 1):-1]
+    if not prior_candles:
+        return None
+    turnovers = [candle.close_price * candle.volume for candle in prior_candles]
+    return float(np.median(turnovers)) if turnovers else None
+
+
+def _assign_liquidity_tiers(tickers: Dict[str, TickerData]) -> None:
+    turnovers = [ticker.rolling_turnover for ticker in tickers.values() if ticker.rolling_turnover]
+    if not turnovers:
+        return
+    low_cutoff, high_cutoff = np.quantile(turnovers, config.LIQUIDITY_TIER_QUANTILES)
+    for ticker in tickers.values():
+        if ticker.rolling_turnover is None:
+            continue
+        if ticker.rolling_turnover >= high_cutoff:
+            ticker.liquidity_tier = "HIGH"
+        elif ticker.rolling_turnover >= low_cutoff:
+            ticker.liquidity_tier = "MEDIUM"
+        else:
+            ticker.liquidity_tier = "LOW"
+
 def process_lightweight_indicators(
     candles_10m: Dict[str, List], 
     raw_tickers_map: Dict[str, Dict]
@@ -47,6 +93,8 @@ def process_lightweight_indicators(
         ticker.price_change_10m = (
             candle_list[-1].close_price / candle_list[-2].close_price - 1
         ) * 100
+        ticker.price_surprise = _historical_price_surprise(candle_list)
+        ticker.rolling_turnover = _rolling_turnover(candle_list)
         
         if len(candle_list) >= 7:
             ticker.price_change_1h = (
@@ -69,7 +117,8 @@ def process_lightweight_indicators(
                 ticker.rvol_z_score = min(raw_z, config.MAX_Z_SCORE_CAP)
 
         lightweight_tickers[market] = ticker
-        
+
+    _assign_liquidity_tiers(lightweight_tickers)
     return lightweight_tickers
 
 
@@ -94,28 +143,19 @@ def evaluate_candidate_eligibility(
         
         z_score = ticker.rvol_z_score or 0
         price_change = abs(ticker.price_change_10m or 0)
-        rank = current_rankings.get(market, 999)
+        price_surprise = ticker.price_surprise
+        liquidity_tier = ticker.liquidity_tier
+        min_z_score = config.rvol_z_score_minimum(liquidity_tier)
+        min_price_surprise = config.price_surprise_minimum(liquidity_tier)
+        is_strict_mode = liquidity_tier != "HIGH"
 
-        # 순위에 따른 동적 임계값 적용
-        if rank <= config.RANK_THRESHOLD_MAJOR:
-            # 메이저 (Top 50)
-            min_price_change = config.MAJOR_MIN_PRICE_CHANGE
-            min_z_score = config.MAJOR_MIN_Z_SCORE
-            is_strict_mode = False 
-        elif rank <= config.RANK_THRESHOLD_MID:
-            # 중위권 (Top 100)
-            min_price_change = config.MID_MIN_PRICE_CHANGE
-            min_z_score = config.MID_MIN_Z_SCORE
-            is_strict_mode = True 
-        else:
-            # 하위권 (Top 100 밖)
-            min_price_change = config.MINOR_MIN_PRICE_CHANGE
-            min_z_score = config.MINOR_MIN_Z_SCORE
-            is_strict_mode = True 
+        if price_surprise is None or liquidity_tier == "UNKNOWN":
+            decisions[market] = CandidateDecision(False, ["price_surprise_unavailable"])
+            continue
 
         # 필터 조건 확인
         has_volume_spike = z_score > min_z_score
-        has_price_spike = price_change > min_price_change
+        has_price_spike = price_surprise > min_price_surprise
 
         # Wash Trading 방지
         if z_score > 5.0 and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE:
@@ -132,7 +172,7 @@ def evaluate_candidate_eligibility(
                 if not has_volume_spike:
                     reasons.append("volume_anomaly_below_threshold")
                 if not has_price_spike:
-                    reasons.append("price_move_below_threshold")
+                    reasons.append("price_surprise_below_threshold")
                 decisions[market] = CandidateDecision(False, reasons)
         else:
             # 메이저: 둘 중 하나만 터져도 감지 (선취매 혹은 뉴스 반응)
@@ -140,6 +180,6 @@ def evaluate_candidate_eligibility(
                 decisions[market] = CandidateDecision(True, [])
             else:
                 decisions[market] = CandidateDecision(
-                    False, ["volume_and_price_move_below_threshold"]
+                    False, ["volume_and_price_surprise_below_threshold"]
                 )
     return decisions

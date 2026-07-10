@@ -41,6 +41,9 @@ class TickerData(BaseModel):
     rvol_z_score: Optional[float] = None
     price_change_1h: Optional[float] = None
     price_change_4h: Optional[float] = None
+    price_surprise: Optional[float] = None
+    rolling_turnover: Optional[float] = None
+    liquidity_tier: str = "UNKNOWN"
     
 
     # --- 심층 분석용 필드  ---

@@ -31,6 +31,8 @@ def test_detect_anomalies_allows_missing_rvol_z_score_for_price_only_candidate()
         market="KRW-BTC",
         candle_history=[_candle(price=110.0)],
         price_change_10m=6.5,
+        price_surprise=3.25,
+        liquidity_tier="HIGH",
         relative_volume=None,
         rvol_z_score=None,
         trend_1h_stable="UP",
@@ -62,6 +64,8 @@ def test_detect_anomalies_uses_the_single_calculated_signal_score():
         market="KRW-BTC",
         candle_history=[_candle(price=110.0, volume=2500.0)],
         price_change_10m=6.5,
+        price_surprise=3.25,
+        liquidity_tier="HIGH",
         relative_volume=4.5,
         rvol_z_score=5.0,
     )
@@ -74,13 +78,15 @@ def test_detect_anomalies_uses_the_single_calculated_signal_score():
     )
 
     assert len(candidates) == 1
-    assert candidates[0].signal_score == pytest.approx(0.6)
+    assert candidates[0].signal_score == pytest.approx(0.525)
 
 
 def test_signal_score_is_not_capped_at_an_arbitrary_value():
     ticker = TickerData(
         market="KRW-BTC",
         price_change_10m=10.0,
+        price_surprise=5.0,
+        liquidity_tier="HIGH",
         rvol_z_score=20.0,
         trend_1h_stable="UP",
         is_above_ma50_daily=True,
