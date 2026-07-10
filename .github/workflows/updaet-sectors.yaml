@@ -45,7 +45,7 @@ jobs:
       uses: 'google-github-actions/auth@v2'
       with:
         workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-        service_account: ${{ secrets.GCP_SA_EMAIL }}
+        service_account: ${{ secrets.GCP_RUNTIME_SA_EMAIL }}
 
     # 섹터 업데이트 스크립트 실행
     - name: Run sector update script

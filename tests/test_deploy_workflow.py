@@ -18,3 +18,10 @@ def test_scheduler_update_does_not_delete_the_existing_job():
     assert "gcloud scheduler jobs update http crypto-rank-tracker-scheduler" in workflow
     assert "gcloud scheduler jobs delete" not in workflow
     assert "--oidc-token-audience=\"$FUNCTION_URL\"" in workflow
+
+
+def test_sector_updater_uses_the_runtime_storage_identity():
+    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+
+    assert "GCP_RUNTIME_SA_EMAIL" in workflow
+    assert "GCP_SA_EMAIL" not in workflow
