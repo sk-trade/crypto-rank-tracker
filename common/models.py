@@ -53,6 +53,7 @@ class TickerData(BaseModel):
     # --- 심층 분석용 필드  ---
     decoupling_status: str = "COUPLED"
     decoupling_score: Optional[float] = None
+    residual_momentum_score: Optional[float] = None
     hourly_candles: List[CandleData] = [] 
     daily_candles: List[CandleData] = []
     

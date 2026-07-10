@@ -230,7 +230,7 @@ class NotificationFormatter:
             f"{signal_title}** (Signal score: {candidate.signal_score:.2f})"
         )
 
-        decoupling_score = ticker.decoupling_score
+        residual_score = ticker.residual_momentum_score
 
         checklist = [
             "```",
@@ -242,8 +242,8 @@ class NotificationFormatter:
             f"[Daily] Above MA200     : {ticker.is_above_ma200_daily}",
             f"[Market] Regime        : {market_regime.get('regime', 'N/A')}",
         ]
-        if decoupling_score is not None:
-                checklist.append(f"[Market] Decoupling    : {decoupling_score:+.1f}%p vs BTC")
+        if residual_score is not None:
+            checklist.append(f"[Market] Residual momentum: {residual_score:+.2f} sigma")
         
         checklist.append("```")
         

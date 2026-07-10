@@ -48,6 +48,8 @@ MIN_MAD_FLOOR = 0.001           # Z-Score 분모 0 방지
 CONDITIONAL_VOLUME_MIN_SAMPLES = 3
 # Three prior weekly observations plus the decision bar at a 10-minute cadence.
 CONDITIONAL_VOLUME_HISTORY_BARS = 3_025
+RESIDUAL_MOMENTUM_LOOKBACK_BARS = 144
+RESIDUAL_MOMENTUM_MIN_OBSERVATIONS = 30
 
 # [Wash Trading 필터]
 # 거래량 제한

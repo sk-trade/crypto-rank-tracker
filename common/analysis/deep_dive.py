@@ -64,13 +64,6 @@ def enrich_deep_dive_tickers(
     """
     enriched_tickers = deep_dive_subset.copy()
     
-    # 디커플링 기준 (BTC/ETH 평균)
-    btc = all_lightweight_tickers.get("KRW-BTC")
-    eth = all_lightweight_tickers.get("KRW-ETH")
-    major_change = 0.0
-    if btc and btc.price_change_10m is not None:
-        major_change = btc.price_change_10m
-    
     for market, ticker in enriched_tickers.items():
         # 데이터 주입
         ticker.hourly_candles = candles_60m.get(market, [])
@@ -94,8 +87,4 @@ def enrich_deep_dive_tickers(
             elif ma6 < ma24 * 0.995: ticker.trend_1h_stable = "DOWN"
             else: ticker.trend_1h_stable = "NEUTRAL"
             
-        # 디커플링 계산
-        if ticker.price_change_10m is not None:
-            ticker.decoupling_score = ticker.price_change_10m - major_change
-
     return enriched_tickers

@@ -17,6 +17,7 @@ from common.analysis.scanner import (
     process_lightweight_indicators,
 )
 from common.execution import assess_execution
+from common.residuals import assign_residual_momentum
 from common.analysis.deep_dive import ( 
     enrich_deep_dive_tickers,
     get_market_regime,
@@ -170,6 +171,7 @@ async def run_check(execution_id: str | None = None):
             await save_pending_scan_events(pending_events, gcs_client)
             current_rankings = calculate_rankings(raw_tickers)
             lightweight_tickers = process_lightweight_indicators(candles_10m, raw_tickers_map)
+            assign_residual_momentum(lightweight_tickers, sectors, reverse_sector_map)
             candidate_decisions = evaluate_candidate_eligibility(lightweight_tickers, current_rankings)
             candidate_markets = [
                 market for market, decision in candidate_decisions.items() if decision.eligible
