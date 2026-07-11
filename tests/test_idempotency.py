@@ -33,3 +33,14 @@ def test_gcs_scan_claim_requires_a_gcs_client(monkeypatch, tmp_path):
         asyncio.run(state_manager.claim_scan_key("completed-candle:2026-06-18T00:10:00+00:00"))
 
     assert not (tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).exists()
+
+
+def test_local_scan_claim_can_be_released_for_retry(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
+
+    assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is True
+    asyncio.run(state_manager.release_scan_key(scan_key))
+
+    assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-b")) is True

@@ -51,16 +51,67 @@ def test_run_check_dispatches_data_quality_incident_and_skips_market_briefing(mo
     app.save_rank_state_history.assert_not_awaited()
 
 
-def test_run_check_skips_all_side_effects_when_the_completed_candle_is_claimed(monkeypatch):
+def test_run_check_skips_mutations_when_the_completed_candle_is_claimed(monkeypatch):
     monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=False))
-    market_loader = AsyncMock()
-    monkeypatch.setattr(app, "get_all_krw_tickers", market_loader)
+    monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(
+        app,
+        "get_all_krw_tickers",
+        AsyncMock(return_value=[{"market": "KRW-BTC", "acc_trade_price_24h": 1.0}]),
+    )
+    monkeypatch.setattr(app, "get_candles", AsyncMock(return_value={"KRW-BTC": []}))
+    append_events = AsyncMock()
+    monkeypatch.setattr(app, "append_scan_events", append_events)
+    data_quality_alert = AsyncMock()
+    monkeypatch.setattr(app, "dispatch_data_quality_alert", data_quality_alert)
 
     import asyncio
 
     asyncio.run(app.run_check())
 
-    market_loader.assert_not_awaited()
+    append_events.assert_not_awaited()
+    data_quality_alert.assert_not_awaited()
+
+
+def test_run_check_does_not_consume_scan_key_when_market_collection_fails(monkeypatch):
+    monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(app, "get_all_krw_tickers", AsyncMock(side_effect=RuntimeError("temporary")))
+    claim = AsyncMock()
+    monkeypatch.setattr(app, "claim_scan_key", claim)
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check())
+
+    claim.assert_not_awaited()
+
+
+def test_run_check_releases_claim_when_persistence_fails_before_notification(monkeypatch):
+    monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(
+        app,
+        "get_all_krw_tickers",
+        AsyncMock(return_value=[{"market": "KRW-BTC", "acc_trade_price_24h": 1.0}]),
+    )
+    monkeypatch.setattr(app, "get_candles", AsyncMock(return_value={"KRW-BTC": []}))
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "append_scan_events", AsyncMock(side_effect=RuntimeError("disk")))
+    release = AsyncMock()
+    monkeypatch.setattr(app, "release_scan_key", release)
+    notify = AsyncMock()
+    monkeypatch.setattr(app, "dispatch_data_quality_alert", notify)
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check())
+
+    release.assert_awaited_once()
+    notify.assert_not_awaited()
 
 
 def test_unknown_regime_marks_candidate_decisions_for_event_logging():

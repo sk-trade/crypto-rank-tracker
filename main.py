@@ -30,6 +30,7 @@ from common.state_manager import (
     append_scan_events,
     append_scan_outcomes,
     claim_scan_key,
+    release_scan_key,
     load_alert_history,
     load_pending_scan_events,
     load_rank_state_history,
@@ -132,6 +133,8 @@ async def run_check(execution_id: str | None = None):
     else:
         logger.info("로컬 파일 저장 모드로 실행됩니다.")
 
+    claimed_scan_key = None
+    notification_started = False
     try:
         async with aiohttp.ClientSession() as session:
             # 공통 준비 단계
@@ -140,9 +143,6 @@ async def run_check(execution_id: str | None = None):
                 minutes=scan_started_at.minute % config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
             )
             scan_key = f"completed-candle:{scan_close_at.isoformat()}"
-            if not await claim_scan_key(scan_key, execution_id=execution_id, gcs_client=gcs_client):
-                logger.warning("Skipping duplicate scheduled scan for %s", scan_key)
-                return
             old_rank_states = await load_rank_state_history(gcs_client)
             previous_rankings = old_rank_states[-1].rankings if old_rank_states else {}
             sectors, reverse_sector_map = await load_and_process_sectors(gcs_client)
@@ -164,6 +164,12 @@ async def run_check(execution_id: str | None = None):
             )
             if data_quality_issues:
                 logger.error("Skipping scan due to data quality: %s", "; ".join(data_quality_issues))
+                if not await claim_scan_key(
+                    scan_key, execution_id=execution_id, gcs_client=gcs_client
+                ):
+                    logger.warning("Skipping duplicate scheduled scan for %s", scan_key)
+                    return
+                claimed_scan_key = scan_key
                 await append_scan_events(
                     build_scan_events(
                         scan_started_at,
@@ -177,14 +183,12 @@ async def run_check(execution_id: str | None = None):
                     ),
                     gcs_client,
                 )
+                notification_started = True
                 await dispatch_data_quality_alert(data_quality_issues)
                 return
 
             pending_events = await load_pending_scan_events(gcs_client)
             resolved_outcomes, pending_events = resolve_scan_outcomes(pending_events, candles_10m)
-            if resolved_outcomes:
-                await append_scan_outcomes(resolved_outcomes, gcs_client)
-            await save_pending_scan_events(pending_events, gcs_client)
             current_rankings = calculate_rankings(raw_tickers)
             lightweight_tickers = process_lightweight_indicators(candles_10m, raw_tickers_map)
             assign_residual_momentum(lightweight_tickers, sectors, reverse_sector_map)
@@ -286,15 +290,15 @@ async def run_check(execution_id: str | None = None):
 
             # 알림 발송 및 상태 저장
             alert_history = await load_alert_history(gcs_client)
-
-            await create_and_dispatch_notification(
-                raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
-                previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
-                final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime, gcs_client=gcs_client
-            )
+            if not await claim_scan_key(
+                scan_key, execution_id=execution_id, gcs_client=gcs_client
+            ):
+                logger.warning("Skipping duplicate scheduled scan for %s", scan_key)
+                return
+            claimed_scan_key = scan_key
 
             scan_events = build_scan_events(
-                scan_started_at,
+                scan_close_at,
                 all_markets,
                 lightweight_tickers,
                 candidate_decisions,
@@ -303,13 +307,22 @@ async def run_check(execution_id: str | None = None):
                 candidates_list,
                 raw_tickers_by_market=raw_tickers_map,
             )
+            if resolved_outcomes:
+                await append_scan_outcomes(resolved_outcomes, gcs_client)
             await append_scan_events(scan_events, gcs_client)
             await save_pending_scan_events(
                 pending_events + [event for event in scan_events if event.direction], gcs_client
             )
 
-            new_rank_state = RankState(last_updated=datetime.datetime.now(datetime.timezone.utc), rankings=current_rankings)
+            new_rank_state = RankState(last_updated=scan_close_at, rankings=current_rankings)
             await save_rank_state_history(new_rank_state, old_rank_states, gcs_client=gcs_client)
+
+            notification_started = True
+            await create_and_dispatch_notification(
+                raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
+                previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
+                final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime, gcs_client=gcs_client
+            )
 
             # # (주석 처리) 현재 분석 결과 로그로 저장
             # tickers_to_save = {
@@ -324,6 +337,11 @@ async def run_check(execution_id: str | None = None):
             # await save_analysis_log(new_analysis_state, gcs_client=gcs_client)
 
     except Exception as e:
+        if claimed_scan_key and not notification_started:
+            try:
+                await release_scan_key(claimed_scan_key, gcs_client=gcs_client)
+            except Exception:
+                logger.exception("Failed to release scan claim %s", claimed_scan_key)
         logger.critical(f"핵심 파이프라인 실행 중 예외 발생: {e}", exc_info=True)
         raise RuntimeError("Failed to execute the main pipeline") from e
 

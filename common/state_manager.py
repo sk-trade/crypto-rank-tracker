@@ -40,7 +40,8 @@ async def save_rank_state_history(
     """새로운 '순위' 상태를 히스토리에 추가하여 저장합니다."""
     filename = config.RANK_STATE_FILE_NAME
 
-    updated_states = old_states + [new_state]
+    updated_states = [state for state in old_states if state.last_updated != new_state.last_updated]
+    updated_states.append(new_state)
     if len(updated_states) > config.STATE_HISTORY_COUNT:
         updated_states = updated_states[-config.STATE_HISTORY_COUNT:]
 
@@ -67,8 +68,14 @@ async def _append_records(filename: str, records: List[ScanEvent] | List[ScanOut
     existing = await load_json(filename, gcs_client)
     if not isinstance(existing, list):
         existing = []
-    existing.extend(record.model_dump(mode="json") for record in records)
-    await save_json(filename, existing, gcs_client)
+    records_by_id = {
+        item.get("event_id"): item
+        for item in existing
+        if isinstance(item, dict) and item.get("event_id")
+    }
+    for record in records:
+        records_by_id[record.event_id] = record.model_dump(mode="json")
+    await save_json(filename, list(records_by_id.values()), gcs_client)
 
 
 async def append_scan_events(events: List[ScanEvent], gcs_client=None):
@@ -85,8 +92,11 @@ async def load_pending_scan_events(gcs_client=None) -> List[ScanEvent]:
 
 
 async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
+    events_by_id = {event.event_id: event for event in events}
     await save_json(
-        "pending_scan_events.json", [event.model_dump(mode="json") for event in events], gcs_client
+        "pending_scan_events.json",
+        [event.model_dump(mode="json") for event in events_by_id.values()],
+        gcs_client,
     )
 
 
@@ -97,6 +107,16 @@ async def claim_scan_key(scan_key: str, execution_id: str | None = None, gcs_cli
             raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
         return await _claim_scan_key_in_gcs(scan_key, execution_id, gcs_client)
     return await asyncio.to_thread(_claim_scan_key_locally, scan_key, execution_id)
+
+
+async def release_scan_key(scan_key: str, gcs_client=None) -> None:
+    """Release a claim when a scan fails before external notification begins."""
+    if config.STATE_STORAGE_METHOD == "GCS":
+        if gcs_client is None:
+            raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
+        await _release_scan_key_in_gcs(scan_key, gcs_client)
+        return
+    await asyncio.to_thread(_release_scan_key_locally, scan_key)
 
 
 def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
@@ -129,6 +149,30 @@ def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
                 os.fsync(state_file.fileno())
             os.replace(temporary_path, state_path)
             return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _release_scan_key_locally(scan_key: str) -> None:
+    os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
+    lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
+    state_path = os.path.join(config.LOCAL_STATE_DIR, IDEMPOTENCY_STATE_FILE_NAME)
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                with open(state_path, encoding="utf-8") as state_file:
+                    state = json.load(state_file)
+            except FileNotFoundError:
+                return
+            claims = state.get("claims", []) if isinstance(state, dict) else []
+            remaining = [claim for claim in claims if claim.get("scan_key") != scan_key]
+            temporary_path = f"{state_path}.tmp"
+            with open(temporary_path, "w", encoding="utf-8") as state_file:
+                json.dump({"claims": remaining}, state_file, ensure_ascii=False)
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.replace(temporary_path, state_path)
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -172,6 +216,35 @@ async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_cl
         except PreconditionFailed:
             continue
     raise RuntimeError("Could not atomically claim scan key after concurrent updates")
+
+
+async def _release_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
+    try:
+        from google.api_core.exceptions import PreconditionFailed
+    except ImportError as error:
+        raise RuntimeError("google-cloud-storage is required for GCS idempotency") from error
+
+    blob = gcs_client.bucket(config.GCS_BUCKET_NAME).blob(IDEMPOTENCY_STATE_FILE_NAME)
+    for _ in range(5):
+        if not await asyncio.to_thread(blob.exists):
+            return
+        raw_state = await asyncio.to_thread(blob.download_as_text)
+        state = json.loads(raw_state)
+        await asyncio.to_thread(blob.reload)
+        generation = int(blob.generation)
+        claims = state.get("claims", []) if isinstance(state, dict) else []
+        remaining = [claim for claim in claims if claim.get("scan_key") != scan_key]
+        try:
+            await asyncio.to_thread(
+                blob.upload_from_string,
+                json.dumps({"claims": remaining}, ensure_ascii=False),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            return
+        except PreconditionFailed:
+            continue
+    raise RuntimeError("Could not atomically release scan key after concurrent updates")
 
 
 async def save_analysis_log(state: AnalysisState, gcs_client=None):
