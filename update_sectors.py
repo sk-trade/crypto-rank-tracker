@@ -49,15 +49,26 @@ class RateLimiter:
 rate_limiter = RateLimiter(calls_per_minute=28)
 
 
+def validate_coin_identity(upbit_name: str | None, coin: Dict, override: Dict | None = None) -> bool:
+    """Require an explicit name and optional network/platform match before tagging."""
+    expected_name = (override or {}).get("name") or upbit_name
+    if expected_name and coin.get("name", "").casefold() != expected_name.casefold():
+        return False
+    expected_network = (override or {}).get("network")
+    if expected_network and expected_network not in (coin.get("platforms") or {}):
+        return False
+    return True
+
+
 # --- API 호출 함수들 ---
-async def get_upbit_krw_markets(session: aiohttp.ClientSession) -> Dict[str, str]:
+async def get_upbit_krw_markets(session: aiohttp.ClientSession) -> Dict[str, Dict]:
     """Upbit의 모든 KRW 마켓 정보를 가져옵니다."""
     try:
         async with session.get(UPBIT_MARKET_URL) as response:
             response.raise_for_status()
             markets = await response.json()
             return {
-                m["market"].split("-")[1].lower(): m["market"]
+                m["market"].split("-")[1].lower(): {"market": m["market"], "english_name": m.get("english_name")}
                 for m in markets
                 if m["market"].startswith("KRW-")
             }
@@ -84,9 +95,9 @@ async def get_coingecko_coins_list(session: aiohttp.ClientSession) -> Dict[str, 
         return {}
 
 
-async def get_coin_categories(
+async def get_coin_detail(
     session: aiohttp.ClientSession, coin_id: str
-) -> Optional[List[str]]:
+) -> Optional[Dict]:
     """특정 코인의 카테고리(섹터) 정보를 가져옵니다."""
     await rate_limiter.wait()
 
@@ -99,7 +110,7 @@ async def get_coin_categories(
             async with session.get(url, headers=headers, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data.get("categories", [])
+                    return data
                 elif response.status == 429:
                     retry_after = int(response.headers.get("Retry-After", "60"))
                     logging.warning(f"Rate limit ({coin_id}). {retry_after}초 대기...")
@@ -113,7 +124,7 @@ async def get_coin_categories(
             if attempt < max_retries - 1:
                 await asyncio.sleep(5)
 
-    return ["Untagged", "API_Error"]
+    return {"categories": ["Untagged", "API_Error"]}
 
 
 async def tag_market(
@@ -121,18 +132,30 @@ async def tag_market(
     symbol: str,
     market_name: str,
     cg_symbol_to_id: Dict[str, List[str]],
+    upbit_name: str | None = None,
 ) -> Tuple[str, List[str]]:
     """단일 Upbit 마켓에 CoinGecko 카테고리를 태깅합니다."""
     if symbol in cg_symbol_to_id:
         candidates = cg_symbol_to_id[symbol]
-        coin_id = CG_SYMBOL_OVERRIDES.get(symbol)
+        configured_override = CG_SYMBOL_OVERRIDES.get(symbol)
+        override = (
+            configured_override
+            if isinstance(configured_override, dict)
+            else {"id": configured_override}
+            if configured_override
+            else None
+        )
+        coin_id = (override or {}).get("id")
         if coin_id and coin_id not in candidates:
             return market_name, ["Untagged", "Override_Invalid"]
         if not coin_id and len(candidates) != 1:
             return market_name, ["Untagged", "CG_Symbol_Ambiguous"]
         coin_id = coin_id or candidates[0]
-        categories = await get_coin_categories(session, coin_id)
-        if categories is not None:
+        detail = await get_coin_detail(session, coin_id)
+        if detail is not None:
+            if not validate_coin_identity(upbit_name, detail, override):
+                return market_name, ["Untagged", "Identity_Mismatch"]
+            categories = detail.get("categories", [])
             return market_name, categories if categories else ["Untagged", "No_Category"]
         else:
             return market_name, ["Untagged", "Lookup_Failed"]
@@ -205,8 +228,13 @@ async def main():
 
         logging.info(f"3. {len(upbit_markets)}개 마켓에 대한 자동 태깅 시작...")
         tasks = [
-            tag_market(session, symbol, market_name, cg_symbol_to_id)
-            for symbol, market_name in upbit_markets.items()
+            tag_market(
+                session, symbol,
+                market_info["market"] if isinstance(market_info, dict) else market_info,
+                cg_symbol_to_id,
+                market_info.get("english_name") if isinstance(market_info, dict) else None,
+            )
+            for symbol, market_info in upbit_markets.items()
         ]
         results = await tqdm_asyncio.gather(*tasks, desc="태깅 진행 중")
         sector_map = dict(results)
