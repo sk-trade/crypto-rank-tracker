@@ -20,6 +20,14 @@ def test_scheduler_update_does_not_delete_the_existing_job():
     assert "--oidc-token-audience=\"$FUNCTION_URL\"" in workflow
 
 
+def test_scheduler_identity_is_authorized_to_invoke_the_gen2_service():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+
+    assert "gcloud run services add-iam-policy-binding crypto-rank-tracker" in workflow
+    assert '--member="serviceAccount:${{ secrets.GCP_SCHEDULER_SA_EMAIL }}"' in workflow
+    assert '--role="roles/run.invoker"' in workflow
+
+
 def test_sector_updater_uses_the_runtime_storage_identity():
     workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
 
@@ -31,6 +39,14 @@ def test_deploy_verification_compiles_every_shipped_python_entrypoint():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
     assert "uv run python -m compileall main.py config.py update_sectors.py common tests" in workflow
+
+
+def test_deploy_verification_imports_every_required_module_from_the_wheel():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+
+    assert 'WHEEL_PATH="$(realpath dist/*.whl)"' in workflow
+    assert "uv run --isolated --with \"$WHEEL_PATH\"" in workflow
+    assert "import main, update_sectors, config, common.upbit_client, common.notification.main" in workflow
 
 
 def test_workflows_preserve_local_storage_default_when_variable_is_omitted():

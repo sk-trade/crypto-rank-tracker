@@ -66,6 +66,14 @@ GitHub Actions is used for deployment flow control:
 - Configure distinct GitHub Secrets for `GCP_DEPLOYER_SA_EMAIL`, `GCP_RUNTIME_SA_EMAIL`,
   and `GCP_SCHEDULER_SA_EMAIL`. The deployer authenticates GitHub Actions, the runtime
   account accesses application resources, and the Scheduler account invokes the function.
+- Configure the `GCP_WIF_PROVIDER` secret for Workload Identity Federation, plus the
+  `WEBHOOK_URL` secret when live notifications are required.
+- Configure repository variables `STATE_STORAGE_METHOD` (optional, defaults to `LOCAL`),
+  `GCS_BUCKET_NAME` (required for `GCS`), and `CG_SYMBOL_OVERRIDES` when symbol collisions
+  need explicit CoinGecko identities. The sector workflow also requires the `CG_API_KEY` secret.
+- Grant the deployer permission to deploy Cloud Functions, act as the runtime service account,
+  update the Cloud Run invoker policy, and manage the Scheduler job. The workflow grants the
+  Scheduler service account `roles/run.invoker` on the deployed Gen2 service.
 - The Gen2 function is deployed with a 540-second service timeout, one maximum instance,
   and one request per instance. Scheduler updates are idempotent and use the function URL
   as their OIDC audience.

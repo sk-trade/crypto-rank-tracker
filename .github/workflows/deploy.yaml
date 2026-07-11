@@ -43,6 +43,13 @@ jobs:
       - name: Build package
         run: uv build
 
+      - name: Verify built package imports
+        run: |
+          WHEEL_PATH="$(realpath dist/*.whl)"
+          TEMP_DIR="$(mktemp -d)"
+          cd "$TEMP_DIR"
+          uv run --isolated --with "$WHEEL_PATH" python -c "import main, update_sectors, config, common.upbit_client, common.notification.main"
+
   deploy:
     needs: verify
     if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
@@ -115,6 +122,13 @@ jobs:
             STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD || 'LOCAL' }}
             GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
             WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+
+      - name: Authorize Scheduler invocation
+        run: |
+          gcloud run services add-iam-policy-binding crypto-rank-tracker \
+            --region=asia-northeast1 \
+            --member="serviceAccount:${{ secrets.GCP_SCHEDULER_SA_EMAIL }}" \
+            --role="roles/run.invoker"
 
       # Cloud Scheduler 설정 (10분마다 실행)
       - name: Create Cloud Scheduler Job
