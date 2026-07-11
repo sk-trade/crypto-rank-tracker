@@ -11,7 +11,7 @@ import aiohttp
 from tqdm.asyncio import tqdm_asyncio
 
 import config
-from common.storage_client import save_json
+from common.storage_client import load_json, save_json
 
 # --- 로거 및 상수 설정 ---
 logging.basicConfig(level="INFO", format="%(asctime)s - %(levelname)s - %(message)s")
@@ -22,6 +22,8 @@ CG_BASE_URL = "https://api.coingecko.com/api/v3"
 CG_COINS_LIST_URL = f"{CG_BASE_URL}/coins/list"
 CG_COIN_DETAIL_URL = f"{CG_BASE_URL}/coins/"
 CG_SYMBOL_OVERRIDES = json.loads(__import__("os").environ.get("CG_SYMBOL_OVERRIDES", "{}"))
+SECTOR_MAP_ROLLBACK_FILE_NAME = "sectors.previous.json"
+MAX_SECTOR_MAP_CHANGE_RATIO = 0.30
 
 
 # --- RateLimiter 클래스 ---
@@ -138,6 +140,32 @@ async def tag_market(
         return market_name, ["Untagged", "CG_Not_Found"]
 
 
+def validate_sector_map_change(previous: Dict, proposed: Dict) -> None:
+    """Reject a suspicious bulk remap instead of replacing a known-good map."""
+    if not previous:
+        return
+    shared = set(previous) & set(proposed)
+    changed = sum(previous[market] != proposed[market] for market in shared)
+    removed = len(set(previous) - set(proposed))
+    ratio = (changed + removed) / len(previous)
+    if ratio > MAX_SECTOR_MAP_CHANGE_RATIO:
+        raise RuntimeError(f"Sector map change ratio {ratio:.1%} exceeds the {MAX_SECTOR_MAP_CHANGE_RATIO:.0%} safety limit.")
+
+
+async def save_validated_sector_map(sector_map: Dict, gcs_client=None) -> None:
+    previous = await load_json(config.SECTOR_MAP_FILE_NAME, gcs_client)
+    previous = previous if isinstance(previous, dict) else {}
+    validate_sector_map_change(previous, sector_map)
+    if previous:
+        await save_json(SECTOR_MAP_ROLLBACK_FILE_NAME, previous, gcs_client)
+    try:
+        await save_json(config.SECTOR_MAP_FILE_NAME, sector_map, gcs_client)
+    except Exception:
+        if previous:
+            await save_json(config.SECTOR_MAP_FILE_NAME, previous, gcs_client)
+        raise
+
+
 async def main():
     """스크립트의 메인 실행 함수입니다."""
     config.validate_storage_config()
@@ -185,7 +213,7 @@ async def main():
 
         logging.info("4. sectors.json 파일 저장 시작...")
         try:
-            await save_json(config.SECTOR_MAP_FILE_NAME, sector_map, gcs_client)
+            await save_validated_sector_map(sector_map, gcs_client)
             storage_type = "GCS" if gcs_client else "로컬"
             logging.info(f"'{config.SECTOR_MAP_FILE_NAME}' 파일 저장 완료 ({storage_type}).")
         except Exception as e:

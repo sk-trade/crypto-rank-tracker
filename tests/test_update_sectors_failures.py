@@ -75,6 +75,7 @@ def test_main_reraises_save_json_failure(monkeypatch):
     monkeypatch.setattr(update_sectors, "get_upbit_krw_markets", AsyncMock(return_value={"btc": "KRW-BTC"}))
     monkeypatch.setattr(update_sectors, "get_coingecko_coins_list", AsyncMock(return_value={"btc": "bitcoin"}))
     monkeypatch.setattr(update_sectors, "tag_market", AsyncMock(return_value=("KRW-BTC", ["Defi"])))
+    monkeypatch.setattr(update_sectors, "load_json", AsyncMock(return_value={}))
 
     async def raise_save(*args, **kwargs):
         raise RuntimeError("save failed")
