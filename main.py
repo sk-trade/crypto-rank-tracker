@@ -172,7 +172,7 @@ async def run_check(execution_id: str | None = None):
                 claimed_scan_key = scan_key
                 await append_scan_events(
                     build_scan_events(
-                        scan_started_at,
+                        scan_close_at,
                         all_markets,
                         {},
                         {},

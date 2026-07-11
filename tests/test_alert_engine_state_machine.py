@@ -118,3 +118,26 @@ def test_alert_history_persists_breakout_structure_and_clears_it_after_failure()
 
     assert history["KRW-BTC"].structure_direction is None
     assert history["KRW-BTC"].structure_level is None
+
+
+def test_bullish_acceleration_preserves_structure_for_the_next_transition():
+    ticker = _ticker([])
+    history = {"KRW-BTC": _history("bullish", level=100.0, last_price=105.0)}
+    initial_timestamp = history["KRW-BTC"].initial_timestamp
+    acceleration = Alert(
+        candidate=_candidate(110.0),
+        ticker_data=ticker,
+        signal_type="MOMENTUM_ACCELERATION",
+        priority=2,
+        structure_level=100.0,
+    )
+
+    history = _update_alert_history(history, [acceleration])
+    next_signal, _, _ = AlertEngine()._get_alert_type_and_priority(
+        _candidate(112.0), ticker, history
+    )
+
+    assert history["KRW-BTC"].structure_direction == "bullish"
+    assert history["KRW-BTC"].structure_level == 100.0
+    assert history["KRW-BTC"].initial_timestamp == initial_timestamp
+    assert next_signal == "MOMENTUM_ACCELERATION"

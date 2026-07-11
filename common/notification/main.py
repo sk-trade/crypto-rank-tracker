@@ -101,12 +101,7 @@ def _update_alert_history(
         market = candidate.market
         signal_type = alert.signal_type
 
-        if signal_type in [
-            "BREAKOUT_START",
-            "MOMENTUM_ACCELERATION",
-            "BREAKDOWN_START",
-            "DOWNTREND_ACCELERATION",
-        ]:
+        if signal_type in ["BREAKOUT_START", "BREAKDOWN_START"]:
             history[market] = AlertHistory(
                 market=market,
                 last_alert_timestamp=now,

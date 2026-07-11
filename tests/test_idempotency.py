@@ -44,3 +44,37 @@ def test_local_scan_claim_can_be_released_for_retry(monkeypatch, tmp_path):
     asyncio.run(state_manager.release_scan_key(scan_key))
 
     assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-b")) is True
+
+
+def test_gcs_claim_reads_the_same_generation_it_conditionally_updates(monkeypatch):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "GCS")
+    monkeypatch.setattr(config, "GCS_BUCKET_NAME", "bucket")
+
+    class Blob:
+        generation = 7
+
+        def exists(self):
+            return True
+
+        def reload(self):
+            return None
+
+        def download_as_text(self, *, if_generation_match):
+            assert if_generation_match == self.generation
+            return '{"claims": []}'
+
+        def upload_from_string(self, _value, *, content_type, if_generation_match):
+            assert content_type == "application/json"
+            assert if_generation_match == self.generation
+
+    blob = Blob()
+
+    class Bucket:
+        def blob(self, _filename):
+            return blob
+
+    class Client:
+        def bucket(self, _name):
+            return Bucket()
+
+    assert asyncio.run(state_manager.claim_scan_key("scan", "run", Client())) is True

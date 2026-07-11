@@ -188,10 +188,15 @@ async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_cl
     for _ in range(5):
         exists = await asyncio.to_thread(blob.exists)
         if exists:
-            raw_state = await asyncio.to_thread(blob.download_as_text)
-            state = json.loads(raw_state)
             await asyncio.to_thread(blob.reload)
             generation = int(blob.generation)
+            try:
+                raw_state = await asyncio.to_thread(
+                    blob.download_as_text, if_generation_match=generation
+                )
+            except PreconditionFailed:
+                continue
+            state = json.loads(raw_state)
         else:
             state = {"claims": []}
             generation = 0
@@ -228,10 +233,15 @@ async def _release_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
     for _ in range(5):
         if not await asyncio.to_thread(blob.exists):
             return
-        raw_state = await asyncio.to_thread(blob.download_as_text)
-        state = json.loads(raw_state)
         await asyncio.to_thread(blob.reload)
         generation = int(blob.generation)
+        try:
+            raw_state = await asyncio.to_thread(
+                blob.download_as_text, if_generation_match=generation
+            )
+        except PreconditionFailed:
+            continue
+        state = json.loads(raw_state)
         claims = state.get("claims", []) if isinstance(state, dict) else []
         remaining = [claim for claim in claims if claim.get("scan_key") != scan_key]
         try:
