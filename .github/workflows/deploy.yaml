@@ -38,7 +38,7 @@ jobs:
         run: uv run python -m pytest
 
       - name: Compile Python sources
-        run: uv run python -m compileall main.py config.py common tests
+        run: uv run python -m compileall main.py config.py update_sectors.py common tests
 
       - name: Build package
         run: uv build

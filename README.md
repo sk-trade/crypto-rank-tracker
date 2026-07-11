@@ -27,7 +27,7 @@ Run the same checks used for local validation:
 
 ```bash
 uv run python -m pytest
-uv run python -m compileall main.py config.py common tests
+uv run python -m compileall main.py config.py update_sectors.py common tests
 uv build
 ```
 

@@ -25,3 +25,9 @@ def test_sector_updater_uses_the_runtime_storage_identity():
 
     assert "GCP_RUNTIME_SA_EMAIL" in workflow
     assert "GCP_SA_EMAIL" not in workflow
+
+
+def test_deploy_verification_compiles_every_shipped_python_entrypoint():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+
+    assert "uv run python -m compileall main.py config.py update_sectors.py common tests" in workflow
