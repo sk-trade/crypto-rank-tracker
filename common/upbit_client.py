@@ -111,10 +111,20 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
             tickers = await response.json()
             if not tickers:
                 raise UpbitAPIError("티커 정보를 가져오지 못했습니다.")
+            ticker_markets = {ticker.get("market") for ticker in tickers}
+            missing_markets = sorted(set(krw_markets) - ticker_markets)
+            unexpected_markets = sorted(ticker_markets - set(krw_markets))
+            if missing_markets or unexpected_markets:
+                raise UpbitAPIError(
+                    "티커 응답의 KRW 마켓 범위가 목록과 일치하지 않습니다. "
+                    f"missing={missing_markets[:10]}, unexpected={unexpected_markets[:10]}"
+                )
             for ticker in tickers:
                 ticker["market_warning"] = warnings.get(ticker["market"])
             return tickers
 
+    except UpbitAPIError:
+        raise
     except aiohttp.ClientError as e:
         logger.error(f"Upbit API 클라이언트 오류 (get_all_krw_tickers): {e}")
         raise UpbitAPIError(f"네트워크/클라이언트 오류: {e}") from e

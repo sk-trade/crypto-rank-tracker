@@ -1,8 +1,15 @@
 import datetime
 import asyncio
 
+import pytest
+
 from common.models import CandleData
-from common.upbit_client import get_candles, normalize_completed_candles
+from common.upbit_client import (
+    UpbitAPIError,
+    get_all_krw_tickers,
+    get_candles,
+    normalize_completed_candles,
+)
 from main import filter_markets_with_complete_deep_dive_data
 
 
@@ -94,6 +101,14 @@ class _Session:
         return _Response(self.pages.pop(0))
 
 
+class _TickerSession:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+
+    def get(self, _url, **_kwargs):
+        return _Response(self.payloads.pop(0))
+
+
 def _raw_candle(timestamp: datetime.datetime) -> dict:
     return {
         "market": "KRW-BTC", "candle_date_time_utc": timestamp.isoformat().replace("+00:00", "Z"),
@@ -116,3 +131,18 @@ def test_get_candles_paginates_before_normalizing_the_complete_grid():
     assert session.calls[0]["count"] == 200
     assert session.calls[1]["count"] == 1
     assert "to" in session.calls[1]
+
+
+def test_get_all_krw_tickers_rejects_partial_ticker_response():
+    session = _TickerSession(
+        [
+            [
+                {"market": "KRW-BTC", "market_warning": "NONE"},
+                {"market": "KRW-ETH", "market_warning": "NONE"},
+            ],
+            [{"market": "KRW-BTC", "trade_price": 100.0}],
+        ]
+    )
+
+    with pytest.raises(UpbitAPIError, match="KRW 마켓 범위가 목록과 일치하지 않습니다"):
+        asyncio.run(get_all_krw_tickers(session))
