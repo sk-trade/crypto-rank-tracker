@@ -36,6 +36,8 @@ CANDLE_SUCCESS_RATE_MINIMUM = 0.95
 
 def validate_storage_config() -> None:
     """Fail early when the selected state backend is missing required settings."""
+    if STATE_STORAGE_METHOD not in {"LOCAL", "GCS"}:
+        raise RuntimeError("STATE_STORAGE_METHOD must be either LOCAL or GCS")
     if STATE_STORAGE_METHOD == "GCS" and not GCS_BUCKET_NAME:
         raise RuntimeError("GCS_BUCKET_NAME is required when STATE_STORAGE_METHOD=GCS")
 

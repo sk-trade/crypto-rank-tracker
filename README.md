@@ -6,7 +6,7 @@ Scheduled tracker for Upbit KRW market ranking and anomaly reporting. The servic
 
 Set these environment variables for runtime behavior:
 
-- `STATE_STORAGE_METHOD`: state backend selector used by the service.
+- `STATE_STORAGE_METHOD`: state backend selector; omit it for `LOCAL`, or set it explicitly to `LOCAL` or `GCS`. Any other value fails at startup.
 - `GCS_BUCKET_NAME`: required bucket name when `STATE_STORAGE_METHOD=GCS`.
 - `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery.
 - `CG_API_KEY`: CoinGecko API key used by the sector updater.
