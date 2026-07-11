@@ -9,7 +9,7 @@ from typing import Dict, List
 
 import config
 from common.models import AlertHistory, AnalysisState, RankState, ScanEvent, ScanOutcome
-from common.storage_client import load_json, save_json
+from common.storage_client import StateBackendUnavailable, load_json, save_json
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 IDEMPOTENCY_STATE_FILE_NAME = "processed_scan_keys.json"
@@ -92,7 +92,9 @@ async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
 
 async def claim_scan_key(scan_key: str, execution_id: str | None = None, gcs_client=None) -> bool:
     """Atomically claim a completed-candle scan key before any side effects occur."""
-    if config.STATE_STORAGE_METHOD == "GCS" and gcs_client:
+    if config.STATE_STORAGE_METHOD == "GCS":
+        if gcs_client is None:
+            raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
         return await _claim_scan_key_in_gcs(scan_key, execution_id, gcs_client)
     return await asyncio.to_thread(_claim_scan_key_locally, scan_key, execution_id)
 

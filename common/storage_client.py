@@ -21,6 +21,10 @@ class StateLoadError(Exception):
     pass
 
 
+class StateBackendUnavailable(RuntimeError):
+    """The configured backend cannot be used by the current caller."""
+
+
 async def load_json(
     filename: str, gcs_client=None
 ) -> Optional[Union[List, Dict]]:
@@ -29,7 +33,9 @@ async def load_json(
     파일이 없으면 None을 반환합니다.
     로드 실패(JSON 파싱 오류, 권한 오류, 네트워크 오류 등)는 예외를 던집니다.
     """
-    if config.STATE_STORAGE_METHOD == "GCS" and gcs_client:
+    if config.STATE_STORAGE_METHOD == "GCS":
+        if gcs_client is None:
+            raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
         return await _load_json_from_gcs(gcs_client, filename)
     filepath = os.path.join(config.LOCAL_STATE_DIR, filename)
     return await _load_json_from_local(filepath)
@@ -38,7 +44,9 @@ async def load_json(
 async def save_json(filename: str, data: Union[List, Dict], gcs_client=None):
     """설정에 따라 GCS 또는 로컬에 JSON 파일을 저장합니다."""
     try:
-        if config.STATE_STORAGE_METHOD == "GCS" and gcs_client:
+        if config.STATE_STORAGE_METHOD == "GCS":
+            if gcs_client is None:
+                raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
             await _save_json_to_gcs(gcs_client, filename, data)
         else:
             filepath = os.path.join(config.LOCAL_STATE_DIR, filename)

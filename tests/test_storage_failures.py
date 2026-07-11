@@ -2,7 +2,15 @@ import asyncio
 
 import pytest
 
-from common.storage_client import StateLoadError, _load_json_from_gcs, _save_json_to_gcs
+import config
+from common.storage_client import (
+    StateBackendUnavailable,
+    StateLoadError,
+    _load_json_from_gcs,
+    _save_json_to_gcs,
+    load_json,
+    save_json,
+)
 
 
 class _Blob:
@@ -45,3 +53,15 @@ def test_gcs_exists_and_download_failures_are_explicit_state_load_errors():
 def test_gcs_upload_failure_propagates_to_the_caller():
     with pytest.raises(RuntimeError, match="write failed"):
         asyncio.run(_save_json_to_gcs(_Client(_Blob(upload_error=RuntimeError("write failed"))), "x.json", {}))
+
+
+def test_gcs_mode_never_silently_falls_back_to_local_storage(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "GCS")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+
+    with pytest.raises(StateBackendUnavailable, match="initialized GCS client"):
+        asyncio.run(load_json("state.json"))
+    with pytest.raises(StateBackendUnavailable, match="initialized GCS client"):
+        asyncio.run(save_json("state.json", {"unexpected": "local write"}))
+
+    assert not (tmp_path / "state.json").exists()
