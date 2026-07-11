@@ -24,6 +24,7 @@ CG_COIN_DETAIL_URL = f"{CG_BASE_URL}/coins/"
 CG_SYMBOL_OVERRIDES = json.loads(__import__("os").environ.get("CG_SYMBOL_OVERRIDES", "{}"))
 SECTOR_MAP_ROLLBACK_FILE_NAME = "sectors.previous.json"
 MAX_SECTOR_MAP_CHANGE_RATIO = 0.30
+TRANSIENT_SECTOR_TAGS = {"API_Error", "Lookup_Failed"}
 
 
 # --- RateLimiter 클래스 ---
@@ -178,6 +179,12 @@ def validate_sector_map_change(previous: Dict, proposed: Dict) -> None:
 async def save_validated_sector_map(sector_map: Dict, gcs_client=None) -> None:
     previous = await load_json(config.SECTOR_MAP_FILE_NAME, gcs_client)
     previous = previous if isinstance(previous, dict) else {}
+    sector_map = {
+        market: previous[market]
+        if market in previous and TRANSIENT_SECTOR_TAGS.intersection(tags)
+        else tags
+        for market, tags in sector_map.items()
+    }
     validate_sector_map_change(previous, sector_map)
     if previous:
         await save_json(SECTOR_MAP_ROLLBACK_FILE_NAME, previous, gcs_client)

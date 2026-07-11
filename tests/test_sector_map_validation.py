@@ -29,3 +29,42 @@ def test_sector_map_backup_and_rollback_preserve_previous_valid_map(monkeypatch)
     with pytest.raises(RuntimeError, match="write failed"):
         asyncio.run(update_sectors.save_validated_sector_map({"KRW-A": ["A"]}))
     assert saved[-1] == (update_sectors.config.SECTOR_MAP_FILE_NAME, {"KRW-A": ["A"]})
+
+
+def test_sector_map_preserves_known_good_tags_on_partial_lookup_failure(monkeypatch):
+    saved = []
+
+    async def load(*_args):
+        return {
+            "KRW-A": ["Layer 1"],
+            "KRW-B": ["DeFi"],
+            "KRW-C": ["Gaming"],
+            "KRW-D": ["Payments"],
+        }
+
+    async def save(filename, value, *_args):
+        saved.append((filename, value))
+
+    monkeypatch.setattr(update_sectors, "load_json", load)
+    monkeypatch.setattr(update_sectors, "save_json", save)
+
+    asyncio.run(
+        update_sectors.save_validated_sector_map(
+            {
+                "KRW-A": ["Untagged", "API_Error"],
+                "KRW-B": ["DeFi"],
+                "KRW-C": ["Gaming"],
+                "KRW-D": ["Payments"],
+            }
+        )
+    )
+
+    assert saved[-1] == (
+        update_sectors.config.SECTOR_MAP_FILE_NAME,
+        {
+            "KRW-A": ["Layer 1"],
+            "KRW-B": ["DeFi"],
+            "KRW-C": ["Gaming"],
+            "KRW-D": ["Payments"],
+        },
+    )
