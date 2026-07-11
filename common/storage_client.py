@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 from typing import Dict, List, Optional, Union
 
 import aiofiles
@@ -111,11 +112,24 @@ async def _load_json_from_local(filepath: str) -> Optional[Union[List, Dict]]:
 
 async def _save_json_to_local(filepath: str, data: Union[List, Dict]):
     """로컬 파일 시스템에 JSON 파일을 저장하는 헬퍼 함수입니다."""
+    temporary_path = None
     try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        directory = os.path.dirname(filepath)
+        os.makedirs(directory, exist_ok=True)
         json_string = json.dumps(data, ensure_ascii=False, indent=2)
-        async with aiofiles.open(filepath, mode="w", encoding="utf-8") as f:
+        descriptor, temporary_path = tempfile.mkstemp(
+            dir=directory, prefix=f".{os.path.basename(filepath)}.", suffix=".tmp"
+        )
+        os.close(descriptor)
+        async with aiofiles.open(temporary_path, mode="w", encoding="utf-8") as f:
             await f.write(json_string)
+            await f.flush()
+            await asyncio.to_thread(os.fsync, f.fileno())
+        os.replace(temporary_path, filepath)
+        temporary_path = None
     except Exception as e:
         logger.error(f"로컬 파일({filepath}) 저장 실패: {e}", exc_info=True)
         raise
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)

@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 import config
+from common import storage_client
 from common.storage_client import (
     StateBackendUnavailable,
     StateLoadError,
@@ -65,3 +66,19 @@ def test_gcs_mode_never_silently_falls_back_to_local_storage(monkeypatch, tmp_pa
         asyncio.run(save_json("state.json", {"unexpected": "local write"}))
 
     assert not (tmp_path / "state.json").exists()
+
+
+def test_local_save_keeps_the_previous_complete_state_if_atomic_replace_fails(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text('{"previous": true}', encoding="utf-8")
+
+    def fail_replace(_source, _destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(storage_client.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        asyncio.run(storage_client._save_json_to_local(str(state_file), {"new": True}))
+
+    assert state_file.read_text(encoding="utf-8") == '{"previous": true}'
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
