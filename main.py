@@ -99,10 +99,11 @@ def filter_candidates_by_market_regime(candidate_markets: list[str], market_regi
 
 
 def record_market_regime_block(
-    candidate_decisions: dict[str, CandidateDecision], market_regime: dict
+    candidate_markets: list[str],
+    candidate_decisions: dict[str, CandidateDecision],
+    market_regime: dict,
 ) -> list[str]:
     """Persist a fail-closed regime gate as a distinct event-log decision."""
-    candidate_markets = [market for market, decision in candidate_decisions.items() if decision.eligible]
     if filter_candidates_by_market_regime(candidate_markets, market_regime):
         return candidate_markets
     for market in candidate_markets:
@@ -254,7 +255,9 @@ async def run_check(execution_id: str | None = None):
 
                 market_regime = get_market_regime(enriched_tickers)
                 logger.info(f"현재 시장 체제: {market_regime.get('regime', 'UNKNOWN')}")
-                candidate_markets = record_market_regime_block(candidate_decisions, market_regime)
+                candidate_markets = record_market_regime_block(
+                    candidate_markets, candidate_decisions, market_regime
+                )
 
             # PHASE 3: 알림 생성
             final_alerts = []

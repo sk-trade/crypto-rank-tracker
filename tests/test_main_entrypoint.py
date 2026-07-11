@@ -64,10 +64,14 @@ def test_run_check_skips_all_side_effects_when_the_completed_candle_is_claimed(m
 
 
 def test_unknown_regime_marks_candidate_decisions_for_event_logging():
-    decisions = {"KRW-BTC": app.CandidateDecision(True, [])}
+    decisions = {
+        "KRW-BTC": app.CandidateDecision(True, []),
+        "KRW-ETH": app.CandidateDecision(True, []),
+    }
 
-    assert app.record_market_regime_block(decisions, {"regime": "UNKNOWN"}) == []
+    assert app.record_market_regime_block(["KRW-BTC"], decisions, {"regime": "UNKNOWN"}) == []
     assert decisions["KRW-BTC"] == app.CandidateDecision(False, ["market_regime_unknown"])
+    assert decisions["KRW-ETH"] == app.CandidateDecision(True, [])
 
 
 def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypatch):
