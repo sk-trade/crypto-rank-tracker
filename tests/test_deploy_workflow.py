@@ -31,3 +31,24 @@ def test_deploy_verification_compiles_every_shipped_python_entrypoint():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
     assert "uv run python -m compileall main.py config.py update_sectors.py common tests" in workflow
+
+
+def test_workflows_preserve_local_storage_default_when_variable_is_omitted():
+    deploy = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+    sectors = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+
+    expected = "vars.STATE_STORAGE_METHOD || 'LOCAL'"
+    assert expected in deploy
+    assert expected in sectors
+
+
+def test_sector_updater_restricts_manual_production_writes_to_main():
+    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+
+    assert "github.event_name == 'schedule' || github.ref == 'refs/heads/main'" in workflow
+
+
+def test_sector_updater_receives_symbol_overrides():
+    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+
+    assert "CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES }}" in workflow

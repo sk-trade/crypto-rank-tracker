@@ -8,6 +8,7 @@ on:
 
 jobs:
   update-sectors:
+    if: ${{ github.event_name == 'schedule' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     
     # GCS에 인증하고 Secret을 사용하기 위한 권한
@@ -56,4 +57,5 @@ jobs:
         # GCS 업로드를 위해 GCP 관련 환경 변수도 전달
         GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }} # 프로젝트 ID가 필요하다면
         GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
-        STATE_STORAGE_METHOD: ${{ vars.STATE_STORAGE_METHOD }}
+        STATE_STORAGE_METHOD: ${{ vars.STATE_STORAGE_METHOD || 'LOCAL' }}
+        CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES }}
