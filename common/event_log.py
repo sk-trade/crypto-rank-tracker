@@ -13,6 +13,29 @@ from common.outcomes import (
 )
 
 
+_EXECUTION_REJECTION_REASONS = frozenset(
+    {
+        "market_warning",
+        "daily_turnover_below_minimum",
+        "orderbook_unavailable",
+        "orderbook_invalid",
+        "orderbook_depth_below_notional",
+        "spread_above_maximum",
+        "slippage_above_maximum",
+        "move_does_not_cover_estimated_costs",
+    }
+)
+
+
+def _final_decision_for_rejected_candidate(reasons: List[str]) -> str:
+    """Keep the gate that rejected a candidate visible to later model analysis."""
+    if "market_regime_unknown" in reasons:
+        return "market_regime_blocked"
+    if _EXECUTION_REJECTION_REASONS.intersection(reasons):
+        return "execution_blocked"
+    return "rejected_lightweight"
+
+
 def build_scan_events(
     observed_at: datetime.datetime,
     markets: Iterable[str],
@@ -52,7 +75,7 @@ def build_scan_events(
         elif not ticker:
             final_decision = "data_quality_blocked"
         elif not eligible:
-            final_decision = "rejected_lightweight"
+            final_decision = _final_decision_for_rejected_candidate(reasons)
         elif market not in deep_dive_markets:
             final_decision = "deep_dive_data_blocked"
             reasons.append("higher_timeframe_candle_history_unavailable")

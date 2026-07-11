@@ -63,6 +63,13 @@ def test_run_check_skips_all_side_effects_when_the_completed_candle_is_claimed(m
     market_loader.assert_not_awaited()
 
 
+def test_unknown_regime_marks_candidate_decisions_for_event_logging():
+    decisions = {"KRW-BTC": app.CandidateDecision(True, [])}
+
+    assert app.record_market_regime_block(decisions, {"regime": "UNKNOWN"}) == []
+    assert decisions["KRW-BTC"] == app.CandidateDecision(False, ["market_regime_unknown"])
+
+
 def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypatch):
     timestamp = datetime.datetime(2026, 6, 18, tzinfo=datetime.timezone.utc)
     candles = [

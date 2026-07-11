@@ -98,6 +98,21 @@ def filter_candidates_by_market_regime(candidate_markets: list[str], market_regi
     return candidate_markets
 
 
+def record_market_regime_block(
+    candidate_decisions: dict[str, CandidateDecision], market_regime: dict
+) -> list[str]:
+    """Persist a fail-closed regime gate as a distinct event-log decision."""
+    candidate_markets = [market for market, decision in candidate_decisions.items() if decision.eligible]
+    if filter_candidates_by_market_regime(candidate_markets, market_regime):
+        return candidate_markets
+    for market in candidate_markets:
+        decision = candidate_decisions[market]
+        candidate_decisions[market] = CandidateDecision(
+            False, [*decision.rejection_reasons, "market_regime_unknown"]
+        )
+    return []
+
+
 async def run_check(execution_id: str | None = None):
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
     config.validate_storage_config()
@@ -239,9 +254,7 @@ async def run_check(execution_id: str | None = None):
 
                 market_regime = get_market_regime(enriched_tickers)
                 logger.info(f"현재 시장 체제: {market_regime.get('regime', 'UNKNOWN')}")
-                candidate_markets = filter_candidates_by_market_regime(
-                    candidate_markets, market_regime
-                )
+                candidate_markets = record_market_regime_block(candidate_decisions, market_regime)
 
             # PHASE 3: 알림 생성
             final_alerts = []

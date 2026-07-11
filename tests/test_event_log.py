@@ -54,6 +54,31 @@ def test_scan_events_include_all_markets_and_rejection_decisions():
     assert by_market["KRW-XRP"].feature_snapshot["raw_ticker"]["market"] == "KRW-XRP"
 
 
+def test_scan_events_preserve_execution_and_regime_blocking_stages():
+    observed_at = datetime.datetime(2026, 6, 18, 0, 10, tzinfo=UTC)
+    ticker = TickerData(
+        market="KRW-BTC",
+        candle_history=[_candle(observed_at, 100.0, 101.0, 99.0)],
+        price_change_10m=2.0,
+    )
+
+    events = build_scan_events(
+        observed_at,
+        ["KRW-BTC", "KRW-ETH"],
+        {"KRW-BTC": ticker, "KRW-ETH": ticker.model_copy(update={"market": "KRW-ETH"})},
+        {
+            "KRW-BTC": CandidateDecision(False, ["orderbook_unavailable"]),
+            "KRW-ETH": CandidateDecision(False, ["market_regime_unknown"]),
+        },
+        [],
+        [],
+    )
+
+    by_market = {event.market: event for event in events}
+    assert by_market["KRW-BTC"].final_decision == "execution_blocked"
+    assert by_market["KRW-ETH"].final_decision == "market_regime_blocked"
+
+
 def test_outcome_resolution_waits_for_complete_entry_path_and_uses_fixed_target():
     signal_start = datetime.datetime(2026, 6, 18, 0, 0, tzinfo=UTC)
     event = ScanEvent(
