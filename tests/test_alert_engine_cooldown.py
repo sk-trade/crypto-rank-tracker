@@ -4,11 +4,16 @@ from common.models import AlertHistory, SignalCandidate, TickerData
 from common.notification.engine import AlertEngine
 
 
-def _history(signal_type: str, last_price: float, now: datetime.datetime) -> AlertHistory:
+def _history(
+    signal_type: str,
+    last_price: float,
+    now: datetime.datetime,
+    minutes_ago: int = 30,
+) -> AlertHistory:
     bearish = "BEAR" in signal_type or "DOWNTREND" in signal_type or "BREAKDOWN" in signal_type
     return AlertHistory(
         market="KRW-BTC",
-        last_alert_timestamp=now - datetime.timedelta(minutes=30),
+        last_alert_timestamp=now - datetime.timedelta(minutes=minutes_ago),
         last_signal_type=signal_type,
         last_price=last_price,
         last_rvol=1.0,
@@ -151,6 +156,61 @@ def test_prior_momentum_acceleration_with_reversal_down_is_bull_failed():
         history={
             "KRW-BTC": _history("MOMENTUM_ACCELERATION", 100.0, now),
         },
+    )
+
+    assert signal_type == "BULL_MOMENTUM_FAILED"
+
+
+def test_bullish_continuation_below_threshold_is_suppressed_during_cooldown():
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+        candidate=_candidate(100.99),
+        ticker=_ticker(),
+        history={"KRW-BTC": _history("BREAKOUT_START", 100.0, now)},
+    )
+
+    assert signal_type is None
+
+
+def test_bearish_continuation_at_threshold_is_allowed_during_cooldown():
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+        candidate=_candidate(99.0),
+        ticker=_ticker(),
+        history={"KRW-BTC": _history("BREAKDOWN_START", 100.0, now)},
+    )
+
+    assert signal_type == "DOWNTREND_ACCELERATION"
+
+
+def test_small_continuation_is_allowed_after_cooldown_expires():
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+        candidate=_candidate(100.01),
+        ticker=_ticker(),
+        history={
+            "KRW-BTC": _history(
+                "BREAKOUT_START",
+                100.0,
+                now,
+                minutes_ago=61,
+            )
+        },
+    )
+
+    assert signal_type == "MOMENTUM_ACCELERATION"
+
+
+def test_structure_failure_is_allowed_during_cooldown():
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+        candidate=_candidate(99.0),
+        ticker=_ticker(),
+        history={"KRW-BTC": _history("BREAKOUT_START", 100.0, now)},
     )
 
     assert signal_type == "BULL_MOMENTUM_FAILED"

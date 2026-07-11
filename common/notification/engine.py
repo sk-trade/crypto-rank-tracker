@@ -76,16 +76,32 @@ class AlertEngine:
             if previous_alert.structure_direction == "bullish":
                 if current_price <= level:
                     return "BULL_MOMENTUM_FAILED", 3, level
-                if current_price > previous_alert.last_price:
+                if current_price > previous_alert.last_price and self._continuation_is_alertable(
+                    previous_alert, current_price
+                ):
                     return "MOMENTUM_ACCELERATION", 2, level
             elif previous_alert.structure_direction == "bearish":
                 if current_price >= level:
                     return "BEAR_MOMENTUM_FAILED", 3, level
-                if current_price < previous_alert.last_price:
+                if current_price < previous_alert.last_price and self._continuation_is_alertable(
+                    previous_alert, current_price
+                ):
                     return "DOWNTREND_ACCELERATION", 2, level
             return None, 0, None
 
         return self._breakout_transition(ticker)
+
+    def _continuation_is_alertable(
+        self, previous_alert: AlertHistory, current_price: float
+    ) -> bool:
+        cooldown = datetime.timedelta(minutes=config.ALERT_COOLDOWN_MINUTES)
+        elapsed = datetime.datetime.now(datetime.timezone.utc) - previous_alert.last_alert_timestamp
+        if elapsed >= cooldown:
+            return True
+        if previous_alert.last_price <= 0:
+            return False
+        additional_change_pct = abs(current_price / previous_alert.last_price - 1.0) * 100
+        return additional_change_pct >= config.SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT
 
     def _breakout_transition(self, ticker: TickerData) -> Tuple[str | None, int, float | None]:
         candles = ticker.candle_history
