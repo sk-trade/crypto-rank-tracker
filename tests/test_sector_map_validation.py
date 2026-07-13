@@ -109,3 +109,61 @@ def test_sector_map_allows_fresh_bootstrap_with_a_usable_category(monkeypatch):
     asyncio.run(update_sectors.save_validated_sector_map(sector_map))
 
     assert saved == [(update_sectors.config.SECTOR_MAP_FILE_NAME, sector_map)]
+
+
+def test_sector_map_rejects_near_total_fresh_bootstrap_failure(monkeypatch):
+    async def load(*_args):
+        return None
+
+    monkeypatch.setattr(update_sectors, "load_json", load)
+    monkeypatch.setattr(update_sectors, "save_json", pytest.fail)
+    sector_map = {"KRW-VALID": ["Layer 1"]}
+    sector_map.update(
+        {
+            f"KRW-FAILED-{index}": ["Untagged", "API_Error"]
+            for index in range(9)
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="bootstrap coverage"):
+        asyncio.run(update_sectors.save_validated_sector_map(sector_map))
+
+
+@pytest.mark.parametrize(
+    "sector_map",
+    [
+        {"KRW-BTC": "DeFi"},
+        {"KRW-BTC": [123]},
+        {"KRW-BTC": []},
+        {123: ["Layer 1"]},
+    ],
+)
+def test_sector_map_rejects_invalid_canonical_schema(monkeypatch, sector_map):
+    async def load(*_args):
+        return None
+
+    monkeypatch.setattr(update_sectors, "load_json", load)
+    monkeypatch.setattr(update_sectors, "save_json", pytest.fail)
+
+    with pytest.raises(RuntimeError, match="schema"):
+        asyncio.run(update_sectors.save_validated_sector_map(sector_map))
+
+
+def test_invalid_coingecko_category_schema_becomes_a_transient_failure(monkeypatch):
+    async def detail(*_args):
+        return {"name": "Bitcoin", "categories": [123]}
+
+    monkeypatch.setattr(update_sectors, "get_coin_detail", detail)
+    monkeypatch.setattr(update_sectors, "CG_SYMBOL_OVERRIDES", {})
+
+    result = asyncio.run(
+        update_sectors.tag_market(
+            None,
+            "btc",
+            "KRW-BTC",
+            {"btc": ["bitcoin"]},
+            upbit_name="Bitcoin",
+        )
+    )
+
+    assert result == ("KRW-BTC", ["Untagged", "Invalid_Category"])

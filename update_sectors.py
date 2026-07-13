@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import json
+import math
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -24,7 +25,8 @@ CG_COIN_DETAIL_URL = f"{CG_BASE_URL}/coins/"
 CG_SYMBOL_OVERRIDES = json.loads(__import__("os").environ.get("CG_SYMBOL_OVERRIDES", "{}"))
 SECTOR_MAP_ROLLBACK_FILE_NAME = "sectors.previous.json"
 MAX_SECTOR_MAP_CHANGE_RATIO = 0.30
-TRANSIENT_SECTOR_TAGS = {"API_Error", "Lookup_Failed"}
+MIN_SECTOR_BOOTSTRAP_USABLE_RATIO = 0.50
+TRANSIENT_SECTOR_TAGS = {"API_Error", "Lookup_Failed", "Invalid_Category"}
 
 
 # --- RateLimiter 클래스 ---
@@ -157,6 +159,15 @@ async def tag_market(
             if not validate_coin_identity(upbit_name, detail, override):
                 return market_name, ["Untagged", "Identity_Mismatch"]
             categories = detail.get("categories", [])
+            if categories and (
+                not isinstance(categories, list)
+                or any(
+                    not isinstance(category, str) or not category.strip()
+                    for category in categories
+                )
+            ):
+                logging.error("CoinGecko category schema is invalid for %s", coin_id)
+                return market_name, ["Untagged", "Invalid_Category"]
             return market_name, categories if categories else ["Untagged", "No_Category"]
         else:
             return market_name, ["Untagged", "Lookup_Failed"]
@@ -176,8 +187,27 @@ def validate_sector_map_change(previous: Dict, proposed: Dict) -> None:
         raise RuntimeError(f"Sector map change ratio {ratio:.1%} exceeds the {MAX_SECTOR_MAP_CHANGE_RATIO:.0%} safety limit.")
 
 
+def validate_sector_map_schema(sector_map: Dict, *, label: str) -> None:
+    """Require the canonical sector map to remain a non-empty dict[str, list[str]]."""
+    if not isinstance(sector_map, dict) or not sector_map:
+        raise RuntimeError(f"Sector map {label} schema must be a non-empty JSON object.")
+    invalid_markets = [
+        market
+        for market, tags in sector_map.items()
+        if not isinstance(market, str)
+        or not market.startswith("KRW-")
+        or not isinstance(tags, list)
+        or not tags
+        or any(not isinstance(tag, str) or not tag.strip() for tag in tags)
+    ]
+    if invalid_markets:
+        raise RuntimeError(
+            f"Sector map {label} schema is invalid for {len(invalid_markets)} market(s)."
+        )
+
+
 def validate_sector_map_bootstrap(previous: Dict, proposed: Dict) -> None:
-    """Require at least one usable category before publishing the first canonical map."""
+    """Require meaningful usable coverage before publishing the first canonical map."""
     if previous:
         return
     usable_markets = [
@@ -192,11 +222,23 @@ def validate_sector_map_bootstrap(previous: Dict, proposed: Dict) -> None:
         raise RuntimeError(
             "Sector map bootstrap has no usable CoinGecko categories; canonical save aborted."
         )
+    required_usable = math.ceil(
+        len(proposed) * MIN_SECTOR_BOOTSTRAP_USABLE_RATIO
+    )
+    if len(usable_markets) < required_usable:
+        ratio = len(usable_markets) / len(proposed)
+        raise RuntimeError(
+            f"Sector map bootstrap coverage {ratio:.1%} is below the "
+            f"{MIN_SECTOR_BOOTSTRAP_USABLE_RATIO:.0%} minimum."
+        )
 
 
 async def save_validated_sector_map(sector_map: Dict, gcs_client=None) -> None:
     previous = await load_json(config.SECTOR_MAP_FILE_NAME, gcs_client)
     previous = previous if isinstance(previous, dict) else {}
+    if previous:
+        validate_sector_map_schema(previous, label="existing")
+    validate_sector_map_schema(sector_map, label="proposed")
     validate_sector_map_bootstrap(previous, sector_map)
     sector_map = {
         market: previous[market]

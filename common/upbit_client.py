@@ -50,6 +50,15 @@ def _positive_finite_number(value: Any) -> bool:
     )
 
 
+def _nonnegative_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    )
+
+
 def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
     """Interpret Upbit's UTC timestamp strings consistently as aware UTC values."""
     if timestamp.tzinfo is None:
@@ -252,6 +261,24 @@ def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleDa
     for item in page:
         if not isinstance(item, dict) or item.get("market") != market:
             raise ValueError(f"{market}: candle response market mismatch")
+        price_fields = (
+            "opening_price",
+            "high_price",
+            "low_price",
+            "trade_price",
+        )
+        if not all(_positive_finite_number(item.get(field)) for field in price_fields):
+            raise ValueError(f"{market}: candle prices must be positive finite numbers")
+        if not _nonnegative_finite_number(item.get("candle_acc_trade_volume")):
+            raise ValueError(f"{market}: candle volume must be a nonnegative finite number")
+        open_price = float(item["opening_price"])
+        high_price = float(item["high_price"])
+        low_price = float(item["low_price"])
+        close_price = float(item["trade_price"])
+        if low_price > min(open_price, close_price) or high_price < max(
+            open_price, close_price
+        ):
+            raise ValueError(f"{market}: candle OHLC values are inconsistent")
         candles.append(
             CandleData.model_validate(
                 {
@@ -261,11 +288,11 @@ def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleDa
                             item["candle_date_time_utc"].replace("Z", "+00:00")
                         )
                     ),
-                    "open_price": item["opening_price"],
-                    "high_price": item["high_price"],
-                    "low_price": item["low_price"],
-                    "close_price": item["trade_price"],
-                    "volume": item["candle_acc_trade_volume"],
+                    "open_price": open_price,
+                    "high_price": high_price,
+                    "low_price": low_price,
+                    "close_price": close_price,
+                    "volume": float(item["candle_acc_trade_volume"]),
                 }
             )
         )

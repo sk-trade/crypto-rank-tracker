@@ -240,6 +240,38 @@ def test_sparse_candle_collection_rejects_cross_market_payloads():
     assert result == {}
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"opening_price": 0.0},
+        {"trade_price": float("nan")},
+        {"high_price": 99.0},
+        {"low_price": 101.0},
+        {"candle_acc_trade_volume": -1.0},
+        {"candle_acc_trade_volume": float("inf")},
+    ],
+)
+def test_sparse_candle_collection_rejects_invalid_numeric_domains(updates):
+    as_of = datetime.datetime(2026, 7, 13, 12, 6, tzinfo=UTC)
+    row = _raw_candle(datetime.datetime(2026, 7, 13, 11, 50, tzinfo=UTC))
+    row.update(updates)
+    session = _Session([[row]])
+
+    result = asyncio.run(
+        get_candles(
+            session,
+            ["KRW-BTC"],
+            "minutes",
+            count=1,
+            minutes_unit=10,
+            as_of=as_of,
+            synthesize_no_trade_intervals=True,
+        )
+    )
+
+    assert result == {}
+
+
 def test_candle_transport_failure_exhausts_retries_and_fails_the_market(monkeypatch):
     as_of = datetime.datetime(2026, 7, 13, 12, 6, tzinfo=UTC)
     session = _Session([_Response([], status=500) for _ in range(3)])
