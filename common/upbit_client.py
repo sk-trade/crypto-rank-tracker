@@ -4,7 +4,6 @@ import asyncio
 import datetime
 import logging
 from typing import Any, Dict, List, Literal, Optional
-from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiolimiter import AsyncLimiter
@@ -18,7 +17,6 @@ logger = logging.getLogger(config.APP_LOGGER_NAME)
 UPBIT_API_BASE_URL = "https://api.upbit.com/v1"
 
 GLOBAL_LIMITER = AsyncLimiter(8, 1) 
-KST = ZoneInfo("Asia/Seoul")
 MAX_CANDLES_PER_REQUEST = 200
 
 class UpbitAPIError(Exception):
@@ -34,13 +32,12 @@ def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
     return timestamp.astimezone(datetime.timezone.utc)
 
 
-def _expected_candle_starts(
+def _candle_grid(
     time_unit: Literal["minutes", "days", "weeks", "months"],
-    count: int,
     minutes_unit: Optional[int],
     as_of: datetime.datetime,
-) -> List[datetime.datetime]:
-    """Return the ordered grid of fully closed Upbit candle start times."""
+) -> tuple[datetime.datetime, datetime.timedelta]:
+    """Return the current open candle start and interval in Upbit's UTC grid."""
     now_utc = _as_utc(as_of)
     if time_unit == "minutes":
         if not minutes_unit:
@@ -50,14 +47,23 @@ def _expected_candle_starts(
         current_start = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) + (
             elapsed // interval
         ) * interval
-        latest_completed = current_start - interval
     elif time_unit == "days":
-        local_today = now_utc.astimezone(KST).replace(hour=0, minute=0, second=0, microsecond=0)
-        latest_completed = (local_today - datetime.timedelta(days=1)).astimezone(datetime.timezone.utc)
         interval = datetime.timedelta(days=1)
+        current_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         raise ValueError(f"Unsupported candle integrity grid: {time_unit}")
+    return current_start, interval
 
+
+def _expected_candle_starts(
+    time_unit: Literal["minutes", "days", "weeks", "months"],
+    count: int,
+    minutes_unit: Optional[int],
+    as_of: datetime.datetime,
+) -> List[datetime.datetime]:
+    """Return the ordered grid of fully closed Upbit candle start times."""
+    current_start, interval = _candle_grid(time_unit, minutes_unit, as_of)
+    latest_completed = current_start - interval
     first = latest_completed - interval * (count - 1)
     return [first + interval * index for index in range(count)]
 
@@ -171,6 +177,8 @@ async def get_candles(
         return {}
 
     limiter = GLOBAL_LIMITER
+    request_as_of = as_of or datetime.datetime.now(datetime.timezone.utc)
+    request_cutoff, _ = _candle_grid(time_unit, minutes_unit, request_as_of)
 
     async def _fetch_single_market(market: str) -> tuple[str, List[CandleData]]:
         """단일 마켓의 캔들 데이터를 가져오는 내부 헬퍼 함수입니다."""
@@ -181,7 +189,7 @@ async def get_candles(
         max_retries = 3
         raw_candles = []
         remaining = count
-        to: datetime.datetime | None = None
+        to = request_cutoff
 
         while remaining:
             params = {"market": market, "count": min(remaining, MAX_CANDLES_PER_REQUEST)}
@@ -246,7 +254,9 @@ async def get_candles(
                 "volume": item["candle_acc_trade_volume"],
             }) for item in raw_candles
         ]
-        complete_candles = normalize_completed_candles(candles, time_unit, count, minutes_unit, as_of)
+        complete_candles = normalize_completed_candles(
+            candles, time_unit, count, minutes_unit, request_as_of
+        )
         if len(complete_candles) != count:
             logger.warning("%s: rejected incomplete, duplicate, or off-grid paginated candle history.", market)
             return market, []

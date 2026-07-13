@@ -50,16 +50,20 @@ def test_normalize_completed_candles_rejects_missing_or_off_grid_minutes():
     assert normalize_completed_candles(off_grid, "minutes", 2, 10, as_of) == []
 
 
-def test_normalize_completed_daily_candles_uses_the_upbit_kst_boundary():
-    candles = [_candle("2026-06-15T15:00:00"), _candle("2026-06-16T15:00:00"), _candle("2026-06-17T15:00:00")]
+def test_normalize_completed_daily_candles_uses_the_upbit_utc_boundary():
+    candles = [
+        _candle("2026-06-16T00:00:00"),
+        _candle("2026-06-17T00:00:00"),
+        _candle("2026-06-18T00:00:00"),
+    ]
 
     result = normalize_completed_candles(
         candles, "days", count=2, as_of=datetime.datetime(2026, 6, 18, 1, tzinfo=UTC)
     )
 
     assert [candle.timestamp for candle in result] == [
-        datetime.datetime(2026, 6, 15, 15, tzinfo=UTC),
-        datetime.datetime(2026, 6, 16, 15, tzinfo=UTC),
+        datetime.datetime(2026, 6, 16, 0, tzinfo=UTC),
+        datetime.datetime(2026, 6, 17, 0, tzinfo=UTC),
     ]
 
 
@@ -129,6 +133,7 @@ def test_get_candles_paginates_before_normalizing_the_complete_grid():
     assert len(result["KRW-BTC"]) == 201
     assert len(session.calls) == 2
     assert session.calls[0]["count"] == 200
+    assert session.calls[0]["to"] == "2026-06-18T12:00:00Z"
     assert session.calls[1]["count"] == 1
     assert "to" in session.calls[1]
 
