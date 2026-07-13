@@ -3,6 +3,8 @@
 import asyncio
 import datetime
 import logging
+import math
+from collections import Counter
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Literal, Optional
 from weakref import WeakKeyDictionary
@@ -37,6 +39,15 @@ def _global_limiter() -> AsyncLimiter:
         limiter = AsyncLimiter(GLOBAL_RATE_LIMIT_PER_SECOND, 1)
         _LOOP_LIMITERS[loop] = limiter
     return limiter
+
+
+def _positive_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) > 0
+    )
 
 
 def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
@@ -313,17 +324,40 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
         ) as response:
             response.raise_for_status()
             tickers = await response.json()
-            if not tickers:
+            if not isinstance(tickers, list) or not tickers:
                 raise UpbitAPIError("티커 정보를 가져오지 못했습니다.")
-            ticker_markets = {ticker.get("market") for ticker in tickers}
-            missing_markets = sorted(set(krw_markets) - ticker_markets)
-            unexpected_markets = sorted(ticker_markets - set(krw_markets))
-            if missing_markets or unexpected_markets:
+            requested_markets = set(krw_markets)
+            ticker_markets = [
+                ticker.get("market") if isinstance(ticker, dict) else None
+                for ticker in tickers
+            ]
+            market_counts = Counter(
+                market for market in ticker_markets if isinstance(market, str)
+            )
+            missing_markets = sorted(requested_markets - set(market_counts))
+            unexpected_markets = sorted(set(market_counts) - requested_markets)
+            duplicate_markets = sorted(
+                market for market, occurrence_count in market_counts.items() if occurrence_count != 1
+            )
+            invalid_rows = sum(market is None for market in ticker_markets)
+            if (
+                missing_markets
+                or unexpected_markets
+                or duplicate_markets
+                or invalid_rows
+                or len(tickers) != len(krw_markets)
+            ):
                 raise UpbitAPIError(
                     "티커 응답의 KRW 마켓 범위가 목록과 일치하지 않습니다. "
-                    f"missing={missing_markets[:10]}, unexpected={unexpected_markets[:10]}"
+                    f"missing={missing_markets[:10]}, unexpected={unexpected_markets[:10]}, "
+                    f"duplicates={duplicate_markets[:10]}, invalid_rows={invalid_rows}"
                 )
             for ticker in tickers:
+                market = ticker["market"]
+                if not _positive_finite_number(ticker.get("acc_trade_price_24h")):
+                    raise UpbitAPIError(
+                        f"{market}: acc_trade_price_24h must be a positive finite number"
+                    )
                 ticker["market_warning"] = warnings.get(ticker["market"])
             return tickers
 
@@ -347,7 +381,31 @@ async def get_orderbooks(session: aiohttp.ClientSession, markets: List[str]) -> 
                 f"{UPBIT_API_BASE_URL}/orderbook", params={"markets": ",".join(markets)}, timeout=15
             ) as response:
                 response.raise_for_status()
-                return {book["market"]: book for book in await response.json()}
+                payload = await response.json()
+                if not isinstance(payload, list):
+                    raise ValueError("orderbook response must be a list")
+                requested_markets = set(markets)
+                orderbooks = {}
+                for book in payload:
+                    market = book.get("market") if isinstance(book, dict) else None
+                    units = book.get("orderbook_units") if isinstance(book, dict) else None
+                    valid_units = isinstance(units, list) and bool(units) and all(
+                        isinstance(unit, dict)
+                        and all(
+                            _positive_finite_number(unit.get(field))
+                            for field in ("bid_price", "bid_size", "ask_price", "ask_size")
+                        )
+                        for unit in units
+                    )
+                    if (
+                        market not in requested_markets
+                        or market in orderbooks
+                        or not valid_units
+                    ):
+                        logger.warning("Ignoring malformed orderbook row for market %s", market)
+                        continue
+                    orderbooks[market] = book
+                return orderbooks
     except (aiohttp.ClientError, ValueError) as error:
         logger.warning("Orderbook collection failed: %s", error)
         return {}

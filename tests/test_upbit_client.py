@@ -9,6 +9,7 @@ from common.upbit_client import (
     _retry_after_seconds,
     get_all_krw_tickers,
     get_candles,
+    get_orderbooks,
     normalize_completed_candles,
     normalize_sparse_completed_candles,
 )
@@ -294,3 +295,63 @@ def test_get_all_krw_tickers_rejects_partial_ticker_response():
 
     with pytest.raises(UpbitAPIError, match="KRW 마켓 범위가 목록과 일치하지 않습니다"):
         asyncio.run(get_all_krw_tickers(session))
+
+
+def test_get_all_krw_tickers_rejects_duplicate_market_rows():
+    session = _TickerSession(
+        [
+            [
+                {"market": "KRW-BTC", "market_warning": "NONE"},
+                {"market": "KRW-ETH", "market_warning": "NONE"},
+            ],
+            [
+                {"market": "KRW-BTC", "acc_trade_price_24h": 300.0},
+                {"market": "KRW-BTC", "acc_trade_price_24h": 100.0},
+                {"market": "KRW-ETH", "acc_trade_price_24h": 200.0},
+            ],
+        ]
+    )
+
+    with pytest.raises(UpbitAPIError, match=r"duplicates=\['KRW-BTC'\]"):
+        asyncio.run(get_all_krw_tickers(session))
+
+
+@pytest.mark.parametrize("turnover", [None, "100", 0.0, -1.0, float("inf")])
+def test_get_all_krw_tickers_rejects_invalid_ranking_turnover(turnover):
+    session = _TickerSession(
+        [
+            [{"market": "KRW-BTC", "market_warning": "NONE"}],
+            [{"market": "KRW-BTC", "acc_trade_price_24h": turnover}],
+        ]
+    )
+
+    with pytest.raises(UpbitAPIError, match="positive finite number"):
+        asyncio.run(get_all_krw_tickers(session))
+
+
+def test_get_orderbooks_preserves_valid_markets_when_other_rows_are_malformed():
+    valid = {
+        "market": "KRW-BTC",
+        "orderbook_units": [
+            {
+                "bid_price": 99.0,
+                "bid_size": 2.0,
+                "ask_price": 101.0,
+                "ask_size": 2.0,
+            }
+        ],
+    }
+    session = _Session(
+        [
+            [
+                valid,
+                {"orderbook_units": valid["orderbook_units"]},
+                {"market": "KRW-ETH", "orderbook_units": [{"bid_price": "bad"}]},
+                {"market": "KRW-XRP", "orderbook_units": valid["orderbook_units"]},
+            ]
+        ]
+    )
+
+    result = asyncio.run(get_orderbooks(session, ["KRW-BTC", "KRW-ETH"]))
+
+    assert result == {"KRW-BTC": valid}
