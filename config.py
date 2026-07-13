@@ -48,8 +48,10 @@ def validate_storage_config() -> None:
 MAX_Z_SCORE_CAP = 10.0          # Z-Score 상한선 (통계 왜곡 방지)
 MIN_MAD_FLOOR = 0.001           # Z-Score 분모 0 방지
 CONDITIONAL_VOLUME_MIN_SAMPLES = 3
-# Three prior weekly observations plus the decision bar at a 10-minute cadence.
-CONDITIONAL_VOLUME_HISTORY_BARS = 3_025
+# Recent indicators need 154 contiguous clock bars; conditional volume uses
+# separate same-slot observations so the broad scan stays within runtime limits.
+RECENT_SCAN_HISTORY_BARS = 154
+CONDITIONAL_VOLUME_LOOKBACK_WEEKS = 3
 RESIDUAL_MOMENTUM_LOOKBACK_BARS = 144
 RESIDUAL_MOMENTUM_MIN_OBSERVATIONS = 30
 

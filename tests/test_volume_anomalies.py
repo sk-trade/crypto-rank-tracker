@@ -12,13 +12,24 @@ def _candle(market: str, timestamp: datetime.datetime, volume: float) -> CandleD
 
 
 def test_conditional_and_cross_sectional_volume_anomalies_are_separate():
-    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
-    # Three earlier same-weekday/time observations establish the conditional baseline.
-    first = [_candle("KRW-A", start + datetime.timedelta(minutes=10 * index), 10.0) for index in range(3025)]
-    second = [_candle("KRW-B", start + datetime.timedelta(minutes=10 * index), 10.0) for index in range(3025)]
-    third = [_candle("KRW-C", start + datetime.timedelta(minutes=10 * index), 20.0) for index in range(3025)]
-    first[-1] = _candle("KRW-A", first[-1].timestamp, 100.0)
-    third[-1] = _candle("KRW-C", third[-1].timestamp, 40.0)
+    latest = datetime.datetime(2026, 7, 13, 11, 50, tzinfo=datetime.timezone.utc)
+
+    def history(market: str, baseline_volume: float, latest_volume: float):
+        same_slot = [
+            _candle(market, latest - datetime.timedelta(weeks=weeks), baseline_volume)
+            for weeks in range(3, 0, -1)
+        ]
+        recent_start = latest - datetime.timedelta(minutes=10 * 153)
+        recent = [
+            _candle(market, recent_start + datetime.timedelta(minutes=10 * index), baseline_volume)
+            for index in range(154)
+        ]
+        recent[-1] = _candle(market, latest, latest_volume)
+        return [*same_slot, *recent]
+
+    first = history("KRW-A", 10.0, 100.0)
+    second = history("KRW-B", 10.0, 10.0)
+    third = history("KRW-C", 20.0, 40.0)
 
     tickers = process_lightweight_indicators({"KRW-A": first, "KRW-B": second, "KRW-C": third}, {})
 

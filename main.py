@@ -156,8 +156,10 @@ async def run_check(execution_id: str | None = None):
                 all_markets,
                 time_unit="minutes",
                 minutes_unit=10,
-                count=config.CONDITIONAL_VOLUME_HISTORY_BARS,
+                count=config.RECENT_SCAN_HISTORY_BARS,
                 as_of=scan_started_at,
+                synthesize_no_trade_intervals=True,
+                same_slot_lookback_weeks=config.CONDITIONAL_VOLUME_LOOKBACK_WEEKS,
             )
             data_quality_issues = assess_scan_data_quality(
                 all_markets, candles_10m, config.CANDLE_SUCCESS_RATE_MINIMUM
