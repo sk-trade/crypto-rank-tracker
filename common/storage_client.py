@@ -12,6 +12,7 @@ import aiofiles
 import config
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
+JsonValue = Union[List, Dict, None]
 
 
 class StateNotFound(Exception):
@@ -28,7 +29,7 @@ class StateBackendUnavailable(RuntimeError):
 
 async def load_json(
     filename: str, gcs_client=None
-) -> Optional[Union[List, Dict]]:
+) -> JsonValue:
     """설정에 따라 GCS 또는 로컬에서 JSON 파일을 로드합니다.
     
     파일이 없으면 None을 반환합니다.
@@ -42,7 +43,7 @@ async def load_json(
     return await _load_json_from_local(filepath)
 
 
-async def save_json(filename: str, data: Union[List, Dict], gcs_client=None):
+async def save_json(filename: str, data: JsonValue, gcs_client=None):
     """설정에 따라 GCS 또는 로컬에 JSON 파일을 저장합니다."""
     try:
         if config.STATE_STORAGE_METHOD == "GCS":
@@ -58,7 +59,7 @@ async def save_json(filename: str, data: Union[List, Dict], gcs_client=None):
 
 async def _load_json_from_gcs(
     gcs_client, filename: str
-) -> Optional[Union[List, Dict]]:
+) -> JsonValue:
     """GCS에서 JSON 파일을 로드하는 헬퍼 함수입니다."""
     bucket = gcs_client.bucket(config.GCS_BUCKET_NAME)
     blob = bucket.blob(filename)
@@ -80,7 +81,7 @@ async def _load_json_from_gcs(
         raise StateLoadError(f"GCS 파일 로드 실패 ({filename}): {e}") from e
 
 
-async def _save_json_to_gcs(gcs_client, filename: str, data: Union[List, Dict]):
+async def _save_json_to_gcs(gcs_client, filename: str, data: JsonValue):
     """GCS에 JSON 파일을 저장하는 헬퍼 함수입니다."""
     try:
         bucket = gcs_client.bucket(config.GCS_BUCKET_NAME)
@@ -110,7 +111,7 @@ async def _load_json_from_local(filepath: str) -> Optional[Union[List, Dict]]:
         raise StateLoadError(f"로컬 파일 로드 실패 ({filepath}): {e}") from e
 
 
-async def _save_json_to_local(filepath: str, data: Union[List, Dict]):
+async def _save_json_to_local(filepath: str, data: JsonValue):
     """로컬 파일 시스템에 JSON 파일을 저장하는 헬퍼 함수입니다."""
     temporary_path = None
     try:
@@ -133,3 +134,10 @@ async def _save_json_to_local(filepath: str, data: Union[List, Dict]):
     finally:
         if temporary_path and os.path.exists(temporary_path):
             os.unlink(temporary_path)
+
+
+def create_gcs_client():
+    """Create a storage client with an explicit project when the environment provides one."""
+    from google.cloud import storage
+
+    return storage.Client(project=config.GCP_PROJECT_ID or None)

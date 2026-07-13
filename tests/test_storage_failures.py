@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import Mock
 
 import pytest
 
@@ -9,6 +10,7 @@ from common.storage_client import (
     StateLoadError,
     _load_json_from_gcs,
     _save_json_to_gcs,
+    create_gcs_client,
     load_json,
     save_json,
 )
@@ -82,3 +84,15 @@ def test_local_save_keeps_the_previous_complete_state_if_atomic_replace_fails(mo
 
     assert state_file.read_text(encoding="utf-8") == '{"previous": true}'
     assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
+def test_gcs_client_uses_explicit_project_when_configured(monkeypatch):
+    from google.cloud import storage
+
+    client = object()
+    monkeypatch.setattr(config, "GCP_PROJECT_ID", "project-id")
+    client_factory = Mock(return_value=client)
+    monkeypatch.setattr(storage, "Client", client_factory)
+
+    assert create_gcs_client() is client
+    client_factory.assert_called_once_with(project="project-id")

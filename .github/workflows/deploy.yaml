@@ -90,8 +90,13 @@ jobs:
 
       - name: Validate durable state configuration
         env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
         run: |
+          if [ -z "$GCP_PROJECT_ID" ]; then
+            echo "::error::GCP_PROJECT_ID repository secret is required for Google Cloud deployment."
+            exit 1
+          fi
           if [ -z "$GCS_BUCKET_NAME" ]; then
             echo "::error::GCS_BUCKET_NAME repository variable is required for durable production state."
             exit 1
@@ -108,6 +113,7 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: 'google-github-actions/auth@v2'
         with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SA_EMAIL }}
 
@@ -116,6 +122,7 @@ jobs:
         id: deploy
         uses: 'google-github-actions/deploy-cloud-functions@v3'
         with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
           name: crypto-rank-tracker          # 배포할 함수 이름
           runtime: python311                # 파이썬 런타임 버전
           entry_point: main                 # 진입점 함수 이름
@@ -128,12 +135,14 @@ jobs:
           max_instance_request_concurrency: 1
           environment_variables: |          # 환경 변수 설정
             STATE_STORAGE_METHOD=GCS
+            GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
             GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
             WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
 
       - name: Authorize Scheduler invocation
         run: |
           gcloud run services add-iam-policy-binding crypto-rank-tracker \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
             --region=asia-northeast1 \
             --member="serviceAccount:${{ secrets.GCP_SCHEDULER_SA_EMAIL }}" \
             --role="roles/run.invoker"
@@ -142,11 +151,12 @@ jobs:
       - name: Create Cloud Scheduler Job
         run: |
           # Cloud Function URL 가져오기
-          FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
+          FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --project="${{ secrets.GCP_PROJECT_ID }}" --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
 
           echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
 
           SCHEDULER_ARGS=(
+            --project=${{ secrets.GCP_PROJECT_ID }}
             --location=asia-northeast1
             --schedule="*/10 * * * *"
             --uri="$FUNCTION_URL"
@@ -170,6 +180,6 @@ jobs:
       - name: Verify deployment
         run: |
           echo "Function deployed successfully!"
-          gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)"
+          gcloud functions describe crypto-rank-tracker --project="${{ secrets.GCP_PROJECT_ID }}" --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)"
           echo "Scheduler job created/updated:"
-          gcloud scheduler jobs describe crypto-rank-tracker-scheduler --location=asia-northeast1
+          gcloud scheduler jobs describe crypto-rank-tracker-scheduler --project="${{ secrets.GCP_PROJECT_ID }}" --location=asia-northeast1

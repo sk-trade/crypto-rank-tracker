@@ -11,7 +11,7 @@ import aiohttp
 from tqdm.asyncio import tqdm_asyncio
 
 import config
-from common.storage_client import load_json, save_json
+from common.storage_client import create_gcs_client, load_json, save_json
 
 # --- 로거 및 상수 설정 ---
 logging.basicConfig(level="INFO", format="%(asctime)s - %(levelname)s - %(message)s")
@@ -224,9 +224,7 @@ async def main():
 
     if config.STATE_STORAGE_METHOD == "GCS":
         try:
-            from google.cloud import storage
-
-            gcs_client = storage.Client()
+            gcs_client = create_gcs_client()
             logging.info("GCS 저장 모드로 실행됩니다.")
         except ImportError as e:
             raise RuntimeError(

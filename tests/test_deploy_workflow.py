@@ -81,6 +81,19 @@ def test_production_workflows_require_shared_gcs_state():
     assert expected_error in sectors
 
 
+def test_production_workflows_select_the_explicit_gcp_project():
+    deploy = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+    sectors = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+
+    expected_error = "GCP_PROJECT_ID repository secret is required"
+    assert expected_error in deploy
+    assert expected_error in sectors
+    assert "project_id: ${{ secrets.GCP_PROJECT_ID }}" in deploy
+    assert "project_id: ${{ secrets.GCP_PROJECT_ID }}" in sectors
+    assert "GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}" in deploy
+    assert "--project=\"${{ secrets.GCP_PROJECT_ID }}\"" in deploy
+
+
 def test_sector_updater_restricts_manual_production_writes_to_main():
     workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
 

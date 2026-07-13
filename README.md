@@ -10,7 +10,7 @@ Set these environment variables for runtime behavior:
 - `GCS_BUCKET_NAME`: required bucket name when `STATE_STORAGE_METHOD=GCS`.
 - `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery.
 - `CG_API_KEY`: CoinGecko API key used by the sector updater.
-- `GCP_PROJECT_ID`: Google Cloud project identifier used by deployment/runtime integration.
+- `GCP_PROJECT_ID`: Google Cloud project identifier. Production workflows require it; local GCS use may omit it only when Application Default Credentials can infer the project.
 - `CG_SYMBOL_OVERRIDES`: optional JSON object mapping an ambiguous lower-case symbol to an explicit CoinGecko id, for example `{"pay":"tenx"}`. Ambiguous symbols without a valid override are left untagged.
 
 ## Local setup
@@ -53,7 +53,7 @@ Both commands can trigger live network traffic and service side effects. They ma
 
 ## Signal Safety
 
-- The scanner fetches 3,025 completed 10-minute candles per market to establish a three-week same-weekday/time volume baseline. Incomplete history, missing conditional samples, or unavailable orderbooks block signals rather than falling back to a weaker rule.
+- The broad scan builds 154 recent 10-minute clock bars per market and separately fetches three prior weekly same-slot observations. Upbit no-trade intervals carry the previous OHLC with zero volume; malformed responses, missing conditional samples, or unavailable orderbooks still block signals rather than falling back to a weaker rule.
 - Candidate execution checks require sufficient 24-hour turnover, two-sided orderbook depth for the configured KRW notional, acceptable spread/slippage, and movement that covers estimated round-trip costs.
 - Local state is stored under `state/`. Rank snapshots retain the most recent `STATE_HISTORY_COUNT` entries; malformed state files fail explicitly rather than silently resetting history.
 - The baseline model, threshold selector, and shadow-promotion policies are offline evaluation tools. They do not replace production alerts until frozen shadow-operation criteria are met.
@@ -70,7 +70,7 @@ GitHub Actions is used for deployment flow control:
 - Configure distinct GitHub Secrets for `GCP_DEPLOYER_SA_EMAIL`, `GCP_RUNTIME_SA_EMAIL`,
   and `GCP_SCHEDULER_SA_EMAIL`. The deployer authenticates GitHub Actions, the runtime
   account accesses application resources, and the Scheduler account invokes the function.
-- Configure the `GCP_WIF_PROVIDER` secret for Workload Identity Federation, plus the
+- Configure the `GCP_PROJECT_ID` and `GCP_WIF_PROVIDER` secrets for explicit project selection and Workload Identity Federation, plus the
   `WEBHOOK_URL` secret when live notifications are required.
 - Production workflows pin `STATE_STORAGE_METHOD=GCS` so the scheduled function and sector
   updater share durable state. Configure the required `GCS_BUCKET_NAME` repository variable;
@@ -80,9 +80,10 @@ GitHub Actions is used for deployment flow control:
 - Grant the deployer permission to deploy Cloud Functions, act as the runtime service account,
   update the Cloud Run invoker policy, and manage the Scheduler job. The workflow grants the
   Scheduler service account `roles/run.invoker` on the deployed Gen2 service.
-- The Gen2 function is deployed with a 540-second service timeout, one maximum instance,
-  and one request per instance. Scheduler updates are idempotent and use the function URL
-  as their OIDC audience.
+- The Gen2 function is deployed with 512 MB memory, a 540-second service timeout, one maximum instance,
+  and one request per instance. Scheduler updates are idempotent, use the function URL
+  as their OIDC audience, and retry failed executions three times with bounded backoff.
+- Configured webhook deliveries use durable outbox state. Missing `WEBHOOK_URL` remains a successful dry-run skip; configured HTTP/network failures surface as failed executions for Scheduler retry.
 
 ## Operational notes
 

@@ -31,6 +31,7 @@ from common.notification.main import (
     recover_pending_notification,
 )
 from common.sector_loader import load_and_process_sectors
+from common.storage_client import create_gcs_client
 from common.state_manager import (
     append_scan_events,
     append_scan_outcomes,
@@ -127,8 +128,7 @@ async def run_check(execution_id: str | None = None):
     gcs_client = None
     if config.STATE_STORAGE_METHOD == "GCS":
         try:
-            from google.cloud import storage
-            gcs_client = storage.Client()
+            gcs_client = create_gcs_client()
             logger.info("GCS 저장 모드로 실행됩니다.")
         except ImportError as e:
             raise RuntimeError(
