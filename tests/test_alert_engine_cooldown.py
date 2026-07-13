@@ -118,6 +118,25 @@ def _briefing_args():
     }
 
 
+def _notification_record(
+    delivery_id: str,
+    scan_key: str,
+    *,
+    kind: str = "briefing",
+    status: str = "prepared",
+):
+    return {
+        "delivery_id": delivery_id,
+        "status": status,
+        "message": delivery_id,
+        "alert_history": None,
+        "previous_alert_history": None,
+        "alert_markets": [],
+        "scan_key": scan_key,
+        "kind": kind,
+    }
+
+
 def test_configured_webhook_failure_is_queued_and_retried(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
@@ -152,6 +171,39 @@ def test_configured_webhook_failure_is_queued_and_retried(monkeypatch, tmp_path)
         call.kwargs["delivery_id"] == pending["delivery_id"]
         for call in send.await_args_list
     )
+
+
+def test_prepared_outbox_keeps_the_scan_handoff_durable_when_history_save_fails(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        notification.NotificationFormatter,
+        "format_daily_briefing",
+        lambda self, **kwargs: "briefing",
+    )
+    monkeypatch.setattr(
+        notification,
+        "save_alert_history",
+        AsyncMock(side_effect=RuntimeError("state write failed")),
+    )
+    send = AsyncMock()
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    with pytest.raises(notification.NotificationDeliveryError) as error:
+        asyncio.run(
+            notification.create_and_dispatch_notification(
+                **_briefing_args(), scan_key="scan-a"
+            )
+        )
+
+    assert error.value.scan_handoff_durable is True
+    pending = asyncio.run(state_manager.load_notification_outbox())
+    assert pending["status"] == "prepared"
+    assert pending["scan_key"] == "scan-a"
+    send.assert_not_awaited()
 
 
 def test_webhook_request_exposes_the_delivery_id_header(monkeypatch):
@@ -189,10 +241,14 @@ def test_webhook_request_exposes_the_delivery_id_header(monkeypatch):
 
 
 def test_delivery_id_is_stable_within_a_scan_and_distinct_across_scans():
-    first = notification._notification_delivery_id("same message", "scan-a")
+    first = notification._notification_delivery_id("same message", "scan-a", "alert")
 
-    assert first == notification._notification_delivery_id("same message", "scan-a")
-    assert first != notification._notification_delivery_id("same message", "scan-b")
+    assert first == notification._notification_delivery_id(
+        "changed retry text", "scan-a", "alert"
+    )
+    assert first != notification._notification_delivery_id(
+        "same message", "scan-b", "alert"
+    )
 
 
 def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
@@ -354,6 +410,314 @@ def test_missing_webhook_rolls_back_prepared_alert_history(monkeypatch, tmp_path
 
     assert result.skipped is True
     assert asyncio.run(load_alert_history()) == {}
+
+
+def test_new_alert_is_queued_behind_an_unresolved_outbox(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        notification.NotificationFormatter,
+        "format_daily_briefing",
+        lambda self, **kwargs: "new briefing",
+    )
+    active = {
+        "delivery_id": "active-delivery",
+        "status": "attempting",
+        "message": "old briefing",
+        "alert_history": None,
+        "previous_alert_history": None,
+        "alert_markets": [],
+        "scan_key": "scan-old",
+        "kind": "briefing",
+    }
+    asyncio.run(state_manager.save_notification_outbox(active))
+    send = AsyncMock()
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    result = asyncio.run(
+        notification.create_and_dispatch_notification(
+            **_briefing_args(), scan_key="scan-new"
+        )
+    )
+
+    backlog = asyncio.run(state_manager.load_notification_backlog())
+    assert result.queued is True
+    assert len(backlog) == 1
+    assert backlog[0]["scan_key"] == "scan-new"
+    assert backlog[0]["kind"] == "alert"
+    assert "KRW-BTC" in asyncio.run(load_alert_history())
+    assert asyncio.run(state_manager.load_notification_outbox()) == active
+    send.assert_not_awaited()
+
+
+def test_repeated_briefings_coalesce_to_the_latest_deferred_scan(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    active = _notification_record(
+        "active-delivery", "scan-active", status="attempting"
+    )
+    asyncio.run(state_manager.save_notification_outbox(active))
+
+    asyncio.run(
+        notification._queue_and_dispatch_notification(
+            "first briefing", scan_key="scan-first"
+        )
+    )
+    asyncio.run(
+        notification._queue_and_dispatch_notification(
+            "second briefing", scan_key="scan-second"
+        )
+    )
+
+    backlog = asyncio.run(state_manager.load_notification_backlog())
+    assert [item["scan_key"] for item in backlog] == ["scan-second"]
+    assert backlog[0]["message"] == "second briefing"
+
+
+def test_notification_backlog_capacity_failure_is_explicit(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    active = _notification_record(
+        "active-delivery", "scan-active", status="attempting"
+    )
+    backlog = [
+        _notification_record(
+            f"deferred-{index}", f"scan-{index}", kind="data_quality"
+        )
+        for index in range(notification.MAX_NOTIFICATION_BACKLOG)
+    ]
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog(backlog))
+
+    with pytest.raises(
+        notification.NotificationDeliveryError,
+        match=f"reached {notification.MAX_NOTIFICATION_BACKLOG}",
+    ):
+        asyncio.run(
+            notification._queue_and_dispatch_notification(
+                "overflow", scan_key="scan-overflow", notification_kind="data_quality"
+            )
+        )
+
+    assert asyncio.run(state_manager.load_notification_backlog()) == backlog
+
+
+def test_malformed_notification_backlog_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    (tmp_path / state_manager.NOTIFICATION_BACKLOG_FILE_NAME).write_text(
+        "{}", encoding="utf-8"
+    )
+
+    with pytest.raises(StateLoadError, match="JSON array"):
+        asyncio.run(state_manager.load_notification_backlog())
+
+
+def test_recovery_promotes_deferred_notification_after_active_success(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    active = {
+        "delivery_id": "active-delivery",
+        "status": "prepared",
+        "message": "old briefing",
+        "alert_history": None,
+        "previous_alert_history": None,
+        "alert_markets": [],
+        "scan_key": "scan-old",
+        "kind": "briefing",
+    }
+    deferred = {
+        "delivery_id": "deferred-delivery",
+        "status": "prepared",
+        "message": "new alert",
+        "alert_history": None,
+        "previous_alert_history": None,
+        "alert_markets": [],
+        "scan_key": "scan-new",
+        "kind": "alert",
+    }
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([deferred]))
+    send = AsyncMock(return_value=notification.DispatchResult(True))
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    first = asyncio.run(notification.recover_pending_notification())
+
+    assert first.sent is True
+    assert asyncio.run(state_manager.load_notification_outbox()) == deferred
+    assert asyncio.run(state_manager.load_notification_backlog()) == []
+    assert send.await_count == 1
+
+    second = asyncio.run(notification.recover_pending_notification())
+
+    assert second.sent is True
+    assert asyncio.run(state_manager.load_notification_outbox()) is None
+    assert send.await_count == 2
+
+
+def test_briefing_recovery_reconciles_deferred_alert_history_after_queue_crash(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    alert_history = _history("BREAKOUT_START", 101.0, now, minutes_ago=0)
+    active = _notification_record("active-delivery", "scan-active")
+    deferred = {
+        **_notification_record("deferred-delivery", "scan-deferred", kind="alert"),
+        "alert_history": {"KRW-BTC": alert_history.model_dump(mode="json")},
+        "previous_alert_history": {},
+        "alert_markets": ["KRW-BTC"],
+    }
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([deferred]))
+    monkeypatch.setattr(
+        notification,
+        "send_notification",
+        AsyncMock(return_value=notification.DispatchResult(True)),
+    )
+
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.sent is True
+    assert asyncio.run(load_alert_history())["KRW-BTC"] == alert_history
+    assert asyncio.run(state_manager.load_notification_outbox()) == deferred
+
+
+def test_recovery_deduplicates_a_promoted_record_left_in_the_backlog(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    active = _notification_record("active-delivery", "scan-active")
+    deferred = _notification_record("deferred-delivery", "scan-deferred")
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([active, deferred]))
+    send = AsyncMock(return_value=notification.DispatchResult(True))
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.sent is True
+    assert asyncio.run(state_manager.load_notification_outbox()) == deferred
+    assert asyncio.run(state_manager.load_notification_backlog()) == []
+    send.assert_awaited_once()
+
+
+def test_earlier_delivery_preserves_and_rebases_a_later_alert_for_the_same_market(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    old_timestamp = datetime.datetime.now(
+        datetime.timezone.utc
+    ) - datetime.timedelta(hours=25)
+    breakout = _history("BREAKOUT_START", 101.0, old_timestamp, minutes_ago=0)
+    breakout.last_alert_timestamp = old_timestamp
+    breakout.initial_timestamp = old_timestamp
+    acceleration = breakout.model_copy(
+        update={
+            "last_alert_timestamp": old_timestamp + datetime.timedelta(minutes=10),
+            "last_signal_type": "MOMENTUM_ACCELERATION",
+            "last_price": 110.0,
+            "last_rvol": 2.0,
+        }
+    )
+    active = {
+        **_notification_record("active-delivery", "scan-active", kind="alert"),
+        "alert_history": {"KRW-BTC": breakout.model_dump(mode="json")},
+        "previous_alert_history": {},
+        "alert_markets": ["KRW-BTC"],
+    }
+    deferred = {
+        **_notification_record("deferred-delivery", "scan-deferred", kind="alert"),
+        "alert_history": {"KRW-BTC": acceleration.model_dump(mode="json")},
+        "previous_alert_history": {
+            "KRW-BTC": breakout.model_dump(mode="json")
+        },
+        "alert_markets": ["KRW-BTC"],
+    }
+    asyncio.run(state_manager.save_alert_history({"KRW-BTC": acceleration}))
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([deferred]))
+    monkeypatch.setattr(
+        notification,
+        "send_notification",
+        AsyncMock(return_value=notification.DispatchResult(True)),
+    )
+
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.sent is True
+    current = asyncio.run(load_alert_history())["KRW-BTC"]
+    promoted = asyncio.run(state_manager.load_notification_outbox())
+    refreshed_predecessor = AlertHistory.model_validate(
+        promoted["previous_alert_history"]["KRW-BTC"]
+    )
+    assert current.last_signal_type == "MOMENTUM_ACCELERATION"
+    assert current.last_price == 110.0
+    assert current.initial_timestamp == refreshed_predecessor.initial_timestamp
+    assert current.last_alert_timestamp >= refreshed_predecessor.last_alert_timestamp
+    assert refreshed_predecessor.last_alert_timestamp > old_timestamp
+
+    monkeypatch.setattr(config, "WEBHOOK_URL", None)
+    canceled = asyncio.run(notification.recover_pending_notification())
+
+    assert canceled.skipped is True
+    rolled_back = asyncio.run(load_alert_history())["KRW-BTC"]
+    assert rolled_back.last_signal_type == "BREAKOUT_START"
+    assert rolled_back.last_alert_timestamp == refreshed_predecessor.last_alert_timestamp
+
+
+def test_missing_webhook_rolls_back_active_and_deferred_alert_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", None)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    btc = _history("BREAKOUT_START", 101.0, now, minutes_ago=0)
+    eth = btc.model_copy(
+        update={"market": "KRW-ETH", "last_price": 202.0, "initial_price": 202.0}
+    )
+    active = {
+        "delivery_id": "active-delivery",
+        "status": "prepared",
+        "message": "old alert",
+        "alert_history": {"KRW-BTC": btc.model_dump(mode="json")},
+        "previous_alert_history": {},
+        "alert_markets": ["KRW-BTC"],
+        "scan_key": "scan-old",
+        "kind": "alert",
+    }
+    deferred = {
+        "delivery_id": "deferred-delivery",
+        "status": "prepared",
+        "message": "new alert",
+        "alert_history": {
+            "KRW-BTC": btc.model_dump(mode="json"),
+            "KRW-ETH": eth.model_dump(mode="json"),
+        },
+        "previous_alert_history": {"KRW-BTC": btc.model_dump(mode="json")},
+        "alert_markets": ["KRW-ETH"],
+        "scan_key": "scan-new",
+        "kind": "alert",
+    }
+    asyncio.run(state_manager.save_alert_history({"KRW-BTC": btc, "KRW-ETH": eth}))
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([deferred]))
+
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.skipped is True
+    assert asyncio.run(load_alert_history()) == {}
+    assert asyncio.run(state_manager.load_notification_outbox()) is None
+    assert asyncio.run(state_manager.load_notification_backlog()) == []
 
 
 def test_delayed_delivery_refreshes_the_alert_cooldown_timestamp(monkeypatch):

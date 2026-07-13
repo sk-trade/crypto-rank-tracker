@@ -14,6 +14,7 @@ from common.storage_client import StateBackendUnavailable, StateLoadError, load_
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 IDEMPOTENCY_STATE_FILE_NAME = "processed_scan_keys.json"
 NOTIFICATION_OUTBOX_FILE_NAME = "notification_outbox.json"
+NOTIFICATION_BACKLOG_FILE_NAME = "notification_backlog.json"
 SCAN_CLAIM_LEASE_SECONDS = 600
 
 
@@ -478,6 +479,11 @@ def _validate_notification_outbox(data: Any) -> Dict[str, Any]:
     scan_key = data.get("scan_key")
     if scan_key is not None and not isinstance(scan_key, str):
         raise StateLoadError("알림 outbox scan_key는 문자열 또는 null이어야 합니다.")
+    kind = data.get("kind", "briefing")
+    if kind not in {"briefing", "alert", "data_quality"}:
+        raise StateLoadError(
+            "알림 outbox kind는 briefing, alert 또는 data_quality여야 합니다."
+        )
     return data
 
 
@@ -494,6 +500,35 @@ async def save_notification_outbox(outbox: Optional[Dict[str, Any]], gcs_client=
     if outbox is not None:
         _validate_notification_outbox(outbox)
     await save_json(NOTIFICATION_OUTBOX_FILE_NAME, outbox, gcs_client)
+
+
+async def load_notification_backlog(gcs_client=None) -> List[Dict[str, Any]]:
+    """Load deferred prepared notifications in FIFO order."""
+    data = await load_json(NOTIFICATION_BACKLOG_FILE_NAME, gcs_client)
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise StateLoadError(
+            f"알림 backlog 형식 오류 ({NOTIFICATION_BACKLOG_FILE_NAME}): JSON array가 필요합니다."
+        )
+    backlog = []
+    for item in data:
+        validated = _validate_notification_outbox(item)
+        if validated["status"] != "prepared":
+            raise StateLoadError("알림 backlog에는 prepared 상태만 저장할 수 있습니다.")
+        backlog.append(validated)
+    return backlog
+
+
+async def save_notification_backlog(
+    backlog: List[Dict[str, Any]], gcs_client=None
+) -> None:
+    """Persist the deferred notification FIFO after validating every record."""
+    for item in backlog:
+        validated = _validate_notification_outbox(item)
+        if validated["status"] != "prepared":
+            raise StateLoadError("알림 backlog에는 prepared 상태만 저장할 수 있습니다.")
+    await save_json(NOTIFICATION_BACKLOG_FILE_NAME, backlog, gcs_client)
 
 
 # --- 로그 정리 ---

@@ -205,19 +205,26 @@ async def run_check(execution_id: str | None = None):
                     gcs_client,
                 )
                 scan_persisted = True
-                if pending_delivery_error:
-                    await complete_scan_key(scan_key, gcs_client)
-                    raise pending_delivery_error
                 try:
                     await dispatch_data_quality_alert(
                         data_quality_issues,
                         gcs_client=gcs_client,
                         scan_key=scan_key,
                     )
-                except NotificationDeliveryError:
-                    await complete_scan_key(scan_key, gcs_client)
+                except NotificationDeliveryError as error:
+                    if error.scan_handoff_durable:
+                        await complete_scan_key(scan_key, gcs_client)
+                    else:
+                        await release_scan_key(scan_key, gcs_client=gcs_client)
+                        claimed_scan_key = None
+                    raise
+                except Exception:
+                    await release_scan_key(scan_key, gcs_client=gcs_client)
+                    claimed_scan_key = None
                     raise
                 await complete_scan_key(scan_key, gcs_client)
+                if pending_delivery_error:
+                    raise pending_delivery_error
                 return
 
             pending_events = await load_pending_scan_events(gcs_client)
@@ -353,9 +360,6 @@ async def run_check(execution_id: str | None = None):
             await save_rank_state_history(new_rank_state, old_rank_states, gcs_client=gcs_client)
             scan_persisted = True
 
-            if pending_delivery_error:
-                await complete_scan_key(scan_key, gcs_client)
-                raise pending_delivery_error
             try:
                 await create_and_dispatch_notification(
                     raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
@@ -363,10 +367,20 @@ async def run_check(execution_id: str | None = None):
                     final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime,
                     gcs_client=gcs_client, scan_key=scan_key,
                 )
-            except NotificationDeliveryError:
-                await complete_scan_key(scan_key, gcs_client)
+            except NotificationDeliveryError as error:
+                if error.scan_handoff_durable:
+                    await complete_scan_key(scan_key, gcs_client)
+                else:
+                    await release_scan_key(scan_key, gcs_client=gcs_client)
+                    claimed_scan_key = None
+                raise
+            except Exception:
+                await release_scan_key(scan_key, gcs_client=gcs_client)
+                claimed_scan_key = None
                 raise
             await complete_scan_key(scan_key, gcs_client)
+            if pending_delivery_error:
+                raise pending_delivery_error
 
             # # (주석 처리) 현재 분석 결과 로그로 저장
             # tickers_to_save = {

@@ -83,7 +83,9 @@ GitHub Actions is used for deployment flow control:
 - The Gen2 function is deployed with 512 MB memory, a 540-second service timeout, one maximum instance,
   and one request per instance. Scheduler updates are idempotent, use the function URL
   as their OIDC audience, and retry failed executions three times with bounded backoff.
-- Configured webhook deliveries use durable outbox state and expose a stable `X-Webhook-Delivery-ID` header for receiver-side reconciliation. Definitive HTTP/connect failures remain retryable, while an in-flight attempt with an unknown outcome is held for operator review instead of being silently cleared or resent. Market scans continue while an older delivery is pending, and removing `WEBHOOK_URL` cancels that pending delivery as a successful dry-run transition.
+- Configured webhook deliveries use durable outbox state and expose a stable `X-Webhook-Delivery-ID` header for receiver-side reconciliation. Definitive HTTP/connect failures remain retryable, while an in-flight attempt with an unknown outcome is held for operator review instead of being silently cleared or resent.
+- Market scans continue while an older delivery is pending. Later alerts and data-quality incidents are retained in FIFO order in `notification_backlog.json`; ordinary no-alert briefings coalesce to the latest scan. The backlog is bounded at 144 retained records, and a full backlog fails the scan explicitly so the notification is not silently discarded.
+- For an outbox in `attempting`, check the receiver for its delivery ID before editing state. If the receiver confirms delivery, preserve the record and change only its status to `delivered`; if it confirms no delivery, change only the status to `prepared`. Leave an unresolved attempt untouched. Removing `WEBHOOK_URL` is an explicit cancellation: prepared and deferred cooldown changes are rolled back, queued records are cleared, and no network retry occurs.
 
 ## Operational notes
 

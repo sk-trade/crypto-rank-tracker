@@ -224,10 +224,10 @@ def _configure_valid_scan_with_notification_error(monkeypatch, error):
     return release
 
 
-def test_run_check_releases_claim_when_configured_webhook_fails(monkeypatch):
+def test_run_check_completes_claim_when_notification_handoff_is_durable(monkeypatch):
     release = _configure_valid_scan_with_notification_error(
         monkeypatch,
-        app.NotificationDeliveryError("HTTP 500"),
+        app.NotificationDeliveryError("HTTP 500", scan_handoff_durable=True),
     )
 
     import asyncio
@@ -237,6 +237,23 @@ def test_run_check_releases_claim_when_configured_webhook_fails(monkeypatch):
 
     app.complete_scan_key.assert_awaited_once()
     release.assert_not_awaited()
+
+
+def test_run_check_releases_claim_when_notification_handoff_is_not_durable(
+    monkeypatch,
+):
+    release = _configure_valid_scan_with_notification_error(
+        monkeypatch,
+        app.NotificationDeliveryError("backlog full"),
+    )
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check(execution_id="run-a"))
+
+    app.complete_scan_key.assert_not_awaited()
+    release.assert_awaited_once()
 
 
 def test_run_check_retains_claim_after_confirmed_delivery_finalization_failure(monkeypatch):
@@ -277,7 +294,8 @@ def test_pending_webhook_failure_does_not_block_market_state_collection(monkeypa
     app.get_all_krw_tickers.assert_awaited_once()
     app.save_rank_state_history.assert_awaited_once()
     app.complete_scan_key.assert_awaited_once()
-    notify.assert_not_awaited()
+    notify.assert_awaited_once()
+    assert notify.await_args.kwargs["scan_key"].startswith("completed-candle:")
     release.assert_not_awaited()
 
 
