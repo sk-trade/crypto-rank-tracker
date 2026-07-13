@@ -188,6 +188,13 @@ def test_webhook_request_exposes_the_delivery_id_header(monkeypatch):
     assert request["headers"] == {"X-Webhook-Delivery-ID": "delivery-1"}
 
 
+def test_delivery_id_is_stable_within_a_scan_and_distinct_across_scans():
+    first = notification._notification_delivery_id("same message", "scan-a")
+
+    assert first == notification._notification_delivery_id("same message", "scan-a")
+    assert first != notification._notification_delivery_id("same message", "scan-b")
+
+
 def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
     monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
     monkeypatch.setattr(
@@ -321,6 +328,32 @@ def test_missing_webhook_cancels_a_pending_delivery(monkeypatch):
 
     assert result.skipped is True
     save_outbox.assert_awaited_once_with(None, None)
+
+
+def test_missing_webhook_rolls_back_prepared_alert_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        notification.NotificationFormatter,
+        "format_daily_briefing",
+        lambda self, **kwargs: "briefing",
+    )
+    monkeypatch.setattr(
+        notification,
+        "send_notification",
+        AsyncMock(return_value=notification.DispatchResult(False, "HTTP 500", 500)),
+    )
+
+    with pytest.raises(notification.NotificationDeliveryError, match="HTTP 500"):
+        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+    assert "KRW-BTC" in asyncio.run(load_alert_history())
+
+    monkeypatch.setattr(config, "WEBHOOK_URL", None)
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.skipped is True
+    assert asyncio.run(load_alert_history()) == {}
 
 
 def test_delayed_delivery_refreshes_the_alert_cooldown_timestamp(monkeypatch):

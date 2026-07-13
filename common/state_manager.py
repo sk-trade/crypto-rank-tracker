@@ -462,6 +462,14 @@ def _validate_notification_outbox(data: Any) -> Dict[str, Any]:
         or any(not isinstance(value, dict) for value in history.values())
     ):
         raise StateLoadError("알림 outbox alert_history는 JSON object 또는 null이어야 합니다.")
+    previous_history = data.get("previous_alert_history")
+    if previous_history is not None and (
+        not isinstance(previous_history, dict)
+        or any(not isinstance(value, dict) for value in previous_history.values())
+    ):
+        raise StateLoadError(
+            "알림 outbox previous_alert_history는 JSON object 또는 null이어야 합니다."
+        )
     alert_markets = data.get("alert_markets", [])
     if not isinstance(alert_markets, list) or any(
         not isinstance(market, str) for market in alert_markets

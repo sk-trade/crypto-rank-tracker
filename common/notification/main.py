@@ -119,6 +119,7 @@ async def create_and_dispatch_notification(
         gcs_client,
         scan_key=scan_key,
         alert_markets=[alert.candidate.market for alert in final_alerts or []],
+        previous_history=alert_history if final_alerts else None,
     )
     if dispatch_result.sent:
         logger.info("알림 메시지를 생성하여 전송했습니다.")
@@ -158,6 +159,11 @@ def _refresh_alert_history_for_delivery(
     return history
 
 
+def _notification_delivery_id(message: str, scan_key: str | None) -> str:
+    identity = f"{scan_key or 'unscoped'}\0{message}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
 async def _queue_and_dispatch_notification(
     message: str,
     updated_history: Optional[Dict[str, AlertHistory]] = None,
@@ -165,6 +171,7 @@ async def _queue_and_dispatch_notification(
     *,
     scan_key: str | None = None,
     alert_markets: Optional[List[str]] = None,
+    previous_history: Optional[Dict[str, AlertHistory]] = None,
 ) -> DispatchResult:
     """Durably prepare a configured webhook before attempting the external side effect."""
     if not config.WEBHOOK_URL:
@@ -172,12 +179,13 @@ async def _queue_and_dispatch_notification(
     if await load_notification_outbox(gcs_client) is not None:
         raise NotificationDeliveryError("a prior webhook delivery is still pending")
 
-    delivery_id = hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+    delivery_id = _notification_delivery_id(message, scan_key)
     outbox = {
         "delivery_id": delivery_id,
         "status": "prepared",
         "message": message,
         "alert_history": _serialize_alert_history(updated_history),
+        "previous_alert_history": _serialize_alert_history(previous_history),
         "alert_markets": sorted(set(alert_markets or [])),
         "scan_key": scan_key,
     }
@@ -251,6 +259,11 @@ async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResu
         return None
     if not config.WEBHOOK_URL:
         try:
+            previous_history = outbox.get("previous_alert_history")
+            if outbox["status"] == "prepared" and previous_history is not None:
+                await save_alert_history(
+                    _deserialize_alert_history(previous_history), gcs_client
+                )
             if scan_key := outbox.get("scan_key"):
                 await complete_scan_key(scan_key, gcs_client)
             await save_notification_outbox(None, gcs_client)
