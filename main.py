@@ -36,6 +36,7 @@ from common.state_manager import (
     append_scan_events,
     append_scan_outcomes,
     claim_scan_key,
+    complete_scan_key,
     release_scan_key,
     load_alert_history,
     load_pending_scan_events,
@@ -139,11 +140,19 @@ async def run_check(execution_id: str | None = None):
         logger.info("로컬 파일 저장 모드로 실행됩니다.")
 
     claimed_scan_key = None
+    scan_persisted = False
     try:
-        recovered_delivery = await recover_pending_notification(gcs_client)
-        if recovered_delivery is not None:
-            logger.info("Recovered pending webhook delivery; deferring the new market scan.")
-            return
+        pending_delivery_error = None
+        try:
+            recovered_delivery = await recover_pending_notification(gcs_client)
+            if recovered_delivery is not None:
+                logger.info("Recovered pending webhook delivery; continuing the market scan.")
+        except NotificationDeliveryError as error:
+            pending_delivery_error = error
+            logger.error(
+                "Pending webhook recovery failed; market-state collection will continue: %s",
+                error,
+            )
         async with aiohttp.ClientSession() as session:
             # 공통 준비 단계
             scan_started_at = datetime.datetime.now(datetime.timezone.utc)
@@ -178,6 +187,8 @@ async def run_check(execution_id: str | None = None):
                     scan_key, execution_id=execution_id, gcs_client=gcs_client
                 ):
                     logger.warning("Skipping duplicate scheduled scan for %s", scan_key)
+                    if pending_delivery_error:
+                        raise pending_delivery_error
                     return
                 claimed_scan_key = scan_key
                 await append_scan_events(
@@ -193,7 +204,20 @@ async def run_check(execution_id: str | None = None):
                     ),
                     gcs_client,
                 )
-                await dispatch_data_quality_alert(data_quality_issues, gcs_client=gcs_client)
+                scan_persisted = True
+                if pending_delivery_error:
+                    await complete_scan_key(scan_key, gcs_client)
+                    raise pending_delivery_error
+                try:
+                    await dispatch_data_quality_alert(
+                        data_quality_issues,
+                        gcs_client=gcs_client,
+                        scan_key=scan_key,
+                    )
+                except NotificationDeliveryError:
+                    await complete_scan_key(scan_key, gcs_client)
+                    raise
+                await complete_scan_key(scan_key, gcs_client)
                 return
 
             pending_events = await load_pending_scan_events(gcs_client)
@@ -303,6 +327,8 @@ async def run_check(execution_id: str | None = None):
                 scan_key, execution_id=execution_id, gcs_client=gcs_client
             ):
                 logger.warning("Skipping duplicate scheduled scan for %s", scan_key)
+                if pending_delivery_error:
+                    raise pending_delivery_error
                 return
             claimed_scan_key = scan_key
 
@@ -325,12 +351,22 @@ async def run_check(execution_id: str | None = None):
 
             new_rank_state = RankState(last_updated=scan_close_at, rankings=current_rankings)
             await save_rank_state_history(new_rank_state, old_rank_states, gcs_client=gcs_client)
+            scan_persisted = True
 
-            await create_and_dispatch_notification(
-                raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
-                previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
-                final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime, gcs_client=gcs_client
-            )
+            if pending_delivery_error:
+                await complete_scan_key(scan_key, gcs_client)
+                raise pending_delivery_error
+            try:
+                await create_and_dispatch_notification(
+                    raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
+                    previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
+                    final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime,
+                    gcs_client=gcs_client, scan_key=scan_key,
+                )
+            except NotificationDeliveryError:
+                await complete_scan_key(scan_key, gcs_client)
+                raise
+            await complete_scan_key(scan_key, gcs_client)
 
             # # (주석 처리) 현재 분석 결과 로그로 저장
             # tickers_to_save = {
@@ -345,10 +381,7 @@ async def run_check(execution_id: str | None = None):
             # await save_analysis_log(new_analysis_state, gcs_client=gcs_client)
 
     except Exception as e:
-        delivery_confirmed = (
-            isinstance(e, NotificationDeliveryError) and e.delivery_confirmed
-        )
-        if claimed_scan_key and not delivery_confirmed:
+        if claimed_scan_key and not scan_persisted:
             try:
                 await release_scan_key(claimed_scan_key, gcs_client=gcs_client)
             except Exception:
@@ -370,7 +403,9 @@ def main(request):
     logger.info("업비트 순위 확인 작업 시작 (Cloud Function).")
     try:
         headers = getattr(request, "headers", {}) if request is not None else {}
-        execution_id = headers.get("X-CloudScheduler-Execution-ID")
+        execution_id = headers.get("X-CloudScheduler-Execution-ID") or headers.get(
+            "X-CloudScheduler-ScheduleTime"
+        )
         asyncio.run(run_check(execution_id=execution_id))
     except Exception as e:
         logger.critical(f"작업 실행 중 심각한 오류 발생: {e}", exc_info=True)

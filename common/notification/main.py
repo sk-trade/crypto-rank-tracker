@@ -16,14 +16,24 @@ class DispatchResult:
     reason: Optional[str] = None
     status_code: Optional[int] = None
     skipped: bool = False
+    delivery_uncertain: bool = False
+    delivery_id: Optional[str] = None
+    scan_key: Optional[str] = None
 
 
 class NotificationDeliveryError(RuntimeError):
     """A configured delivery failed or could not be finalized durably."""
 
-    def __init__(self, message: str, *, delivery_confirmed: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        delivery_confirmed: bool = False,
+        scan_handoff_durable: bool = False,
+    ):
         super().__init__(message)
         self.delivery_confirmed = delivery_confirmed
+        self.scan_handoff_durable = scan_handoff_durable
 
 import config
 from common.models import Alert, AlertHistory, TickerData
@@ -31,6 +41,7 @@ from common.notification.engine import AlertEngine
 from common.notification.formatter import NotificationFormatter
 from common.signals.detector import detect_anomalies, filter_market_wide_events
 from common.state_manager import (
+    complete_scan_key,
     load_notification_outbox,
     save_alert_history,
     save_notification_outbox,
@@ -39,10 +50,14 @@ from common.state_manager import (
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
-async def dispatch_data_quality_alert(issues: List[str], gcs_client=None) -> DispatchResult:
+async def dispatch_data_quality_alert(
+    issues: List[str], gcs_client=None, scan_key: str | None = None
+) -> DispatchResult:
     """Notify operators that market data is unusable without emitting a market briefing."""
     message = NotificationFormatter().format_data_quality_alert(issues)
-    result = await _queue_and_dispatch_notification(message, gcs_client=gcs_client)
+    result = await _queue_and_dispatch_notification(
+        message, gcs_client=gcs_client, scan_key=scan_key
+    )
     if result.sent:
         logger.warning("Data-quality incident notification sent: %s", "; ".join(issues))
     elif not result.skipped:
@@ -61,6 +76,7 @@ async def create_and_dispatch_notification(
     market_regime: Dict[str, Any],
     final_alerts: Optional[List[Alert]] = None,
     gcs_client=None,
+    scan_key: str | None = None,
 ) -> DispatchResult:
     """시장 브리핑을 생성하고, 최종 알림이 있을 경우 함께 전송합니다."""
 
@@ -98,7 +114,11 @@ async def create_and_dispatch_notification(
         }
         updated_history = _update_alert_history(copied_history, final_alerts)
     dispatch_result = await _queue_and_dispatch_notification(
-        final_message, updated_history, gcs_client
+        final_message,
+        updated_history,
+        gcs_client,
+        scan_key=scan_key,
+        alert_markets=[alert.candidate.market for alert in final_alerts or []],
     )
     if dispatch_result.sent:
         logger.info("알림 메시지를 생성하여 전송했습니다.")
@@ -120,10 +140,31 @@ def _deserialize_alert_history(payload: Dict[str, Dict[str, Any]]) -> Dict[str, 
     }
 
 
+def _refresh_alert_history_for_delivery(
+    history: Dict[str, AlertHistory], alert_markets: List[str]
+) -> Dict[str, AlertHistory]:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for market in alert_markets:
+        entry = history.get(market)
+        if entry is None:
+            continue
+        is_initial_transition = (
+            entry.last_signal_type in {"BREAKOUT_START", "BREAKDOWN_START"}
+            and entry.initial_timestamp == entry.last_alert_timestamp
+        )
+        entry.last_alert_timestamp = now
+        if is_initial_transition:
+            entry.initial_timestamp = now
+    return history
+
+
 async def _queue_and_dispatch_notification(
     message: str,
     updated_history: Optional[Dict[str, AlertHistory]] = None,
     gcs_client=None,
+    *,
+    scan_key: str | None = None,
+    alert_markets: Optional[List[str]] = None,
 ) -> DispatchResult:
     """Durably prepare a configured webhook before attempting the external side effect."""
     if not config.WEBHOOK_URL:
@@ -137,6 +178,8 @@ async def _queue_and_dispatch_notification(
         "status": "prepared",
         "message": message,
         "alert_history": _serialize_alert_history(updated_history),
+        "alert_markets": sorted(set(alert_markets or [])),
+        "scan_key": scan_key,
     }
     await save_notification_outbox(outbox, gcs_client)
     return await _deliver_prepared_notification(outbox, gcs_client)
@@ -145,28 +188,60 @@ async def _queue_and_dispatch_notification(
 async def _deliver_prepared_notification(outbox: Dict[str, Any], gcs_client=None) -> DispatchResult:
     history_payload = outbox.get("alert_history")
     if history_payload is not None:
-        await save_alert_history(_deserialize_alert_history(history_payload), gcs_client)
+        history = _refresh_alert_history_for_delivery(
+            _deserialize_alert_history(history_payload), outbox.get("alert_markets", [])
+        )
+        await save_alert_history(history, gcs_client)
 
     attempting = {**outbox, "status": "attempting"}
     await save_notification_outbox(attempting, gcs_client)
-    result = await send_notification(outbox["message"])
+    result = await send_notification(
+        outbox["message"], delivery_id=outbox["delivery_id"]
+    )
+    result.delivery_id = outbox["delivery_id"]
+    result.scan_key = outbox.get("scan_key")
     if result.sent:
+        delivered = {**outbox, "status": "delivered"}
         try:
+            await save_notification_outbox(delivered, gcs_client)
+            if scan_key := outbox.get("scan_key"):
+                await complete_scan_key(scan_key, gcs_client)
             await save_notification_outbox(None, gcs_client)
         except Exception as error:
             raise NotificationDeliveryError(
                 "webhook delivered but outbox finalization failed",
                 delivery_confirmed=True,
+                scan_handoff_durable=True,
             ) from error
         return result
 
+    if result.delivery_uncertain:
+        try:
+            if scan_key := outbox.get("scan_key"):
+                await complete_scan_key(scan_key, gcs_client)
+        except Exception as error:
+            raise NotificationDeliveryError(
+                "webhook outcome is uncertain and scan completion failed",
+                scan_handoff_durable=True,
+            ) from error
+        raise NotificationDeliveryError(
+            f"webhook outcome is uncertain: {result.reason}",
+            scan_handoff_durable=True,
+        )
+
     try:
         await save_notification_outbox({**outbox, "status": "prepared"}, gcs_client)
+        if scan_key := outbox.get("scan_key"):
+            await complete_scan_key(scan_key, gcs_client)
     except Exception as error:
         raise NotificationDeliveryError(
-            f"webhook failed and retry state could not be restored: {result.reason}"
+            f"webhook failed and retry state could not be restored: {result.reason}",
+            scan_handoff_durable=True,
         ) from error
-    raise NotificationDeliveryError(f"configured webhook delivery failed: {result.reason}")
+    raise NotificationDeliveryError(
+        f"configured webhook delivery failed: {result.reason}",
+        scan_handoff_durable=True,
+    )
 
 
 async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResult]:
@@ -175,22 +250,53 @@ async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResu
     if outbox is None:
         return None
     if not config.WEBHOOK_URL:
-        raise NotificationDeliveryError("pending webhook delivery cannot run without WEBHOOK_URL")
-    if outbox["status"] == "attempting":
-        # A lost process cannot know whether the webhook accepted the request. Treat the
-        # attempt as delivered to preserve the product's no-duplicate alert contract.
         try:
+            if scan_key := outbox.get("scan_key"):
+                await complete_scan_key(scan_key, gcs_client)
             await save_notification_outbox(None, gcs_client)
         except Exception as error:
             raise NotificationDeliveryError(
-                "uncertain webhook attempt could not be finalized",
-                delivery_confirmed=True,
+                "pending webhook cancellation could not be persisted",
+                scan_handoff_durable=True,
             ) from error
-        logger.error(
-            "Cleared uncertain webhook attempt %s without resending to avoid duplicate alerts.",
-            outbox["delivery_id"],
+        return DispatchResult(
+            sent=False,
+            reason="pending webhook delivery canceled because WEBHOOK_URL is not configured",
+            skipped=True,
+            delivery_id=outbox["delivery_id"],
+            scan_key=outbox.get("scan_key"),
         )
-        return DispatchResult(sent=True, reason="uncertain prior attempt treated as delivered")
+    if outbox["status"] == "attempting":
+        try:
+            if scan_key := outbox.get("scan_key"):
+                await complete_scan_key(scan_key, gcs_client)
+        except Exception as error:
+            raise NotificationDeliveryError(
+                "uncertain webhook attempt could not complete its scan claim",
+                scan_handoff_durable=True,
+            ) from error
+        raise NotificationDeliveryError(
+            "webhook attempt outcome is uncertain; inspect the receiver using delivery_id "
+            f"{outbox['delivery_id']} before resetting or clearing the outbox",
+            scan_handoff_durable=True,
+        )
+    if outbox["status"] == "delivered":
+        try:
+            if scan_key := outbox.get("scan_key"):
+                await complete_scan_key(scan_key, gcs_client)
+            await save_notification_outbox(None, gcs_client)
+        except Exception as error:
+            raise NotificationDeliveryError(
+                "confirmed webhook delivery could not be finalized",
+                delivery_confirmed=True,
+                scan_handoff_durable=True,
+            ) from error
+        return DispatchResult(
+            sent=True,
+            reason="confirmed prior delivery finalized",
+            delivery_id=outbox["delivery_id"],
+            scan_key=outbox.get("scan_key"),
+        )
     return await _deliver_prepared_notification(outbox, gcs_client)
 
 
@@ -228,7 +334,9 @@ def _update_alert_history(
     return history
 
 
-async def send_notification(message: str) -> DispatchResult:
+async def send_notification(
+    message: str, delivery_id: str | None = None
+) -> DispatchResult:
     """웹훅을 통해 메시지를 보냅니다. 전송 결과를 반환합니다."""
     if not config.WEBHOOK_URL:
         logger.warning("웹훅 URL이 설정되지 않았습니다. 알림을 보내지 않습니다.")
@@ -237,23 +345,39 @@ async def send_notification(message: str) -> DispatchResult:
         )
 
     payload: Dict[str, Any] = {"text": message}
+    headers = {"X-Webhook-Delivery-ID": delivery_id} if delivery_id else None
     if message.strip().startswith("@channel"):
         payload["link_names"] = True
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                config.WEBHOOK_URL, json=payload, timeout=10
+                config.WEBHOOK_URL, json=payload, headers=headers, timeout=10
             ) as response:
                 if response.ok:
                     logger.info("웹훅 알림 전송 성공.")
-                    return DispatchResult(sent=True)
+                    return DispatchResult(sent=True, delivery_id=delivery_id)
                 else:
                     error_text = await response.text()
                     logger.error(
                         f"웹훅 전송 실패 ({response.status}): {error_text}"
                     )
-                    return DispatchResult(sent=False, reason=f"HTTP {response.status}", status_code=response.status)
+                    return DispatchResult(
+                        sent=False,
+                        reason=f"HTTP {response.status}",
+                        status_code=response.status,
+                        delivery_id=delivery_id,
+                    )
+    except (aiohttp.ClientConnectorError, aiohttp.InvalidURL) as e:
+        logger.error(f"웹훅 연결 실패: {e}", exc_info=True)
+        return DispatchResult(
+            sent=False, reason=str(e), delivery_id=delivery_id
+        )
     except Exception as e:
         logger.error(f"웹훅 전송 중 예외 발생: {e}", exc_info=True)
-        return DispatchResult(sent=False, reason=str(e))
+        return DispatchResult(
+            sent=False,
+            reason=str(e),
+            delivery_uncertain=True,
+            delivery_id=delivery_id,
+        )

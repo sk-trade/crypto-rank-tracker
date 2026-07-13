@@ -83,7 +83,7 @@ GitHub Actions is used for deployment flow control:
 - The Gen2 function is deployed with 512 MB memory, a 540-second service timeout, one maximum instance,
   and one request per instance. Scheduler updates are idempotent, use the function URL
   as their OIDC audience, and retry failed executions three times with bounded backoff.
-- Configured webhook deliveries use durable outbox state. Missing `WEBHOOK_URL` remains a successful dry-run skip; configured HTTP/network failures surface as failed executions for Scheduler retry.
+- Configured webhook deliveries use durable outbox state and expose a stable `X-Webhook-Delivery-ID` header for receiver-side reconciliation. Definitive HTTP/connect failures remain retryable, while an in-flight attempt with an unknown outcome is held for operator review instead of being silently cleared or resent. Market scans continue while an older delivery is pending, and removing `WEBHOOK_URL` cancels that pending delivery as a successful dry-run transition.
 
 ## Operational notes
 

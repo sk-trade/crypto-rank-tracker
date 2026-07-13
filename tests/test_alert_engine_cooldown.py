@@ -148,6 +148,44 @@ def test_configured_webhook_failure_is_queued_and_retried(monkeypatch, tmp_path)
     assert result.sent is True
     assert asyncio.run(state_manager.load_notification_outbox()) is None
     assert send.await_count == 2
+    assert all(
+        call.kwargs["delivery_id"] == pending["delivery_id"]
+        for call in send.await_args_list
+    )
+
+
+def test_webhook_request_exposes_the_delivery_id_header(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    request = {}
+
+    class Response:
+        ok = True
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def post(self, url, **kwargs):
+            request.update({"url": url, **kwargs})
+            return Response()
+
+    monkeypatch.setattr(notification.aiohttp, "ClientSession", Session)
+
+    result = asyncio.run(
+        notification.send_notification("briefing", delivery_id="delivery-1")
+    )
+
+    assert result.sent is True
+    assert request["headers"] == {"X-Webhook-Delivery-ID": "delivery-1"}
 
 
 def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
@@ -175,7 +213,7 @@ def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
 
     send = AsyncMock(return_value=notification.DispatchResult(True))
 
-    async def ordered_send(_message):
+    async def ordered_send(_message, **_kwargs):
         operation_order.append("send")
         return await send(_message)
 
@@ -188,7 +226,7 @@ def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
         asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
 
     assert error.value.delivery_confirmed is True
-    assert outbox["status"] == "attempting"
+    assert outbox["status"] == "delivered"
     assert operation_order == ["history", "send"]
 
     fail_clear = False
@@ -199,6 +237,128 @@ def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
     assert result.sent is True
     assert outbox is None
     resend.assert_not_awaited()
+
+
+def test_uncertain_attempt_is_preserved_for_operator_resolution(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    outbox = {
+        "delivery_id": "delivery-1",
+        "status": "attempting",
+        "message": "briefing",
+        "alert_history": None,
+    }
+
+    async def load_outbox(_gcs_client=None):
+        return outbox
+
+    save_outbox = AsyncMock()
+    send = AsyncMock()
+    monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
+    monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    with pytest.raises(notification.NotificationDeliveryError, match="outcome is uncertain"):
+        asyncio.run(notification.recover_pending_notification())
+
+    save_outbox.assert_not_awaited()
+    send.assert_not_awaited()
+
+
+def test_ambiguous_network_failure_keeps_attempting_outbox(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        notification.NotificationFormatter,
+        "format_daily_briefing",
+        lambda self, **kwargs: "briefing",
+    )
+    outbox = None
+
+    async def load_outbox(_gcs_client=None):
+        return outbox
+
+    async def save_outbox(value, _gcs_client=None):
+        nonlocal outbox
+        outbox = value
+
+    send = AsyncMock(
+        return_value=notification.DispatchResult(
+            False, "response lost", delivery_uncertain=True
+        )
+    )
+    monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
+    monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
+    monkeypatch.setattr(notification, "save_alert_history", AsyncMock())
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    with pytest.raises(notification.NotificationDeliveryError, match="outcome is uncertain"):
+        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+
+    assert outbox["status"] == "attempting"
+    assert send.await_count == 1
+
+    with pytest.raises(notification.NotificationDeliveryError, match="outcome is uncertain"):
+        asyncio.run(notification.recover_pending_notification())
+    assert send.await_count == 1
+
+
+def test_missing_webhook_cancels_a_pending_delivery(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", None)
+    outbox = {
+        "delivery_id": "delivery-1",
+        "status": "prepared",
+        "message": "briefing",
+        "alert_history": None,
+    }
+
+    async def load_outbox(_gcs_client=None):
+        return outbox
+
+    save_outbox = AsyncMock()
+    monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
+    monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
+
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.skipped is True
+    save_outbox.assert_awaited_once_with(None, None)
+
+
+def test_delayed_delivery_refreshes_the_alert_cooldown_timestamp(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    old_timestamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=25)
+    history = _history("BREAKOUT_START", 101.0, old_timestamp, minutes_ago=0)
+    history.last_alert_timestamp = old_timestamp
+    history.initial_timestamp = old_timestamp
+    outbox = {
+        "delivery_id": "delivery-1",
+        "status": "prepared",
+        "message": "briefing",
+        "alert_history": {"KRW-BTC": history.model_dump(mode="json")},
+        "alert_markets": ["KRW-BTC"],
+    }
+    saved_history = None
+
+    async def load_outbox(_gcs_client=None):
+        return outbox
+
+    async def save_history(value, _gcs_client=None):
+        nonlocal saved_history
+        saved_history = value
+
+    monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
+    monkeypatch.setattr(notification, "save_notification_outbox", AsyncMock())
+    monkeypatch.setattr(notification, "save_alert_history", save_history)
+    monkeypatch.setattr(
+        notification,
+        "send_notification",
+        AsyncMock(return_value=notification.DispatchResult(True)),
+    )
+
+    asyncio.run(notification.recover_pending_notification())
+
+    refreshed = saved_history["KRW-BTC"]
+    assert refreshed.last_alert_timestamp > old_timestamp + datetime.timedelta(hours=24)
+    assert refreshed.initial_timestamp == refreshed.last_alert_timestamp
 
 
 def test_missing_webhook_skips_without_outbox_or_history_mutation(monkeypatch):

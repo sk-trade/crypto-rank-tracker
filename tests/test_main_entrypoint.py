@@ -10,6 +10,7 @@ from common.models import CandleData
 @pytest.fixture(autouse=True)
 def no_pending_notification(monkeypatch):
     monkeypatch.setattr(app, "recover_pending_notification", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "complete_scan_key", AsyncMock())
 
 
 def test_cloud_function_entrypoint_returns_ok_when_run_check_succeeds(monkeypatch):
@@ -159,7 +160,9 @@ def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypat
     monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
     monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
     monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
-    monkeypatch.setattr(app, "get_all_krw_tickers", AsyncMock(return_value=raw_tickers))
+    market_fetch = AsyncMock(return_value=raw_tickers)
+    monkeypatch.setattr(app, "get_all_krw_tickers", market_fetch)
+    monkeypatch.setattr(app, "recover_pending_notification", AsyncMock(return_value=object()))
     monkeypatch.setattr(
         app,
         "get_candles",
@@ -179,6 +182,7 @@ def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypat
     asyncio.run(app.run_check())
 
     persisted_events = append_events.await_args.args[0]
+    market_fetch.assert_awaited_once()
     assert {event.market for event in persisted_events} == {"KRW-BTC", "KRW-ETH"}
     assert all(event.final_decision == "rejected_lightweight" for event in persisted_events)
 
@@ -231,7 +235,8 @@ def test_run_check_releases_claim_when_configured_webhook_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
         asyncio.run(app.run_check())
 
-    release.assert_awaited_once()
+    app.complete_scan_key.assert_awaited_once()
+    release.assert_not_awaited()
 
 
 def test_run_check_retains_claim_after_confirmed_delivery_finalization_failure(monkeypatch):
@@ -245,4 +250,43 @@ def test_run_check_retains_claim_after_confirmed_delivery_finalization_failure(m
     with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
         asyncio.run(app.run_check())
 
+    app.complete_scan_key.assert_awaited_once()
     release.assert_not_awaited()
+
+
+def test_pending_webhook_failure_does_not_block_market_state_collection(monkeypatch):
+    release = _configure_valid_scan_with_notification_error(
+        monkeypatch,
+        AssertionError("new notification must not replace a pending outbox"),
+    )
+    pending_error = app.NotificationDeliveryError(
+        "configured webhook delivery failed: HTTP 500",
+        scan_handoff_durable=True,
+    )
+    monkeypatch.setattr(
+        app, "recover_pending_notification", AsyncMock(side_effect=pending_error)
+    )
+    notify = AsyncMock()
+    monkeypatch.setattr(app, "create_and_dispatch_notification", notify)
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check(execution_id="run-a"))
+
+    app.get_all_krw_tickers.assert_awaited_once()
+    app.save_rank_state_history.assert_awaited_once()
+    app.complete_scan_key.assert_awaited_once()
+    notify.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+def test_cloud_function_uses_scheduler_schedule_time_as_retry_identity(monkeypatch):
+    run_check = AsyncMock()
+    monkeypatch.setattr(app, "run_check", run_check)
+
+    class Request:
+        headers = {"X-CloudScheduler-ScheduleTime": "2026-07-13T15:00:00Z"}
+
+    assert app.main(Request()) == ("OK", 200)
+    run_check.assert_awaited_once_with(execution_id="2026-07-13T15:00:00Z")

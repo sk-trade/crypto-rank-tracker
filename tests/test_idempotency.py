@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 
 import pytest
@@ -44,6 +45,60 @@ def test_local_scan_claim_can_be_released_for_retry(monkeypatch, tmp_path):
     asyncio.run(state_manager.release_scan_key(scan_key))
 
     assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-b")) is True
+
+
+def test_same_scheduler_execution_reclaims_an_in_progress_scan(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
+
+    assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is True
+    assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is True
+
+    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    assert state["claims"][0]["status"] == "in_progress"
+
+
+def test_completed_scan_key_cannot_be_reclaimed(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
+
+    assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is True
+    asyncio.run(state_manager.complete_scan_key(scan_key))
+
+    assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is False
+    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    assert state["claims"][0]["status"] == "completed"
+
+
+def test_stale_in_progress_scan_can_be_reclaimed(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
+    stale_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        seconds=state_manager.SCAN_CLAIM_LEASE_SECONDS + 1
+    )
+    (tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).write_text(
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "scan_key": scan_key,
+                        "execution_id": "old-run",
+                        "claimed_at": stale_time.isoformat(),
+                        "status": "in_progress",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(state_manager.claim_scan_key(scan_key, "new-run")) is True
+    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    assert state["claims"][0]["execution_id"] == "new-run"
+    assert state["claims"][0]["status"] == "in_progress"
 
 
 def test_gcs_claim_reads_the_same_generation_it_conditionally_updates(monkeypatch):

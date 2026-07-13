@@ -14,6 +14,7 @@ from common.storage_client import StateBackendUnavailable, StateLoadError, load_
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 IDEMPOTENCY_STATE_FILE_NAME = "processed_scan_keys.json"
 NOTIFICATION_OUTBOX_FILE_NAME = "notification_outbox.json"
+SCAN_CLAIM_LEASE_SECONDS = 600
 
 
 # --- 순위 상태 관리 ---
@@ -102,12 +103,22 @@ async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
 
 
 async def claim_scan_key(scan_key: str, execution_id: str | None = None, gcs_client=None) -> bool:
-    """Atomically claim a completed-candle scan key before any side effects occur."""
+    """Atomically acquire or resume an in-progress completed-candle scan."""
     if config.STATE_STORAGE_METHOD == "GCS":
         if gcs_client is None:
             raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
         return await _claim_scan_key_in_gcs(scan_key, execution_id, gcs_client)
     return await asyncio.to_thread(_claim_scan_key_locally, scan_key, execution_id)
+
+
+async def complete_scan_key(scan_key: str, gcs_client=None) -> None:
+    """Mark a claimed scan complete after its durable state or outbox handoff exists."""
+    if config.STATE_STORAGE_METHOD == "GCS":
+        if gcs_client is None:
+            raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
+        await _complete_scan_key_in_gcs(scan_key, gcs_client)
+        return
+    await asyncio.to_thread(_complete_scan_key_locally, scan_key)
 
 
 async def release_scan_key(scan_key: str, gcs_client=None) -> None:
@@ -118,6 +129,56 @@ async def release_scan_key(scan_key: str, gcs_client=None) -> None:
         await _release_scan_key_in_gcs(scan_key, gcs_client)
         return
     await asyncio.to_thread(_release_scan_key_locally, scan_key)
+
+
+def _claim_status(claim: Dict[str, Any]) -> str:
+    # Legacy claim records were permanent completion markers.
+    return claim.get("status", "completed")
+
+
+def _claim_can_resume(
+    claim: Dict[str, Any], execution_id: str | None, now: datetime.datetime
+) -> bool:
+    if _claim_status(claim) != "in_progress":
+        return False
+    if execution_id and claim.get("execution_id") == execution_id:
+        return True
+    try:
+        claimed_at = datetime.datetime.fromisoformat(claim["claimed_at"])
+        if claimed_at.tzinfo is None:
+            claimed_at = claimed_at.replace(tzinfo=datetime.timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return True
+    return (now - claimed_at.astimezone(datetime.timezone.utc)).total_seconds() > SCAN_CLAIM_LEASE_SECONDS
+
+
+def _acquire_claim(
+    claims: List[Dict[str, Any]], scan_key: str, execution_id: str | None
+) -> tuple[bool, List[Dict[str, Any]]]:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for claim in claims:
+        if claim.get("scan_key") != scan_key:
+            continue
+        if not _claim_can_resume(claim, execution_id, now):
+            return False, claims
+        claim.update(
+            {
+                "execution_id": execution_id,
+                "claimed_at": now.isoformat(),
+                "status": "in_progress",
+            }
+        )
+        claim.pop("completed_at", None)
+        return True, claims
+    claims.append(
+        {
+            "scan_key": scan_key,
+            "execution_id": execution_id,
+            "claimed_at": now.isoformat(),
+            "status": "in_progress",
+        }
+    )
+    return True, claims
 
 
 def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
@@ -133,15 +194,9 @@ def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
             except FileNotFoundError:
                 state = {"claims": []}
             claims = state.get("claims", []) if isinstance(state, dict) else []
-            if any(claim.get("scan_key") == scan_key for claim in claims):
+            acquired, claims = _acquire_claim(claims, scan_key, execution_id)
+            if not acquired:
                 return False
-            claims.append(
-                {
-                    "scan_key": scan_key,
-                    "execution_id": execution_id,
-                    "claimed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                }
-            )
             state = {"claims": claims[-config.IDEMPOTENCY_KEY_HISTORY_LIMIT :]}
             temporary_path = f"{state_path}.tmp"
             with open(temporary_path, "w", encoding="utf-8") as state_file:
@@ -150,6 +205,40 @@ def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
                 os.fsync(state_file.fileno())
             os.replace(temporary_path, state_path)
             return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _complete_scan_key_locally(scan_key: str) -> None:
+    os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
+    lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
+    state_path = os.path.join(config.LOCAL_STATE_DIR, IDEMPOTENCY_STATE_FILE_NAME)
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                with open(state_path, encoding="utf-8") as state_file:
+                    state = json.load(state_file)
+            except FileNotFoundError:
+                return
+            claims = state.get("claims", []) if isinstance(state, dict) else []
+            changed = False
+            for claim in claims:
+                if claim.get("scan_key") == scan_key:
+                    claim["status"] = "completed"
+                    claim["completed_at"] = datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat()
+                    changed = True
+                    break
+            if not changed:
+                return
+            temporary_path = f"{state_path}.tmp"
+            with open(temporary_path, "w", encoding="utf-8") as state_file:
+                json.dump({"claims": claims}, state_file, ensure_ascii=False)
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.replace(temporary_path, state_path)
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -202,15 +291,9 @@ async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_cl
             state = {"claims": []}
             generation = 0
         claims = state.get("claims", []) if isinstance(state, dict) else []
-        if any(claim.get("scan_key") == scan_key for claim in claims):
+        acquired, claims = _acquire_claim(claims, scan_key, execution_id)
+        if not acquired:
             return False
-        claims.append(
-            {
-                "scan_key": scan_key,
-                "execution_id": execution_id,
-                "claimed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            }
-        )
         try:
             await asyncio.to_thread(
                 blob.upload_from_string,
@@ -222,6 +305,50 @@ async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_cl
         except PreconditionFailed:
             continue
     raise RuntimeError("Could not atomically claim scan key after concurrent updates")
+
+
+async def _complete_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
+    try:
+        from google.api_core.exceptions import PreconditionFailed
+    except ImportError as error:
+        raise RuntimeError("google-cloud-storage is required for GCS idempotency") from error
+
+    blob = gcs_client.bucket(config.GCS_BUCKET_NAME).blob(IDEMPOTENCY_STATE_FILE_NAME)
+    for _ in range(5):
+        if not await asyncio.to_thread(blob.exists):
+            return
+        await asyncio.to_thread(blob.reload)
+        generation = int(blob.generation)
+        try:
+            raw_state = await asyncio.to_thread(
+                blob.download_as_text, if_generation_match=generation
+            )
+        except PreconditionFailed:
+            continue
+        state = json.loads(raw_state)
+        claims = state.get("claims", []) if isinstance(state, dict) else []
+        changed = False
+        for claim in claims:
+            if claim.get("scan_key") == scan_key:
+                claim["status"] = "completed"
+                claim["completed_at"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat()
+                changed = True
+                break
+        if not changed:
+            return
+        try:
+            await asyncio.to_thread(
+                blob.upload_from_string,
+                json.dumps({"claims": claims}, ensure_ascii=False),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            return
+        except PreconditionFailed:
+            continue
+    raise RuntimeError("Could not atomically complete scan key after concurrent updates")
 
 
 async def _release_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
@@ -323,8 +450,10 @@ def _validate_notification_outbox(data: Any) -> Dict[str, Any]:
         raise StateLoadError(
             f"알림 outbox 형식 오류 ({NOTIFICATION_OUTBOX_FILE_NAME}): JSON object가 필요합니다."
         )
-    if data.get("status") not in {"prepared", "attempting"}:
-        raise StateLoadError("알림 outbox status는 prepared 또는 attempting이어야 합니다.")
+    if data.get("status") not in {"prepared", "attempting", "delivered"}:
+        raise StateLoadError(
+            "알림 outbox status는 prepared, attempting 또는 delivered여야 합니다."
+        )
     if not isinstance(data.get("delivery_id"), str) or not isinstance(data.get("message"), str):
         raise StateLoadError("알림 outbox delivery_id와 message는 문자열이어야 합니다.")
     history = data.get("alert_history")
@@ -333,6 +462,14 @@ def _validate_notification_outbox(data: Any) -> Dict[str, Any]:
         or any(not isinstance(value, dict) for value in history.values())
     ):
         raise StateLoadError("알림 outbox alert_history는 JSON object 또는 null이어야 합니다.")
+    alert_markets = data.get("alert_markets", [])
+    if not isinstance(alert_markets, list) or any(
+        not isinstance(market, str) for market in alert_markets
+    ):
+        raise StateLoadError("알림 outbox alert_markets는 문자열 배열이어야 합니다.")
+    scan_key = data.get("scan_key")
+    if scan_key is not None and not isinstance(scan_key, str):
+        raise StateLoadError("알림 outbox scan_key는 문자열 또는 null이어야 합니다.")
     return data
 
 
