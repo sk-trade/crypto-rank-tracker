@@ -41,6 +41,15 @@ jobs:
     - name: Install dependencies
       run: uv sync --frozen
 
+    - name: Validate durable state configuration
+      env:
+        GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
+      run: |
+        if [ -z "$GCS_BUCKET_NAME" ]; then
+          echo "::error::GCS_BUCKET_NAME repository variable is required for durable production state."
+          exit 1
+        fi
+
     # Google Cloud에 인증 (GCS에 업로드하기 위해 필요)
     - name: Authenticate to Google Cloud
       uses: 'google-github-actions/auth@v2'
@@ -57,5 +66,5 @@ jobs:
         # GCS 업로드를 위해 GCP 관련 환경 변수도 전달
         GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }} # 프로젝트 ID가 필요하다면
         GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
-        STATE_STORAGE_METHOD: ${{ vars.STATE_STORAGE_METHOD || 'LOCAL' }}
+        STATE_STORAGE_METHOD: GCS
         CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES }}

@@ -3,8 +3,7 @@ name: Deploy to Google Cloud Functions
 on:
   push:
     branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  pull_request: {}
   workflow_dispatch:
 
 jobs:
@@ -89,6 +88,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Validate durable state configuration
+        env:
+          GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
+        run: |
+          if [ -z "$GCS_BUCKET_NAME" ]; then
+            echo "::error::GCS_BUCKET_NAME repository variable is required for durable production state."
+            exit 1
+          fi
+
       # uv에서 requirements.txt 생성 (GCF 배포용)
       - name: Generate requirements.txt
         run: |
@@ -119,7 +127,7 @@ jobs:
           max_instance_count: 1
           max_instance_request_concurrency: 1
           environment_variables: |          # 환경 변수 설정
-            STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD || 'LOCAL' }}
+            STATE_STORAGE_METHOD=GCS
             GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
             WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
 

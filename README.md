@@ -29,6 +29,10 @@ Run the same checks used for local validation:
 uv run python -m pytest
 uv run python -m compileall main.py config.py update_sectors.py common tests
 uv build
+WHEEL_PATH="$(realpath dist/*.whl)"
+TEMP_DIR="$(mktemp -d)"
+(cd "$TEMP_DIR" && uv run --isolated --with "$WHEEL_PATH" python -c \
+  "import main, update_sectors, config, common.upbit_client, common.notification.main")
 ```
 
 ## Local execution
@@ -58,7 +62,7 @@ Both commands can trigger live network traffic and service side effects. They ma
 
 GitHub Actions is used for deployment flow control:
 
-- Pull requests run verification only.
+- Pull requests to any target branch run verification only.
 - Pushes to `main` and manual `workflow_dispatch` runs from `main` deploy after verification.
 - The deployment target is Cloud Function `crypto-rank-tracker` in `asia-northeast1`.
 - Cloud Scheduler runs every 10 minutes.
@@ -68,9 +72,11 @@ GitHub Actions is used for deployment flow control:
   account accesses application resources, and the Scheduler account invokes the function.
 - Configure the `GCP_WIF_PROVIDER` secret for Workload Identity Federation, plus the
   `WEBHOOK_URL` secret when live notifications are required.
-- Configure repository variables `STATE_STORAGE_METHOD` (optional, defaults to `LOCAL`),
-  `GCS_BUCKET_NAME` (required for `GCS`), and `CG_SYMBOL_OVERRIDES` when symbol collisions
-  need explicit CoinGecko identities. The sector workflow also requires the `CG_API_KEY` secret.
+- Production workflows pin `STATE_STORAGE_METHOD=GCS` so the scheduled function and sector
+  updater share durable state. Configure the required `GCS_BUCKET_NAME` repository variable;
+  deployment and sector refresh fail before authentication when it is missing.
+- Configure `CG_SYMBOL_OVERRIDES` when symbol collisions need explicit CoinGecko identities.
+  The sector workflow also requires the `CG_API_KEY` secret.
 - Grant the deployer permission to deploy Cloud Functions, act as the runtime service account,
   update the Cloud Run invoker policy, and manage the Scheduler job. The workflow grants the
   Scheduler service account `roles/run.invoker` on the deployed Gen2 service.

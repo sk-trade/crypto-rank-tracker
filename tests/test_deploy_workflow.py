@@ -12,6 +12,16 @@ def test_gen2_deployment_uses_explicit_limits_and_separate_service_accounts():
     assert "max_instance_request_concurrency: 1" in workflow
 
 
+def test_all_pull_requests_verify_but_only_main_can_deploy():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+
+    assert "pull_request: {}" in workflow
+    assert 'branches: ["main"]' in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "needs: verify" in workflow
+    assert "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'" in workflow
+
+
 def test_scheduler_update_does_not_delete_the_existing_job():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
@@ -49,13 +59,17 @@ def test_deploy_verification_imports_every_required_module_from_the_wheel():
     assert "import main, update_sectors, config, common.upbit_client, common.notification.main" in workflow
 
 
-def test_workflows_preserve_local_storage_default_when_variable_is_omitted():
+def test_production_workflows_require_shared_gcs_state():
     deploy = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
     sectors = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
 
-    expected = "vars.STATE_STORAGE_METHOD || 'LOCAL'"
-    assert expected in deploy
-    assert expected in sectors
+    assert "STATE_STORAGE_METHOD=GCS" in deploy
+    assert "STATE_STORAGE_METHOD: GCS" in sectors
+    assert "vars.STATE_STORAGE_METHOD" not in deploy
+    assert "vars.STATE_STORAGE_METHOD" not in sectors
+    expected_error = "GCS_BUCKET_NAME repository variable is required for durable production state."
+    assert expected_error in deploy
+    assert expected_error in sectors
 
 
 def test_sector_updater_restricts_manual_production_writes_to_main():
