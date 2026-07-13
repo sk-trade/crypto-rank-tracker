@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 
 import pytest
 
@@ -33,3 +34,25 @@ def test_rank_state_corruption_is_explicit_not_empty_history(monkeypatch, tmp_pa
 
     with pytest.raises(StateLoadError):
         asyncio.run(load_rank_state_history())
+
+
+@pytest.mark.parametrize("payload", [{}, False, 0, ""])
+def test_rank_state_wrong_shape_is_explicit_not_empty_history(
+    monkeypatch, tmp_path, payload
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    (tmp_path / config.RANK_STATE_FILE_NAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    with pytest.raises(StateLoadError):
+        asyncio.run(load_rank_state_history())
+
+
+def test_empty_rank_state_history_remains_valid(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    (tmp_path / config.RANK_STATE_FILE_NAME).write_text("[]", encoding="utf-8")
+
+    assert asyncio.run(load_rank_state_history()) == []

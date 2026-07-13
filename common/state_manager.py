@@ -7,6 +7,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from pydantic import ValidationError
+
 import config
 from common.models import AlertHistory, AnalysisState, RankState, ScanEvent, ScanOutcome
 from common.storage_client import StateBackendUnavailable, StateLoadError, load_json, save_json
@@ -26,15 +28,22 @@ async def load_rank_state_history(gcs_client=None) -> List[RankState]:
     filename = config.RANK_STATE_FILE_NAME
     data = await load_json(filename, gcs_client)
 
-    if not data:
+    if data is None:
         logger.info(f"순위 상태 파일({filename})이 없어 초기 상태로 시작합니다.")
         return []
 
     # 과거 호환성을 위해 단일 객체로 저장된 경우 리스트로 변환
     if isinstance(data, dict):
         data = [data]
+    elif not isinstance(data, list):
+        raise StateLoadError(
+            f"순위 상태 형식 오류 ({filename}): JSON array 또는 legacy object가 필요합니다."
+        )
 
-    return [RankState.model_validate(s) for s in data]
+    try:
+        return [RankState.model_validate(s) for s in data]
+    except ValidationError as error:
+        raise StateLoadError(f"순위 상태 내용 오류 ({filename})") from error
 
 
 async def save_rank_state_history(
