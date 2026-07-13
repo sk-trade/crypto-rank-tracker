@@ -367,6 +367,13 @@ async def _enqueue_deferred_notification(
             queued=True,
         )
     if outbox["kind"] == "briefing":
+        removed_briefings = [
+            item for item in backlog if item.get("kind") == "briefing"
+        ]
+        for scan_key in {
+            item.get("scan_key") for item in removed_briefings if item.get("scan_key")
+        }:
+            await complete_scan_key(scan_key, gcs_client)
         backlog = [item for item in backlog if item.get("kind") != "briefing"]
     if len(backlog) >= MAX_NOTIFICATION_BACKLOG:
         raise NotificationDeliveryError(
@@ -376,9 +383,11 @@ async def _enqueue_deferred_notification(
     await save_notification_backlog(backlog, gcs_client)
     try:
         await _persist_outbox_alert_history(outbox, gcs_client)
+        if scan_key := outbox.get("scan_key"):
+            await complete_scan_key(scan_key, gcs_client)
     except Exception as error:
         raise NotificationDeliveryError(
-            "notification was queued but alert history could not be persisted",
+            "notification was queued but its durable scan handoff could not be finalized",
             scan_handoff_durable=True,
         ) from error
     return DispatchResult(
@@ -416,6 +425,24 @@ async def _queue_and_dispatch_notification(
     }
     active = await load_notification_outbox(gcs_client)
     backlog = await load_notification_backlog(gcs_client)
+    if scan_key:
+        existing = next(
+            (
+                pending
+                for pending in [*([active] if active else []), *backlog]
+                if pending.get("scan_key") == scan_key
+            ),
+            None,
+        )
+        if existing is not None:
+            await complete_scan_key(scan_key, gcs_client)
+            return DispatchResult(
+                sent=False,
+                reason="notification already durably owns this scan",
+                delivery_id=existing["delivery_id"],
+                scan_key=scan_key,
+                queued=True,
+            )
     if active is not None:
         if active["delivery_id"] == delivery_id:
             return DispatchResult(
@@ -513,6 +540,20 @@ async def _promote_next_notification(
     return next_outbox
 
 
+async def _complete_pending_notification_scans(
+    outbox: Optional[Dict[str, Any]],
+    backlog: List[Dict[str, Any]],
+    gcs_client=None,
+) -> None:
+    scan_keys = {
+        item.get("scan_key")
+        for item in [*(backlog or []), *([outbox] if outbox else [])]
+        if item.get("scan_key")
+    }
+    for scan_key in scan_keys:
+        await complete_scan_key(scan_key, gcs_client)
+
+
 async def _cancel_pending_notifications(
     outbox: Optional[Dict[str, Any]],
     backlog: List[Dict[str, Any]],
@@ -525,13 +566,7 @@ async def _cancel_pending_notifications(
         await _rollback_outbox_alert_history(deferred, gcs_client)
     if outbox is not None and outbox["status"] == "prepared":
         await _rollback_outbox_alert_history(outbox, gcs_client)
-    scan_keys = {
-        item.get("scan_key")
-        for item in [*(backlog or []), *([outbox] if outbox else [])]
-        if item.get("scan_key")
-    }
-    for scan_key in scan_keys:
-        await complete_scan_key(scan_key, gcs_client)
+    await _complete_pending_notification_scans(outbox, backlog, gcs_client)
     await save_notification_backlog([], gcs_client)
     if not preserve_ambiguous_attempt:
         await save_notification_outbox(None, gcs_client)
@@ -544,6 +579,13 @@ async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResu
     backlog = await load_notification_backlog(gcs_client)
     if outbox is None and not backlog:
         return None
+    try:
+        await _complete_pending_notification_scans(outbox, backlog, gcs_client)
+    except Exception as error:
+        raise NotificationDeliveryError(
+            "pending notification scan handoff could not be finalized",
+            scan_handoff_durable=True,
+        ) from error
     if not config.WEBHOOK_URL:
         try:
             preserved_ambiguous_attempt = await _cancel_pending_notifications(

@@ -497,6 +497,68 @@ def test_new_alert_is_queued_behind_an_unresolved_outbox(monkeypatch, tmp_path):
     send.assert_not_awaited()
 
 
+def test_retry_reuses_a_durable_notification_for_the_same_scan_across_kinds(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    active = _notification_record(
+        "active-delivery", "scan-active", status="attempting"
+    )
+    existing = _notification_record(
+        "existing-alert", "scan-shared", kind="alert"
+    )
+    assert asyncio.run(
+        state_manager.claim_scan_key("scan-shared", execution_id="run-a")
+    )
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([existing]))
+
+    result = asyncio.run(
+        notification._queue_and_dispatch_notification(
+            "recomputed briefing",
+            scan_key="scan-shared",
+            notification_kind="briefing",
+        )
+    )
+
+    assert result.queued is True
+    assert result.delivery_id == "existing-alert"
+    assert asyncio.run(state_manager.load_notification_backlog()) == [existing]
+    assert not asyncio.run(
+        state_manager.claim_scan_key("scan-shared", execution_id="run-a")
+    )
+
+
+def test_recovery_finalizes_deferred_scan_claims_before_the_scan_can_recompute(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    active = _notification_record(
+        "active-delivery", "scan-active", status="attempting"
+    )
+    deferred = _notification_record(
+        "deferred-delivery", "scan-deferred", kind="alert"
+    )
+    assert asyncio.run(
+        state_manager.claim_scan_key("scan-deferred", execution_id="run-a")
+    )
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([deferred]))
+
+    with pytest.raises(
+        notification.NotificationDeliveryError, match="outcome is uncertain"
+    ):
+        asyncio.run(notification.recover_pending_notification())
+
+    assert not asyncio.run(
+        state_manager.claim_scan_key("scan-deferred", execution_id="run-a")
+    )
+
+
 def test_repeated_briefings_coalesce_to_the_latest_deferred_scan(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
