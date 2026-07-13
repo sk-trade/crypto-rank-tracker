@@ -176,9 +176,28 @@ def validate_sector_map_change(previous: Dict, proposed: Dict) -> None:
         raise RuntimeError(f"Sector map change ratio {ratio:.1%} exceeds the {MAX_SECTOR_MAP_CHANGE_RATIO:.0%} safety limit.")
 
 
+def validate_sector_map_bootstrap(previous: Dict, proposed: Dict) -> None:
+    """Require at least one usable category before publishing the first canonical map."""
+    if previous:
+        return
+    usable_markets = [
+        market
+        for market, tags in proposed.items()
+        if isinstance(tags, list)
+        and tags
+        and "Untagged" not in tags
+        and not TRANSIENT_SECTOR_TAGS.intersection(tags)
+    ]
+    if not usable_markets:
+        raise RuntimeError(
+            "Sector map bootstrap has no usable CoinGecko categories; canonical save aborted."
+        )
+
+
 async def save_validated_sector_map(sector_map: Dict, gcs_client=None) -> None:
     previous = await load_json(config.SECTOR_MAP_FILE_NAME, gcs_client)
     previous = previous if isinstance(previous, dict) else {}
+    validate_sector_map_bootstrap(previous, sector_map)
     sector_map = {
         market: previous[market]
         if market in previous and TRANSIENT_SECTOR_TAGS.intersection(tags)

@@ -68,3 +68,44 @@ def test_sector_map_preserves_known_good_tags_on_partial_lookup_failure(monkeypa
             "KRW-D": ["Payments"],
         },
     )
+
+
+def test_sector_map_rejects_all_failed_fresh_bootstrap_without_writing(monkeypatch):
+    save = pytest.fail
+
+    async def load(*_args):
+        return None
+
+    monkeypatch.setattr(update_sectors, "load_json", load)
+    monkeypatch.setattr(update_sectors, "save_json", save)
+
+    with pytest.raises(RuntimeError, match="no usable CoinGecko categories"):
+        asyncio.run(
+            update_sectors.save_validated_sector_map(
+                {
+                    "KRW-BTC": ["Untagged", "API_Error"],
+                    "KRW-ETH": ["Untagged", "Lookup_Failed"],
+                }
+            )
+        )
+
+
+def test_sector_map_allows_fresh_bootstrap_with_a_usable_category(monkeypatch):
+    saved = []
+
+    async def load(*_args):
+        return None
+
+    async def save(filename, value, *_args):
+        saved.append((filename, value))
+
+    monkeypatch.setattr(update_sectors, "load_json", load)
+    monkeypatch.setattr(update_sectors, "save_json", save)
+
+    sector_map = {
+        "KRW-BTC": ["Layer 1"],
+        "KRW-ETH": ["Untagged", "API_Error"],
+    }
+    asyncio.run(update_sectors.save_validated_sector_map(sector_map))
+
+    assert saved == [(update_sectors.config.SECTOR_MAP_FILE_NAME, sector_map)]
