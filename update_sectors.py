@@ -175,7 +175,7 @@ async def tag_market(
         if detail is not None:
             if not validate_coin_identity(upbit_name, detail, override):
                 return market_name, ["Untagged", "Identity_Mismatch"]
-            categories = detail.get("categories", [])
+            categories = detail.get("categories")
             if not isinstance(categories, list) or any(
                 not isinstance(category, str) or not category.strip()
                 for category in categories

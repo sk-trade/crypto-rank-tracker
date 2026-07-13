@@ -190,3 +190,23 @@ def test_falsy_invalid_coingecko_category_schema_is_not_treated_as_empty(
     )
 
     assert result == ("KRW-BTC", ["Untagged", "Invalid_Category"])
+
+
+def test_missing_coingecko_category_field_is_a_transient_schema_failure(monkeypatch):
+    async def detail(*_args):
+        return {"name": "Bitcoin"}
+
+    monkeypatch.setattr(update_sectors, "get_coin_detail", detail)
+    monkeypatch.setattr(update_sectors, "CG_SYMBOL_OVERRIDES", {})
+
+    result = asyncio.run(
+        update_sectors.tag_market(
+            None,
+            "btc",
+            "KRW-BTC",
+            {"btc": ["bitcoin"]},
+            upbit_name="Bitcoin",
+        )
+    )
+
+    assert result == ("KRW-BTC", ["Untagged", "Invalid_Category"])
