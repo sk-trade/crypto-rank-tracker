@@ -386,6 +386,52 @@ def test_missing_webhook_cancels_a_pending_delivery(monkeypatch):
     save_outbox.assert_awaited_once_with(None, None)
 
 
+def test_missing_webhook_preserves_an_ambiguous_attempt_and_cancels_deferred_work(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", None)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    attempted = _history("BREAKOUT_START", 101.0, now, minutes_ago=0)
+    deferred_history = attempted.model_copy(
+        update={
+            "last_signal_type": "MOMENTUM_ACCELERATION",
+            "last_price": 110.0,
+        }
+    )
+    active = {
+        **_notification_record(
+            "active-delivery", "scan-active", kind="alert", status="attempting"
+        ),
+        "alert_history": {"KRW-BTC": attempted.model_dump(mode="json")},
+        "previous_alert_history": {},
+        "alert_markets": ["KRW-BTC"],
+    }
+    deferred = {
+        **_notification_record("deferred-delivery", "scan-deferred", kind="alert"),
+        "alert_history": {
+            "KRW-BTC": deferred_history.model_dump(mode="json")
+        },
+        "previous_alert_history": {
+            "KRW-BTC": attempted.model_dump(mode="json")
+        },
+        "alert_markets": ["KRW-BTC"],
+    }
+    asyncio.run(state_manager.save_alert_history({"KRW-BTC": deferred_history}))
+    asyncio.run(state_manager.save_notification_outbox(active))
+    asyncio.run(state_manager.save_notification_backlog([deferred]))
+
+    with pytest.raises(
+        notification.NotificationDeliveryError, match="outcome is uncertain"
+    ):
+        asyncio.run(notification.recover_pending_notification())
+
+    assert asyncio.run(state_manager.load_notification_outbox()) == active
+    assert asyncio.run(state_manager.load_notification_backlog()) == []
+    assert asyncio.run(load_alert_history())["KRW-BTC"] == attempted
+
+
 def test_missing_webhook_rolls_back_prepared_alert_history(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))

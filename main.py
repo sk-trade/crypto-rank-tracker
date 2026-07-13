@@ -122,7 +122,26 @@ def record_market_regime_block(
     return []
 
 
-async def run_check(execution_id: str | None = None):
+def _scheduled_scan_time(schedule_time: str | None) -> datetime.datetime:
+    if schedule_time is None:
+        return datetime.datetime.now(datetime.timezone.utc)
+    normalized = (
+        f"{schedule_time[:-1]}+00:00"
+        if schedule_time.endswith("Z")
+        else schedule_time
+    )
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise ValueError("X-CloudScheduler-ScheduleTime must be RFC 3339") from error
+    if parsed.tzinfo is None:
+        raise ValueError("X-CloudScheduler-ScheduleTime must include a timezone")
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+async def run_check(
+    execution_id: str | None = None, schedule_time: str | None = None
+):
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
     config.validate_storage_config()
 
@@ -155,7 +174,7 @@ async def run_check(execution_id: str | None = None):
             )
         async with aiohttp.ClientSession() as session:
             # 공통 준비 단계
-            scan_started_at = datetime.datetime.now(datetime.timezone.utc)
+            scan_started_at = _scheduled_scan_time(schedule_time)
             scan_close_at = scan_started_at.replace(second=0, microsecond=0) - datetime.timedelta(
                 minutes=scan_started_at.minute % config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
             )
@@ -417,10 +436,12 @@ def main(request):
     logger.info("업비트 순위 확인 작업 시작 (Cloud Function).")
     try:
         headers = getattr(request, "headers", {}) if request is not None else {}
-        execution_id = headers.get("X-CloudScheduler-Execution-ID") or headers.get(
-            "X-CloudScheduler-ScheduleTime"
-        )
-        asyncio.run(run_check(execution_id=execution_id))
+        schedule_time = headers.get("X-CloudScheduler-ScheduleTime")
+        execution_id = schedule_time or headers.get("X-CloudScheduler-Execution-ID")
+        run_kwargs = {"execution_id": execution_id}
+        if schedule_time:
+            run_kwargs["schedule_time"] = schedule_time
+        asyncio.run(run_check(**run_kwargs))
     except Exception as e:
         logger.critical(f"작업 실행 중 심각한 오류 발생: {e}", exc_info=True)
         return ("Internal Server Error", 500)

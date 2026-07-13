@@ -517,7 +517,10 @@ async def _cancel_pending_notifications(
     outbox: Optional[Dict[str, Any]],
     backlog: List[Dict[str, Any]],
     gcs_client=None,
-) -> None:
+) -> bool:
+    preserve_ambiguous_attempt = (
+        outbox is not None and outbox["status"] == "attempting"
+    )
     for deferred in reversed(backlog):
         await _rollback_outbox_alert_history(deferred, gcs_client)
     if outbox is not None and outbox["status"] == "prepared":
@@ -530,7 +533,9 @@ async def _cancel_pending_notifications(
     for scan_key in scan_keys:
         await complete_scan_key(scan_key, gcs_client)
     await save_notification_backlog([], gcs_client)
-    await save_notification_outbox(None, gcs_client)
+    if not preserve_ambiguous_attempt:
+        await save_notification_outbox(None, gcs_client)
+    return preserve_ambiguous_attempt
 
 
 async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResult]:
@@ -541,12 +546,20 @@ async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResu
         return None
     if not config.WEBHOOK_URL:
         try:
-            await _cancel_pending_notifications(outbox, backlog, gcs_client)
+            preserved_ambiguous_attempt = await _cancel_pending_notifications(
+                outbox, backlog, gcs_client
+            )
         except Exception as error:
             raise NotificationDeliveryError(
                 "pending webhook cancellation could not be persisted",
                 scan_handoff_durable=True,
             ) from error
+        if preserved_ambiguous_attempt:
+            raise NotificationDeliveryError(
+                "webhook attempt outcome is uncertain; inspect the receiver using delivery_id "
+                f"{outbox['delivery_id']} before resetting or clearing the outbox",
+                scan_handoff_durable=True,
+            )
         representative = outbox or backlog[0]
         return DispatchResult(
             sent=False,

@@ -304,7 +304,47 @@ def test_cloud_function_uses_scheduler_schedule_time_as_retry_identity(monkeypat
     monkeypatch.setattr(app, "run_check", run_check)
 
     class Request:
-        headers = {"X-CloudScheduler-ScheduleTime": "2026-07-13T15:00:00Z"}
+        headers = {
+            "X-CloudScheduler-Execution-ID": "attempt-specific-id",
+            "X-CloudScheduler-ScheduleTime": "2026-07-13T15:00:00Z",
+        }
 
     assert app.main(Request()) == ("OK", 200)
-    run_check.assert_awaited_once_with(execution_id="2026-07-13T15:00:00Z")
+    run_check.assert_awaited_once_with(
+        execution_id="2026-07-13T15:00:00Z",
+        schedule_time="2026-07-13T15:00:00Z",
+    )
+
+
+def test_scheduler_retry_derives_the_scan_from_the_original_schedule_time(monkeypatch):
+    monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(
+        app,
+        "get_all_krw_tickers",
+        AsyncMock(return_value=[{"market": "KRW-BTC"}, {"market": "KRW-ETH"}]),
+    )
+    candles = AsyncMock(return_value={"KRW-ETH": []})
+    monkeypatch.setattr(app, "get_candles", candles)
+    monkeypatch.setattr(app, "dispatch_data_quality_alert", AsyncMock())
+    monkeypatch.setattr(app, "append_scan_events", AsyncMock())
+
+    import asyncio
+
+    asyncio.run(
+        app.run_check(
+            execution_id="2026-07-13T15:04:59Z",
+            schedule_time="2026-07-13T15:04:59Z",
+        )
+    )
+
+    expected_time = datetime.datetime(
+        2026, 7, 13, 15, 4, 59, tzinfo=datetime.timezone.utc
+    )
+    app.claim_scan_key.assert_awaited_once_with(
+        "completed-candle:2026-07-13T15:00:00+00:00",
+        execution_id="2026-07-13T15:04:59Z",
+        gcs_client=None,
+    )
+    assert candles.await_args.kwargs["as_of"] == expected_time
