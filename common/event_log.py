@@ -80,7 +80,7 @@ def build_scan_events(
             final_decision = "deep_dive_data_blocked"
             reasons.append("higher_timeframe_candle_history_unavailable")
         elif market in alerts_by_market:
-            final_decision = "alert_sent"
+            final_decision = "alert_selected"
         else:
             final_decision = "candidate_not_alerted"
 

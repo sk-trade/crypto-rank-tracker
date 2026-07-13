@@ -5,7 +5,7 @@ import fcntl
 import json
 import logging
 import os
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import config
 from common.models import AlertHistory, AnalysisState, RankState, ScanEvent, ScanOutcome
@@ -13,6 +13,7 @@ from common.storage_client import StateBackendUnavailable, StateLoadError, load_
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 IDEMPOTENCY_STATE_FILE_NAME = "processed_scan_keys.json"
+NOTIFICATION_OUTBOX_FILE_NAME = "notification_outbox.json"
 
 
 # --- 순위 상태 관리 ---
@@ -281,6 +282,17 @@ async def save_analysis_log(state: AnalysisState, gcs_client=None):
 # --- 알림 히스토리 관리 ---
 
 
+def _active_alert_history(
+    history: Dict[str, AlertHistory], now: Optional[datetime.datetime] = None
+) -> Dict[str, AlertHistory]:
+    cutoff = (now or datetime.datetime.now(datetime.timezone.utc)) - datetime.timedelta(hours=24)
+    return {
+        market: alert
+        for market, alert in history.items()
+        if alert.last_alert_timestamp > cutoff
+    }
+
+
 async def load_alert_history(gcs_client=None) -> Dict[str, AlertHistory]:
     """알림 히스토리 파일을 로드합니다."""
     data = await load_json(config.ALERT_HISTORY_FILE_NAME, gcs_client)
@@ -291,23 +303,52 @@ async def load_alert_history(gcs_client=None) -> Dict[str, AlertHistory]:
             f"알림 히스토리 형식 오류 ({config.ALERT_HISTORY_FILE_NAME}): JSON object가 필요합니다."
         )
 
-    return {
+    history = {
         market: AlertHistory.model_validate(alert_data)
         for market, alert_data in data.items()
     }
+    return _active_alert_history(history)
 
 
 async def save_alert_history(history: Dict[str, AlertHistory], gcs_client=None):
     """알림 히스토리를 저장하며, 24시간 이상된 기록은 자동으로 정리합니다."""
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
-    cleaned_history = {
-        market: alert
-        for market, alert in history.items()
-        if alert.last_alert_timestamp > cutoff
-    }
+    cleaned_history = _active_alert_history(history)
     data_to_save = {m: ah.model_dump(mode="json") for m, ah in cleaned_history.items()}
     await save_json(config.ALERT_HISTORY_FILE_NAME, data_to_save, gcs_client)
     logger.info(f"알림 히스토리 저장 완료: {config.ALERT_HISTORY_FILE_NAME}")
+
+
+def _validate_notification_outbox(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise StateLoadError(
+            f"알림 outbox 형식 오류 ({NOTIFICATION_OUTBOX_FILE_NAME}): JSON object가 필요합니다."
+        )
+    if data.get("status") not in {"prepared", "attempting"}:
+        raise StateLoadError("알림 outbox status는 prepared 또는 attempting이어야 합니다.")
+    if not isinstance(data.get("delivery_id"), str) or not isinstance(data.get("message"), str):
+        raise StateLoadError("알림 outbox delivery_id와 message는 문자열이어야 합니다.")
+    history = data.get("alert_history")
+    if history is not None and (
+        not isinstance(history, dict)
+        or any(not isinstance(value, dict) for value in history.values())
+    ):
+        raise StateLoadError("알림 outbox alert_history는 JSON object 또는 null이어야 합니다.")
+    return data
+
+
+async def load_notification_outbox(gcs_client=None) -> Optional[Dict[str, Any]]:
+    """Load the single pending webhook delivery, failing closed on corrupt state."""
+    data = await load_json(NOTIFICATION_OUTBOX_FILE_NAME, gcs_client)
+    if data is None:
+        return None
+    return _validate_notification_outbox(data)
+
+
+async def save_notification_outbox(outbox: Optional[Dict[str, Any]], gcs_client=None) -> None:
+    """Persist or clear the single pending webhook delivery."""
+    if outbox is not None:
+        _validate_notification_outbox(outbox)
+    await save_json(NOTIFICATION_OUTBOX_FILE_NAME, outbox, gcs_client)
 
 
 # --- 로그 정리 ---

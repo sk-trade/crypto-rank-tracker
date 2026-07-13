@@ -154,6 +154,10 @@ jobs:
             --oidc-service-account-email=${{ secrets.GCP_SCHEDULER_SA_EMAIL }}
             --oidc-token-audience="$FUNCTION_URL"
             --attempt-deadline=15m
+            --max-retry-attempts=3
+            --min-backoff=30s
+            --max-backoff=5m
+            --max-doublings=2
             --time-zone="Asia/Seoul"
             --description="10분마다 업비트 랭킹 체크"
           )

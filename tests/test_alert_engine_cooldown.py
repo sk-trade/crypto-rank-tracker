@@ -1,10 +1,14 @@
 import asyncio
 import datetime
+import json
+from unittest.mock import AsyncMock
 
 import pytest
 
 import config
-from common.models import AlertHistory, SignalCandidate, TickerData
+import common.notification.main as notification
+from common import state_manager
+from common.models import Alert, AlertHistory, SignalCandidate, TickerData
 from common.notification.engine import AlertEngine
 from common.state_manager import load_alert_history
 from common.storage_client import StateLoadError
@@ -72,6 +76,148 @@ def test_alert_history_wrong_shape_fails_closed(monkeypatch, tmp_path):
 
     with pytest.raises(StateLoadError, match="JSON object"):
         asyncio.run(load_alert_history())
+
+
+def test_alert_history_expires_before_transition_classification(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    stale = _history(
+        "BREAKOUT_START",
+        100.0,
+        datetime.datetime.now(datetime.timezone.utc),
+        minutes_ago=25 * 60,
+    )
+    (tmp_path / config.ALERT_HISTORY_FILE_NAME).write_text(
+        json.dumps({"KRW-BTC": stale.model_dump(mode="json")}), encoding="utf-8"
+    )
+
+    assert asyncio.run(load_alert_history()) == {}
+
+
+def _breakout_alert() -> Alert:
+    return Alert(
+        candidate=_candidate(101.0),
+        ticker_data=_ticker(),
+        signal_type="BREAKOUT_START",
+        priority=3,
+        structure_level=100.0,
+    )
+
+
+def _briefing_args():
+    return {
+        "raw_tickers": [],
+        "enriched_tickers": {},
+        "current_rankings": {},
+        "previous_rankings": {},
+        "SECTORS": {},
+        "REVERSE_SECTOR_MAP": {},
+        "alert_history": {},
+        "market_regime": {},
+        "final_alerts": [_breakout_alert()],
+    }
+
+
+def test_configured_webhook_failure_is_queued_and_retried(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        notification.NotificationFormatter,
+        "format_daily_briefing",
+        lambda self, **kwargs: "briefing",
+    )
+    send = AsyncMock(
+        side_effect=[
+            notification.DispatchResult(False, "HTTP 500", 500),
+            notification.DispatchResult(True),
+        ]
+    )
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    with pytest.raises(notification.NotificationDeliveryError, match="HTTP 500"):
+        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+
+    pending = asyncio.run(state_manager.load_notification_outbox())
+    history = asyncio.run(load_alert_history())
+    assert pending["status"] == "prepared"
+    assert history["KRW-BTC"].last_signal_type == "BREAKOUT_START"
+
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.sent is True
+    assert asyncio.run(state_manager.load_notification_outbox()) is None
+    assert send.await_count == 2
+
+
+def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        notification.NotificationFormatter,
+        "format_daily_briefing",
+        lambda self, **kwargs: "briefing",
+    )
+    outbox = None
+    fail_clear = True
+    operation_order = []
+
+    async def load_outbox(_gcs_client=None):
+        return outbox
+
+    async def save_outbox(value, _gcs_client=None):
+        nonlocal outbox
+        if value is None and fail_clear:
+            raise RuntimeError("state write failed after delivery")
+        outbox = value
+
+    async def save_history(_value, _gcs_client=None):
+        operation_order.append("history")
+
+    send = AsyncMock(return_value=notification.DispatchResult(True))
+
+    async def ordered_send(_message):
+        operation_order.append("send")
+        return await send(_message)
+
+    monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
+    monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
+    monkeypatch.setattr(notification, "save_alert_history", save_history)
+    monkeypatch.setattr(notification, "send_notification", ordered_send)
+
+    with pytest.raises(notification.NotificationDeliveryError) as error:
+        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+
+    assert error.value.delivery_confirmed is True
+    assert outbox["status"] == "attempting"
+    assert operation_order == ["history", "send"]
+
+    fail_clear = False
+    resend = AsyncMock()
+    monkeypatch.setattr(notification, "send_notification", resend)
+    result = asyncio.run(notification.recover_pending_notification())
+
+    assert result.sent is True
+    assert outbox is None
+    resend.assert_not_awaited()
+
+
+def test_missing_webhook_skips_without_outbox_or_history_mutation(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", None)
+    monkeypatch.setattr(
+        notification.NotificationFormatter,
+        "format_daily_briefing",
+        lambda self, **kwargs: "briefing",
+    )
+    save_outbox = AsyncMock()
+    save_history = AsyncMock()
+    monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
+    monkeypatch.setattr(notification, "save_alert_history", save_history)
+
+    result = asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+
+    assert result.skipped is True
+    save_outbox.assert_not_awaited()
+    save_history.assert_not_awaited()
 
 
 def test_process_signals_classifies_downtrend_follow_up_as_acceleration():

@@ -7,6 +7,11 @@ import main as app
 from common.models import CandleData
 
 
+@pytest.fixture(autouse=True)
+def no_pending_notification(monkeypatch):
+    monkeypatch.setattr(app, "recover_pending_notification", AsyncMock(return_value=None))
+
+
 def test_cloud_function_entrypoint_returns_ok_when_run_check_succeeds(monkeypatch):
     async def run_check_success(execution_id=None):
         return None
@@ -176,3 +181,68 @@ def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypat
     persisted_events = append_events.await_args.args[0]
     assert {event.market for event in persisted_events} == {"KRW-BTC", "KRW-ETH"}
     assert all(event.final_decision == "rejected_lightweight" for event in persisted_events)
+
+
+def _configure_valid_scan_with_notification_error(monkeypatch, error):
+    timestamp = datetime.datetime(2026, 6, 18, tzinfo=datetime.timezone.utc)
+    candles = [
+        CandleData(
+            market="KRW-BTC",
+            timestamp=timestamp + datetime.timedelta(minutes=10 * index),
+            open_price=100.0,
+            high_price=100.0,
+            low_price=100.0,
+            close_price=100.0,
+            volume=1.0,
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(
+        app,
+        "get_all_krw_tickers",
+        AsyncMock(return_value=[{"market": "KRW-BTC", "acc_trade_price_24h": 1.0}]),
+    )
+    monkeypatch.setattr(app, "get_candles", AsyncMock(return_value={"KRW-BTC": candles}))
+    monkeypatch.setattr(app, "load_pending_scan_events", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "load_alert_history", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "append_scan_events", AsyncMock())
+    monkeypatch.setattr(app, "append_scan_outcomes", AsyncMock())
+    monkeypatch.setattr(app, "save_pending_scan_events", AsyncMock())
+    monkeypatch.setattr(app, "save_rank_state_history", AsyncMock())
+    monkeypatch.setattr(
+        app, "create_and_dispatch_notification", AsyncMock(side_effect=error)
+    )
+    release = AsyncMock()
+    monkeypatch.setattr(app, "release_scan_key", release)
+    return release
+
+
+def test_run_check_releases_claim_when_configured_webhook_fails(monkeypatch):
+    release = _configure_valid_scan_with_notification_error(
+        monkeypatch,
+        app.NotificationDeliveryError("HTTP 500"),
+    )
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check())
+
+    release.assert_awaited_once()
+
+
+def test_run_check_retains_claim_after_confirmed_delivery_finalization_failure(monkeypatch):
+    release = _configure_valid_scan_with_notification_error(
+        monkeypatch,
+        app.NotificationDeliveryError("outbox clear failed", delivery_confirmed=True),
+    )
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check())
+
+    release.assert_not_awaited()

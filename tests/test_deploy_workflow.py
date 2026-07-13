@@ -30,6 +30,15 @@ def test_scheduler_update_does_not_delete_the_existing_job():
     assert "--oidc-token-audience=\"$FUNCTION_URL\"" in workflow
 
 
+def test_scheduler_retries_failed_webhook_executions_with_bounded_backoff():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+
+    assert "--max-retry-attempts=3" in workflow
+    assert "--min-backoff=30s" in workflow
+    assert "--max-backoff=5m" in workflow
+    assert "--max-doublings=2" in workflow
+
+
 def test_scheduler_identity_is_authorized_to_invoke_the_gen2_service():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 

@@ -5,7 +5,7 @@ import pytest
 
 from common.analysis.scanner import CandidateDecision
 from common.event_log import build_scan_events, resolve_scan_outcomes
-from common.models import CandleData, ScanEvent, TickerData
+from common.models import Alert, CandleData, ScanEvent, SignalCandidate, TickerData
 from common import state_manager
 
 
@@ -77,6 +77,42 @@ def test_scan_events_preserve_execution_and_regime_blocking_stages():
     by_market = {event.market: event for event in events}
     assert by_market["KRW-BTC"].final_decision == "execution_blocked"
     assert by_market["KRW-ETH"].final_decision == "market_regime_blocked"
+
+
+def test_scan_event_records_alert_selection_without_claiming_delivery():
+    observed_at = datetime.datetime(2026, 6, 18, 0, 10, tzinfo=UTC)
+    ticker = TickerData(
+        market="KRW-BTC",
+        candle_history=[_candle(observed_at, 100.0, 101.0, 99.0)],
+        price_change_10m=2.0,
+    )
+    candidate = SignalCandidate(
+        market="KRW-BTC",
+        signal_score=0.9,
+        price_change=2.0,
+        rvol=3.0,
+        rvol_z_score=4.0,
+        contexts=[],
+        current_price=100.0,
+    )
+    alert = Alert(
+        candidate=candidate,
+        ticker_data=ticker,
+        signal_type="BREAKOUT_START",
+        priority=3,
+    )
+
+    event = build_scan_events(
+        observed_at,
+        ["KRW-BTC"],
+        {"KRW-BTC": ticker},
+        {"KRW-BTC": CandidateDecision(True, [])},
+        ["KRW-BTC"],
+        [alert],
+        [candidate],
+    )[0]
+
+    assert event.final_decision == "alert_selected"
 
 
 def test_outcome_resolution_waits_for_complete_entry_path_and_uses_fixed_target():

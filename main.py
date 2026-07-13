@@ -24,7 +24,12 @@ from common.analysis.deep_dive import (
 )
 from common.models import Alert, RankState, SignalCandidate
 from common.event_log import build_scan_events, resolve_scan_outcomes
-from common.notification.main import create_and_dispatch_notification, dispatch_data_quality_alert
+from common.notification.main import (
+    NotificationDeliveryError,
+    create_and_dispatch_notification,
+    dispatch_data_quality_alert,
+    recover_pending_notification,
+)
 from common.sector_loader import load_and_process_sectors
 from common.state_manager import (
     append_scan_events,
@@ -134,8 +139,11 @@ async def run_check(execution_id: str | None = None):
         logger.info("로컬 파일 저장 모드로 실행됩니다.")
 
     claimed_scan_key = None
-    notification_started = False
     try:
+        recovered_delivery = await recover_pending_notification(gcs_client)
+        if recovered_delivery is not None:
+            logger.info("Recovered pending webhook delivery; deferring the new market scan.")
+            return
         async with aiohttp.ClientSession() as session:
             # 공통 준비 단계
             scan_started_at = datetime.datetime.now(datetime.timezone.utc)
@@ -185,8 +193,7 @@ async def run_check(execution_id: str | None = None):
                     ),
                     gcs_client,
                 )
-                notification_started = True
-                await dispatch_data_quality_alert(data_quality_issues)
+                await dispatch_data_quality_alert(data_quality_issues, gcs_client=gcs_client)
                 return
 
             pending_events = await load_pending_scan_events(gcs_client)
@@ -319,7 +326,6 @@ async def run_check(execution_id: str | None = None):
             new_rank_state = RankState(last_updated=scan_close_at, rankings=current_rankings)
             await save_rank_state_history(new_rank_state, old_rank_states, gcs_client=gcs_client)
 
-            notification_started = True
             await create_and_dispatch_notification(
                 raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
                 previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
@@ -339,7 +345,10 @@ async def run_check(execution_id: str | None = None):
             # await save_analysis_log(new_analysis_state, gcs_client=gcs_client)
 
     except Exception as e:
-        if claimed_scan_key and not notification_started:
+        delivery_confirmed = (
+            isinstance(e, NotificationDeliveryError) and e.delivery_confirmed
+        )
+        if claimed_scan_key and not delivery_confirmed:
             try:
                 await release_scan_key(claimed_scan_key, gcs_client=gcs_client)
             except Exception:
