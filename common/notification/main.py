@@ -31,10 +31,14 @@ class NotificationDeliveryError(RuntimeError):
         *,
         delivery_confirmed: bool = False,
         scan_handoff_durable: bool = False,
+        scan_handoff_uncertain: bool = False,
     ):
         super().__init__(message)
         self.delivery_confirmed = delivery_confirmed
         self.scan_handoff_durable = scan_handoff_durable or delivery_confirmed
+        self.scan_handoff_uncertain = (
+            scan_handoff_uncertain and not self.scan_handoff_durable
+        )
 
 import config
 from common.models import Alert, AlertHistory, TickerData
@@ -380,7 +384,27 @@ async def _enqueue_deferred_notification(
             f"notification backlog reached {MAX_NOTIFICATION_BACKLOG} retained records"
         )
     backlog.append(outbox)
-    await save_notification_backlog(backlog, gcs_client)
+    try:
+        await save_notification_backlog(backlog, gcs_client)
+    except Exception as error:
+        try:
+            persisted_backlog = await load_notification_backlog(gcs_client)
+        except Exception:
+            raise NotificationDeliveryError(
+                "notification backlog write outcome could not be verified",
+                scan_handoff_uncertain=True,
+            ) from error
+        if any(
+            item["delivery_id"] == outbox["delivery_id"]
+            for item in persisted_backlog
+        ):
+            raise NotificationDeliveryError(
+                "notification backlog write committed without acknowledgement",
+                scan_handoff_durable=True,
+            ) from error
+        raise NotificationDeliveryError(
+            "notification backlog write did not persist"
+        ) from error
     try:
         await _persist_outbox_alert_history(outbox, gcs_client)
         if scan_key := outbox.get("scan_key"):
@@ -455,7 +479,27 @@ async def _queue_and_dispatch_notification(
         return await _enqueue_deferred_notification(outbox, backlog, gcs_client)
     if backlog:
         return await _enqueue_deferred_notification(outbox, backlog, gcs_client)
-    await save_notification_outbox(outbox, gcs_client)
+    try:
+        await save_notification_outbox(outbox, gcs_client)
+    except Exception as error:
+        try:
+            persisted_outbox = await load_notification_outbox(gcs_client)
+        except Exception:
+            raise NotificationDeliveryError(
+                "notification outbox write outcome could not be verified",
+                scan_handoff_uncertain=True,
+            ) from error
+        if (
+            persisted_outbox is not None
+            and persisted_outbox["delivery_id"] == outbox["delivery_id"]
+        ):
+            raise NotificationDeliveryError(
+                "notification outbox write committed without acknowledgement",
+                scan_handoff_durable=True,
+            ) from error
+        raise NotificationDeliveryError(
+            "notification outbox write did not persist"
+        ) from error
     try:
         return await _deliver_prepared_notification(outbox, gcs_client)
     except NotificationDeliveryError:

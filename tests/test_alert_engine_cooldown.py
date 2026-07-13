@@ -206,6 +206,122 @@ def test_prepared_outbox_keeps_the_scan_handoff_durable_when_history_save_fails(
     send.assert_not_awaited()
 
 
+def test_committed_initial_outbox_write_error_is_a_durable_handoff(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    outbox = None
+
+    async def load_outbox(_gcs_client=None):
+        return outbox
+
+    async def save_outbox(value, _gcs_client=None):
+        nonlocal outbox
+        outbox = value
+        raise TimeoutError("response lost after commit")
+
+    monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
+    monkeypatch.setattr(
+        notification, "load_notification_backlog", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
+    send = AsyncMock()
+    monkeypatch.setattr(notification, "send_notification", send)
+
+    with pytest.raises(notification.NotificationDeliveryError) as error:
+        asyncio.run(
+            notification._queue_and_dispatch_notification(
+                "briefing", scan_key="scan-a"
+            )
+        )
+
+    assert error.value.scan_handoff_durable is True
+    assert error.value.scan_handoff_uncertain is False
+    assert outbox["status"] == "prepared"
+    assert outbox["scan_key"] == "scan-a"
+    send.assert_not_awaited()
+
+
+def test_unreadable_initial_outbox_write_error_is_an_uncertain_handoff(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    load_outbox = AsyncMock(side_effect=[None, TimeoutError("read unavailable")])
+    monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
+    monkeypatch.setattr(
+        notification, "load_notification_backlog", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        notification,
+        "save_notification_outbox",
+        AsyncMock(side_effect=TimeoutError("write outcome unknown")),
+    )
+
+    with pytest.raises(notification.NotificationDeliveryError) as error:
+        asyncio.run(
+            notification._queue_and_dispatch_notification(
+                "briefing", scan_key="scan-a"
+            )
+        )
+
+    assert error.value.scan_handoff_durable is False
+    assert error.value.scan_handoff_uncertain is True
+
+
+def test_absent_initial_outbox_after_write_error_is_not_a_durable_handoff(
+    monkeypatch,
+):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        notification, "load_notification_outbox", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        notification, "load_notification_backlog", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        notification,
+        "save_notification_outbox",
+        AsyncMock(side_effect=TimeoutError("write failed before commit")),
+    )
+
+    with pytest.raises(notification.NotificationDeliveryError) as error:
+        asyncio.run(
+            notification._queue_and_dispatch_notification(
+                "briefing", scan_key="scan-a"
+            )
+        )
+
+    assert error.value.scan_handoff_durable is False
+    assert error.value.scan_handoff_uncertain is False
+
+
+def test_committed_deferred_backlog_write_error_is_a_durable_handoff(monkeypatch):
+    monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
+    backlog = [_notification_record("old-delivery", "scan-old")]
+
+    async def load_backlog(_gcs_client=None):
+        return list(backlog)
+
+    async def save_backlog(value, _gcs_client=None):
+        nonlocal backlog
+        backlog = list(value)
+        raise TimeoutError("response lost after commit")
+
+    monkeypatch.setattr(
+        notification, "load_notification_outbox", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(notification, "load_notification_backlog", load_backlog)
+    monkeypatch.setattr(notification, "save_notification_backlog", save_backlog)
+    monkeypatch.setattr(notification, "complete_scan_key", AsyncMock())
+
+    with pytest.raises(notification.NotificationDeliveryError) as error:
+        asyncio.run(
+            notification._queue_and_dispatch_notification(
+                "new briefing", scan_key="scan-new"
+            )
+        )
+
+    assert error.value.scan_handoff_durable is True
+    assert error.value.scan_handoff_uncertain is False
+    assert [item["scan_key"] for item in backlog] == ["scan-new"]
+
+
 def test_webhook_request_exposes_the_delivery_id_header(monkeypatch):
     monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
     request = {}

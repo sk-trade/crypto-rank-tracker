@@ -256,6 +256,23 @@ def test_run_check_releases_claim_when_notification_handoff_is_not_durable(
     release.assert_awaited_once()
 
 
+def test_run_check_retains_claim_when_notification_handoff_is_uncertain(monkeypatch):
+    release = _configure_valid_scan_with_notification_error(
+        monkeypatch,
+        app.NotificationDeliveryError(
+            "outbox write outcome unknown", scan_handoff_uncertain=True
+        ),
+    )
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check(execution_id="run-a"))
+
+    app.complete_scan_key.assert_not_awaited()
+    release.assert_not_awaited()
+
+
 def test_run_check_retains_claim_after_confirmed_delivery_finalization_failure(monkeypatch):
     release = _configure_valid_scan_with_notification_error(
         monkeypatch,

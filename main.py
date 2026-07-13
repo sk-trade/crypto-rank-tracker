@@ -389,6 +389,12 @@ async def run_check(
             except NotificationDeliveryError as error:
                 if error.scan_handoff_durable:
                     await complete_scan_key(scan_key, gcs_client)
+                elif error.scan_handoff_uncertain:
+                    logger.error(
+                        "Notification handoff is uncertain; retaining scan claim %s for retry reconciliation",
+                        scan_key,
+                    )
+                    claimed_scan_key = None
                 else:
                     await release_scan_key(scan_key, gcs_client=gcs_client)
                     claimed_scan_key = None
