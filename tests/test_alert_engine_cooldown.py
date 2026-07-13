@@ -1,7 +1,13 @@
+import asyncio
 import datetime
 
+import pytest
+
+import config
 from common.models import AlertHistory, SignalCandidate, TickerData
 from common.notification.engine import AlertEngine
+from common.state_manager import load_alert_history
+from common.storage_client import StateLoadError
 
 
 def _history(
@@ -57,6 +63,15 @@ def _process_signal_type(previous_signal_type: str, current_price: float) -> str
 
     assert len(alerts) == 1
     return alerts[0].signal_type
+
+
+def test_alert_history_wrong_shape_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    (tmp_path / config.ALERT_HISTORY_FILE_NAME).write_text("[]", encoding="utf-8")
+
+    with pytest.raises(StateLoadError, match="JSON object"):
+        asyncio.run(load_alert_history())
 
 
 def test_process_signals_classifies_downtrend_follow_up_as_acceleration():

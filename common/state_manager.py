@@ -9,7 +9,7 @@ from typing import Dict, List
 
 import config
 from common.models import AlertHistory, AnalysisState, RankState, ScanEvent, ScanOutcome
-from common.storage_client import StateBackendUnavailable, load_json, save_json
+from common.storage_client import StateBackendUnavailable, StateLoadError, load_json, save_json
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 IDEMPOTENCY_STATE_FILE_NAME = "processed_scan_keys.json"
@@ -284,12 +284,12 @@ async def save_analysis_log(state: AnalysisState, gcs_client=None):
 async def load_alert_history(gcs_client=None) -> Dict[str, AlertHistory]:
     """알림 히스토리 파일을 로드합니다."""
     data = await load_json(config.ALERT_HISTORY_FILE_NAME, gcs_client)
-    if not isinstance(data, dict):
-        if data is not None:
-            logger.warning(
-                f"'{config.ALERT_HISTORY_FILE_NAME}' 파일의 형식이 올바르지 않습니다 (Dict가 아님). 빈 히스토리로 시작합니다."
-            )
+    if data is None:
         return {}
+    if not isinstance(data, dict):
+        raise StateLoadError(
+            f"알림 히스토리 형식 오류 ({config.ALERT_HISTORY_FILE_NAME}): JSON object가 필요합니다."
+        )
 
     return {
         market: AlertHistory.model_validate(alert_data)
