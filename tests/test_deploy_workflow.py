@@ -103,4 +103,4 @@ def test_sector_updater_restricts_manual_production_writes_to_main():
 def test_sector_updater_receives_symbol_overrides():
     workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
 
-    assert "CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES }}" in workflow
+    assert "CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES || '{}' }}" in workflow

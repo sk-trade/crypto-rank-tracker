@@ -5,8 +5,9 @@ import logging
 import time
 import json
 import math
+import os
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from tqdm.asyncio import tqdm_asyncio
@@ -22,11 +23,27 @@ UPBIT_MARKET_URL = "https://api.upbit.com/v1/market/all"
 CG_BASE_URL = "https://api.coingecko.com/api/v3"
 CG_COINS_LIST_URL = f"{CG_BASE_URL}/coins/list"
 CG_COIN_DETAIL_URL = f"{CG_BASE_URL}/coins/"
-CG_SYMBOL_OVERRIDES = json.loads(__import__("os").environ.get("CG_SYMBOL_OVERRIDES", "{}"))
 SECTOR_MAP_ROLLBACK_FILE_NAME = "sectors.previous.json"
 MAX_SECTOR_MAP_CHANGE_RATIO = 0.30
 MIN_SECTOR_BOOTSTRAP_USABLE_RATIO = 0.50
 TRANSIENT_SECTOR_TAGS = {"API_Error", "Lookup_Failed", "Invalid_Category"}
+
+
+def parse_symbol_overrides(raw_value: str | None) -> Dict[str, Any]:
+    """Parse the optional symbol override mapping, treating blank config as absent."""
+    raw_value = (raw_value or "").strip()
+    if not raw_value:
+        return {}
+    try:
+        overrides = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("CG_SYMBOL_OVERRIDES must be a JSON object") from error
+    if not isinstance(overrides, dict):
+        raise RuntimeError("CG_SYMBOL_OVERRIDES must be a JSON object")
+    return overrides
+
+
+CG_SYMBOL_OVERRIDES = parse_symbol_overrides(os.environ.get("CG_SYMBOL_OVERRIDES"))
 
 
 # --- RateLimiter 클래스 ---
@@ -159,12 +176,9 @@ async def tag_market(
             if not validate_coin_identity(upbit_name, detail, override):
                 return market_name, ["Untagged", "Identity_Mismatch"]
             categories = detail.get("categories", [])
-            if categories and (
-                not isinstance(categories, list)
-                or any(
-                    not isinstance(category, str) or not category.strip()
-                    for category in categories
-                )
+            if not isinstance(categories, list) or any(
+                not isinstance(category, str) or not category.strip()
+                for category in categories
             ):
                 logging.error("CoinGecko category schema is invalid for %s", coin_id)
                 return market_name, ["Untagged", "Invalid_Category"]
