@@ -139,6 +139,20 @@ def _scheduled_scan_time(schedule_time: str | None) -> datetime.datetime:
     return parsed.astimezone(datetime.timezone.utc)
 
 
+async def _settle_notification_scan_claim(
+    error: NotificationDeliveryError, scan_key: str, gcs_client=None
+) -> None:
+    if error.scan_handoff_durable:
+        await complete_scan_key(scan_key, gcs_client)
+    elif error.scan_handoff_uncertain:
+        logger.error(
+            "Notification handoff is uncertain; retaining scan claim %s for retry reconciliation",
+            scan_key,
+        )
+    else:
+        await release_scan_key(scan_key, gcs_client=gcs_client)
+
+
 async def run_check(
     execution_id: str | None = None, schedule_time: str | None = None
 ):
@@ -231,11 +245,8 @@ async def run_check(
                         scan_key=scan_key,
                     )
                 except NotificationDeliveryError as error:
-                    if error.scan_handoff_durable:
-                        await complete_scan_key(scan_key, gcs_client)
-                    else:
-                        await release_scan_key(scan_key, gcs_client=gcs_client)
-                        claimed_scan_key = None
+                    await _settle_notification_scan_claim(error, scan_key, gcs_client)
+                    claimed_scan_key = None
                     raise
                 except Exception:
                     await release_scan_key(scan_key, gcs_client=gcs_client)
@@ -387,17 +398,8 @@ async def run_check(
                     gcs_client=gcs_client, scan_key=scan_key,
                 )
             except NotificationDeliveryError as error:
-                if error.scan_handoff_durable:
-                    await complete_scan_key(scan_key, gcs_client)
-                elif error.scan_handoff_uncertain:
-                    logger.error(
-                        "Notification handoff is uncertain; retaining scan claim %s for retry reconciliation",
-                        scan_key,
-                    )
-                    claimed_scan_key = None
-                else:
-                    await release_scan_key(scan_key, gcs_client=gcs_client)
-                    claimed_scan_key = None
+                await _settle_notification_scan_claim(error, scan_key, gcs_client)
+                claimed_scan_key = None
                 raise
             except Exception:
                 await release_scan_key(scan_key, gcs_client=gcs_client)

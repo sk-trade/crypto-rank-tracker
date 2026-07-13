@@ -57,6 +57,40 @@ def test_run_check_dispatches_data_quality_incident_and_skips_market_briefing(mo
     app.save_rank_state_history.assert_not_awaited()
 
 
+def test_data_quality_scan_retains_claim_when_notification_handoff_is_uncertain(
+    monkeypatch,
+):
+    monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "load_and_process_sectors", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(
+        app,
+        "get_all_krw_tickers",
+        AsyncMock(return_value=[{"market": "KRW-BTC"}, {"market": "KRW-ETH"}]),
+    )
+    monkeypatch.setattr(app, "get_candles", AsyncMock(return_value={"KRW-ETH": []}))
+    monkeypatch.setattr(app, "append_scan_events", AsyncMock())
+    monkeypatch.setattr(
+        app,
+        "dispatch_data_quality_alert",
+        AsyncMock(
+            side_effect=app.NotificationDeliveryError(
+                "outbox write outcome unknown", scan_handoff_uncertain=True
+            )
+        ),
+    )
+    release = AsyncMock()
+    monkeypatch.setattr(app, "release_scan_key", release)
+
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="Failed to execute the main pipeline"):
+        asyncio.run(app.run_check(execution_id="run-a"))
+
+    app.complete_scan_key.assert_not_awaited()
+    release.assert_not_awaited()
+
+
 def test_run_check_skips_mutations_when_the_completed_candle_is_claimed(monkeypatch):
     monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=False))
     monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
