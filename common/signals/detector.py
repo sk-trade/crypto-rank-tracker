@@ -1,37 +1,35 @@
 #common/signals/detector
 
 import logging
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 import numpy as np
-import pandas as pd
 
 import config
-from common.models import SignalCandidate, TickerData
+from common.models import (
+    SignalCandidate,
+    TickerData,
+    TrendState,
+)
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
 def detect_anomalies(
+    candidate_markets: Iterable[str],
     enriched_tickers: Dict[str, TickerData],
-    current_rankings: Dict[str, int], 
     SECTORS: Dict[str, List[str]],
     REVERSE_SECTOR_MAP: Dict[str, List[str]],
 ) -> List[SignalCandidate]:
-    """기술적 지표가 계산된 TickerData를 분석하여 잠재적 시그널 후보 목록을 생성합니다."""
+    """Score selected candidates while retaining whole-market context."""
     # Z-score는 scanner에서 이미 계산됨. detector는 읽기만 한다.
-
-    # 현재 거래량의 백분위수 계산 (거래량 수준 평가용)
-    current_volumes = {
-        market: ticker.candle_history[-1].volume
-        for market, ticker in enriched_tickers.items()
-        if ticker.candle_history
-    }
-    volume_series = pd.Series(current_volumes)
 
     # 각 티커를 순회하며 시그널 후보 생성
     candidates = []
-    for market, ticker in enriched_tickers.items():
+    for market in candidate_markets:
+        ticker = enriched_tickers.get(market)
+        if ticker is None:
+            continue
         # Candidate selection already requires this metric; retain that contract here.
         conditional_z_score = ticker.conditional_log_rvol_z_score
         if conditional_z_score is None:
@@ -51,37 +49,17 @@ def detect_anomalies(
         signal_score = calculate_signal_score(ticker, sector_corr)
 
         if signal_score >= config.SIGNAL_SCORE_CANDIDATE_MINIMUM:
-            contexts = _build_contexts(ticker)
             candidate = SignalCandidate(
                 market=market,
                 signal_score=signal_score,
                 price_change=ticker.price_change_10m or 0.0,
                 rvol=ticker.relative_volume or 0.0,
                 rvol_z_score=conditional_z_score,
-                contexts=contexts,
                 current_price=ticker.candle_history[-1].close_price,
             )
             candidates.append(candidate)
 
     return sorted(candidates, key=lambda x: x.signal_score, reverse=True)
-
-def _build_contexts(ticker: TickerData) -> List[str]:
-    """TickerData를 기반으로 시그널에 대한 컨텍스트 문자열 리스트를 생성합니다."""
-    contexts = []
-    if ticker.trend_1h == "UP" and ticker.trend_4h == "UP":
-        contexts.append("단기/중기 모멘텀 일치")
-    elif ticker.trend_1h == "UP":
-        contexts.append("단기 상승 모멘텀")
-
-    if ticker.bb_status == "BREAKOUT_UPPER":
-        contexts.append("BB상단 돌파")
-    elif ticker.bb_status == "SQUEEZE":
-        contexts.append("변동성 압축 상태(BB)")
-
-    rarity_map = {"HIGH": "★☆☆", "VERY_HIGH": "★★☆", "EXTREME": "★★★"}
-    if rarity_tag := rarity_map.get(ticker.volatility_tier):
-        contexts.append(f"희귀도 {rarity_tag}")
-    return contexts
 
 
 def calculate_sector_correlation(
@@ -95,7 +73,7 @@ def calculate_sector_correlation(
     if not tags:
         return 0.0
 
-    primary_sector = tags[0].split("(")[0].strip()
+    primary_sector = tags[0]
     sector_coins = SECTORS.get(primary_sector, [])
     if len(sector_coins) < 3:
         return 0.0
@@ -123,13 +101,13 @@ def calculate_sector_correlation(
     return max(0, (correlation - 0.5) * 2)
 
 
-def calculate_signal_score(ticker: TickerData, sector_corr: float, rank: int | None = None) -> float:
+def calculate_signal_score(ticker: TickerData, sector_corr: float) -> float:
     """
     사전 시점의 변동성 정규화 가격 surprise와 유동성 구간으로 점수를 매깁니다.
     """
     score = 0.0
     
-    z_score = ticker.rvol_z_score or 0
+    z_score = ticker.conditional_log_rvol_z_score or 0
     price_change_abs = abs(ticker.price_change_10m or 0)
     price_surprise = ticker.price_surprise or 0.0
     target_price_surprise = config.price_surprise_minimum(ticker.liquidity_tier)
@@ -152,11 +130,15 @@ def calculate_signal_score(ticker: TickerData, sector_corr: float, rank: int | N
 
     # 추세 정렬 (최대 0.2)
     if (ticker.price_change_10m or 0) > 0:
-        if ticker.trend_1h_stable == "UP": score += 0.1
-        if ticker.is_above_ma50_daily is True: score += 0.1
+        if ticker.trend_1h_stable is TrendState.UP:
+            score += 0.1
+        if ticker.is_above_ma50_daily is True:
+            score += 0.1
     elif (ticker.price_change_10m or 0) < 0:
-        if ticker.trend_1h_stable == "DOWN": score += 0.1
-        if ticker.is_above_ma50_daily is False: score += 0.1
+        if ticker.trend_1h_stable is TrendState.DOWN:
+            score += 0.1
+        if ticker.is_above_ma50_daily is False:
+            score += 0.1
 
     # 보너스 (섹터, 디커플링)
     score += sector_corr * 0.1

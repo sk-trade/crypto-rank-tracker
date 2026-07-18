@@ -1,6 +1,15 @@
 import datetime
 
-from common.models import Alert, AlertHistory, CandleData, SignalCandidate, TickerData
+import config
+from common.models import (
+    Alert,
+    AlertHistory,
+    CandleData,
+    SignalCandidate,
+    SignalType,
+    StructureDirection,
+    TickerData,
+)
 from common.notification.engine import AlertEngine
 from common.notification.main import _update_alert_history
 
@@ -34,17 +43,18 @@ def _candidate(price: float) -> SignalCandidate:
         price_change=0.1,
         rvol=1.0,
         rvol_z_score=1.0,
-        contexts=[],
         current_price=price,
     )
 
 
-def _history(direction: str, level: float, last_price: float) -> AlertHistory:
+def _history(
+    direction: StructureDirection, level: float, last_price: float
+) -> AlertHistory:
     now = datetime.datetime.now(UTC)
     return AlertHistory(
         market="KRW-BTC",
         last_alert_timestamp=now,
-        last_signal_type="BREAKOUT_START",
+        last_signal_type=SignalType.BREAKOUT_START,
         last_price=last_price,
         last_rvol=1.0,
         initial_timestamp=now,
@@ -59,7 +69,7 @@ def test_breakout_start_requires_close_above_prior_resistance():
         _candidate(101.0), _ticker([100.0] * 20 + [101.0]), {}
     )
 
-    assert signal_type == "BREAKOUT_START"
+    assert signal_type is SignalType.BREAKOUT_START
     assert level == 100.0
 
 
@@ -72,24 +82,32 @@ def test_positive_move_below_resistance_is_not_a_breakout_start():
 
 
 def test_acceleration_requires_an_existing_breakout_and_further_extension():
-    history = {"KRW-BTC": _history("bullish", level=100.0, last_price=102.0)}
+    history = {
+        "KRW-BTC": _history(
+            StructureDirection.BULLISH, level=100.0, last_price=102.0
+        )
+    }
 
     signal_type, _, level = AlertEngine()._get_alert_type_and_priority(
         _candidate(104.0), _ticker([]), history
     )
 
-    assert signal_type == "MOMENTUM_ACCELERATION"
+    assert signal_type is SignalType.MOMENTUM_ACCELERATION
     assert level == 100.0
 
 
 def test_failure_requires_reentry_through_the_breakout_level():
-    history = {"KRW-BTC": _history("bullish", level=100.0, last_price=104.0)}
+    history = {
+        "KRW-BTC": _history(
+            StructureDirection.BULLISH, level=100.0, last_price=104.0
+        )
+    }
 
     signal_type, _, level = AlertEngine()._get_alert_type_and_priority(
         _candidate(100.0), _ticker([]), history
     )
 
-    assert signal_type == "BULL_MOMENTUM_FAILED"
+    assert signal_type is SignalType.BULL_MOMENTUM_FAILED
     assert level == 100.0
 
 
@@ -98,19 +116,19 @@ def test_alert_history_persists_breakout_structure_and_clears_it_after_failure()
     breakout = Alert(
         candidate=_candidate(101.0),
         ticker_data=ticker,
-        signal_type="BREAKOUT_START",
+        signal_type=SignalType.BREAKOUT_START,
         priority=3,
         structure_level=100.0,
     )
     history = _update_alert_history({}, [breakout])
 
-    assert history["KRW-BTC"].structure_direction == "bullish"
+    assert history["KRW-BTC"].structure_direction is StructureDirection.BULLISH
     assert history["KRW-BTC"].structure_level == 100.0
 
     failed = Alert(
         candidate=_candidate(100.0),
         ticker_data=ticker,
-        signal_type="BULL_MOMENTUM_FAILED",
+        signal_type=SignalType.BULL_MOMENTUM_FAILED,
         priority=3,
         structure_level=100.0,
     )
@@ -120,14 +138,50 @@ def test_alert_history_persists_breakout_structure_and_clears_it_after_failure()
     assert history["KRW-BTC"].structure_level is None
 
 
+def test_failure_history_suppresses_new_structure_until_cooldown_expires():
+    ticker = _ticker([100.0] * 20 + [101.0])
+    history = {
+        "KRW-BTC": _history(
+            StructureDirection.BULLISH, level=100.0, last_price=101.0
+        )
+    }
+    failed = Alert(
+        candidate=_candidate(99.0),
+        ticker_data=ticker,
+        signal_type=SignalType.BULL_MOMENTUM_FAILED,
+        priority=3,
+        structure_level=100.0,
+    )
+    history = _update_alert_history(history, [failed])
+    next_candidate = _candidate(101.0).model_copy(update={"price_change": 1.0})
+
+    assert AlertEngine().process_signals(
+        [next_candidate], {"KRW-BTC": ticker}, history
+    ) == []
+
+    history["KRW-BTC"].last_alert_timestamp -= datetime.timedelta(
+        minutes=config.ALERT_COOLDOWN_MINUTES + 1
+    )
+    alerts = AlertEngine().process_signals(
+        [next_candidate], {"KRW-BTC": ticker}, history
+    )
+
+    assert len(alerts) == 1
+    assert alerts[0].signal_type is SignalType.BREAKOUT_START
+
+
 def test_bullish_acceleration_preserves_structure_for_the_next_transition():
     ticker = _ticker([])
-    history = {"KRW-BTC": _history("bullish", level=100.0, last_price=105.0)}
+    history = {
+        "KRW-BTC": _history(
+            StructureDirection.BULLISH, level=100.0, last_price=105.0
+        )
+    }
     initial_timestamp = history["KRW-BTC"].initial_timestamp
     acceleration = Alert(
         candidate=_candidate(110.0),
         ticker_data=ticker,
-        signal_type="MOMENTUM_ACCELERATION",
+        signal_type=SignalType.MOMENTUM_ACCELERATION,
         priority=2,
         structure_level=100.0,
     )
@@ -137,7 +191,7 @@ def test_bullish_acceleration_preserves_structure_for_the_next_transition():
         _candidate(112.0), ticker, history
     )
 
-    assert history["KRW-BTC"].structure_direction == "bullish"
+    assert history["KRW-BTC"].structure_direction is StructureDirection.BULLISH
     assert history["KRW-BTC"].structure_level == 100.0
     assert history["KRW-BTC"].initial_timestamp == initial_timestamp
-    assert next_signal == "MOMENTUM_ACCELERATION"
+    assert next_signal is SignalType.MOMENTUM_ACCELERATION

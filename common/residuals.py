@@ -27,7 +27,11 @@ def assign_residual_momentum(
         tags = reverse_sectors.get(market, [])
         if not tags or market == "KRW-BTC":
             continue
-        peers = [coin for coin in sectors.get(tags[0].split("(")[0].strip(), []) if coin != market and coin in returns]
+        peers = [
+            coin
+            for coin in sectors.get(tags[0], [])
+            if coin != market and coin in returns
+        ]
         if len(peers) < 2:
             continue
         sector_factor = np.median(np.array([returns[peer][start:] for peer in peers]), axis=0)

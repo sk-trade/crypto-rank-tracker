@@ -1,8 +1,15 @@
 import datetime
 
 from common.analysis.deep_dive import get_market_regime
-from common.models import CandleData, TickerData
-from main import filter_candidates_by_market_regime
+from common.models import (
+    CandleData,
+    CandidateDecision,
+    MarketRegime,
+    MarketRegimeSnapshot,
+    RejectionCode,
+    TickerData,
+)
+from main import record_market_regime_block
 
 
 UTC = datetime.timezone.utc
@@ -25,23 +32,47 @@ def _btc_ticker(prices: list[float], high_offset: float = 1.0) -> TickerData:
 
 
 def test_regime_is_unknown_without_enough_btc_candles_for_true_range_and_rsi():
-    assert get_market_regime({"KRW-BTC": _btc_ticker([100.0] * 24)}) == {"regime": "UNKNOWN"}
+    assert get_market_regime(
+        {"KRW-BTC": _btc_ticker([100.0] * 24)}
+    ) == MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN)
 
 
 def test_regime_uses_recent_rsi_window_for_a_bull_trend():
     regime = get_market_regime({"KRW-BTC": _btc_ticker([100.0 + index for index in range(25)])})
 
-    assert regime["regime"] == "TRENDING_BULL"
-    assert regime["rsi"] == 100.0
+    assert regime.regime is MarketRegime.TRENDING_BULL
+    assert regime.rsi == 100.0
 
 
 def test_true_range_includes_gaps_from_the_previous_close():
     prices = [100.0] * 19 + [110.0] + [111.0] * 5
     regime = get_market_regime({"KRW-BTC": _btc_ticker(prices, high_offset=0.5)})
 
-    assert regime["atr_ratio"] > 1.0
+    assert regime.atr_ratio > 1.0
 
 
 def test_unknown_market_regime_blocks_all_candidates():
-    assert filter_candidates_by_market_regime(["KRW-BTC", "KRW-ETH"], {"regime": "UNKNOWN"}) == []
-    assert filter_candidates_by_market_regime(["KRW-BTC"], {"regime": "TRENDING_BULL"}) == ["KRW-BTC"]
+    decisions = {
+        "KRW-BTC": CandidateDecision(eligible=True),
+        "KRW-ETH": CandidateDecision(eligible=True),
+    }
+    assert (
+        record_market_regime_block(
+            ["KRW-BTC", "KRW-ETH"],
+            decisions,
+            MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN),
+        )
+        == []
+    )
+    assert all(
+        decision.rejection_reasons == [RejectionCode.MARKET_REGIME_UNKNOWN]
+        for decision in decisions.values()
+    )
+
+    allowed = {"KRW-BTC": CandidateDecision(eligible=True)}
+    assert record_market_regime_block(
+        ["KRW-BTC"],
+        allowed,
+        MarketRegimeSnapshot(regime=MarketRegime.TRENDING_BULL),
+    ) == ["KRW-BTC"]
+    assert allowed["KRW-BTC"].eligible

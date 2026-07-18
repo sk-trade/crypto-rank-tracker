@@ -8,10 +8,11 @@ Set these environment variables for runtime behavior:
 
 - `STATE_STORAGE_METHOD`: state backend selector; omit it for `LOCAL`, or set it explicitly to `LOCAL` or `GCS`. Any other value fails at startup.
 - `GCS_BUCKET_NAME`: required bucket name when `STATE_STORAGE_METHOD=GCS`.
-- `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery.
+- `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery. Local runs read it directly; production syncs the GitHub secret into Google Secret Manager and injects it as a runtime secret.
+- `SHADOW_MODE`: set to `true`, `1`, or `yes` for no-webhook evaluations that must retain production-equivalent cooldown state in isolated `shadow_alert_history.json` without advancing delivery-backed `alert_history.json`.
 - `CG_API_KEY`: CoinGecko API key used by the sector updater.
 - `GCP_PROJECT_ID`: Google Cloud project identifier. Production workflows require it; local GCS use may omit it only when Application Default Credentials can infer the project.
-- `CG_SYMBOL_OVERRIDES`: optional JSON object mapping an ambiguous lower-case symbol to an explicit CoinGecko id, for example `{"pay":"tenx"}`. Ambiguous symbols without a valid override are left untagged.
+- `CG_SYMBOL_OVERRIDES`: optional JSON object mapping an ambiguous lower-case symbol to an explicit CoinGecko id, for example `{"pay":"tenx"}`. Values may also provide explicit `name` and `network` constraints. Unique CoinGecko symbols do not depend on provider display-name equality; ambiguous symbols without a valid override are left untagged.
 
 ## Local setup
 
@@ -31,7 +32,7 @@ uv run python -m compileall main.py config.py update_sectors.py common tests
 uv build
 WHEEL_PATH="$(realpath dist/*.whl)"
 TEMP_DIR="$(mktemp -d)"
-(cd "$TEMP_DIR" && uv run --isolated --with "$WHEEL_PATH" python -c \
+(cd "$TEMP_DIR" && uv run --no-cache --isolated --with "$WHEEL_PATH" python -c \
   "import main, update_sectors, config, common.upbit_client, common.notification.main")
 ```
 
@@ -71,15 +72,17 @@ GitHub Actions is used for deployment flow control:
   and `GCP_SCHEDULER_SA_EMAIL`. The deployer authenticates GitHub Actions, the runtime
   account accesses application resources, and the Scheduler account invokes the function.
 - Configure the `GCP_PROJECT_ID` and `GCP_WIF_PROVIDER` secrets for explicit project selection and Workload Identity Federation, plus the
-  `WEBHOOK_URL` secret when live notifications are required.
+  `WEBHOOK_URL` GitHub secret when live notifications are required. The deploy workflow creates or updates `crypto-rank-tracker-webhook-url` in Secret Manager and injects only its resource reference into the Cloud Function revision.
 - Production workflows pin `STATE_STORAGE_METHOD=GCS` so the scheduled function and sector
   updater share durable state. Configure the required `GCS_BUCKET_NAME` repository variable;
   deployment and sector refresh fail before authentication when it is missing.
 - Configure `CG_SYMBOL_OVERRIDES` when symbol collisions need explicit CoinGecko identities.
   The sector workflow also requires the `CG_API_KEY` secret.
 - Grant the deployer permission to deploy Cloud Functions, act as the runtime service account,
-  update the Cloud Run invoker policy, and manage the Scheduler job. The workflow grants the
-  Scheduler service account `roles/run.invoker` on the deployed Gen2 service.
+  update the Cloud Run invoker policy, manage the Scheduler job, and create/update the designated
+  Secret Manager secret and its IAM policy. The workflow grants the runtime account
+  `roles/secretmanager.secretAccessor` on that secret and grants the Scheduler service account
+  `roles/run.invoker` on the deployed Gen2 service.
 - The Gen2 function is deployed with 512 MB memory, a 540-second service timeout, one maximum instance,
   and one request per instance. Scheduler updates are idempotent, use the function URL
   as their OIDC audience, and retry failed executions three times with bounded backoff. Retries use

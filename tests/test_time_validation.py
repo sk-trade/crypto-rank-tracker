@@ -24,6 +24,24 @@ def test_final_holdout_is_later_than_training_data():
     assert max(item.entry_candle_start for item in train) < min(item.entry_candle_start for item in holdout)
 
 
+def test_final_holdout_purges_overlapping_labels_and_applies_embargo():
+    base = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    outcomes = [
+        _outcome(index).model_copy(
+            update={
+                "entry_candle_start": base + datetime.timedelta(minutes=10 * index),
+                "exit_candle_start": base + datetime.timedelta(minutes=10 * index + 60),
+            }
+        )
+        for index in range(20)
+    ]
+
+    train, holdout = final_holdout(outcomes)
+    boundary = holdout[0].entry_candle_start - datetime.timedelta(hours=1)
+
+    assert all(item.exit_candle_start < boundary for item in train)
+
+
 def test_evaluation_reports_cost_adjusted_expectation_hit_rate_and_bootstrap_interval():
     report = evaluate_outcomes([_outcome(index).model_copy(update={"directional_net_return": value}) for index, value in enumerate([-0.2, 0.1, 0.3, -0.1])])
     assert report.net_expected_return == pytest.approx(0.025)

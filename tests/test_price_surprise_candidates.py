@@ -3,7 +3,17 @@ import datetime
 import pytest
 
 from common.analysis.scanner import evaluate_candidate_eligibility, process_lightweight_indicators
-from common.models import CandleData, TickerData
+from common.models import CandleData, LiquidityTier, RejectionCode, TickerData
+
+
+def _with_close(candle: CandleData, close_price: float) -> CandleData:
+    data = candle.model_dump(mode="python")
+    data.update(
+        close_price=close_price,
+        high_price=max(candle.high_price, close_price),
+        low_price=min(candle.low_price, close_price),
+    )
+    return CandleData.model_validate(data)
 
 
 def _history(market: str, base_price: float, step_return: float, volume: float) -> list[CandleData]:
@@ -23,18 +33,22 @@ def _history(market: str, base_price: float, step_return: float, volume: float) 
                 volume=volume,
             )
         )
-    candles[-1].close_price *= 1.03
+    candles[-1] = _with_close(candles[-1], candles[-1].close_price * 1.03)
     return candles
 
 
 def test_price_surprise_normalizes_assets_with_different_volatility():
     low_volatility = _history("KRW-LOW", 100.0, 0.001, 1000.0)
     high_volatility = _history("KRW-HIGH", 100.0, 0.01, 1000.0)
-    low_volatility[-1].close_price = low_volatility[-2].close_price * 1.003
-    high_volatility[-1].close_price = high_volatility[-2].close_price * 1.03
+    low_volatility[-1] = _with_close(
+        low_volatility[-1], low_volatility[-2].close_price * 1.003
+    )
+    high_volatility[-1] = _with_close(
+        high_volatility[-1], high_volatility[-2].close_price * 1.03
+    )
 
     tickers = process_lightweight_indicators(
-        {"KRW-LOW": low_volatility, "KRW-HIGH": high_volatility}, {}
+        {"KRW-LOW": low_volatility, "KRW-HIGH": high_volatility}
     )
 
     assert tickers["KRW-LOW"].price_surprise == pytest.approx(
@@ -43,12 +57,18 @@ def test_price_surprise_normalizes_assets_with_different_volatility():
 
 
 def test_candidate_rejects_missing_historical_volatility_without_percent_fallback():
-    ticker = TickerData(market="KRW-NEW", price_change_10m=10.0, liquidity_tier="UNKNOWN")
+    ticker = TickerData(
+        market="KRW-NEW",
+        price_change_10m=10.0,
+        liquidity_tier=LiquidityTier.UNKNOWN,
+    )
 
-    decision = evaluate_candidate_eligibility({"KRW-NEW": ticker}, {"KRW-NEW": 1})
+    decision = evaluate_candidate_eligibility({"KRW-NEW": ticker})
 
     assert decision["KRW-NEW"].eligible is False
-    assert decision["KRW-NEW"].rejection_reasons == ["price_surprise_unavailable"]
+    assert decision["KRW-NEW"].rejection_reasons == [
+        RejectionCode.PRICE_SURPRISE_UNAVAILABLE
+    ]
 
 
 def test_liquidity_tiers_come_from_prior_rolling_turnover_not_rank():
@@ -57,9 +77,9 @@ def test_liquidity_tiers_come_from_prior_rolling_turnover_not_rank():
     high = _history("KRW-HIGH", 100.0, 0.002, 1000.0)
 
     tickers = process_lightweight_indicators(
-        {"KRW-LOW": low, "KRW-MID": middle, "KRW-HIGH": high}, {}
+        {"KRW-LOW": low, "KRW-MID": middle, "KRW-HIGH": high}
     )
 
-    assert tickers["KRW-LOW"].liquidity_tier == "LOW"
-    assert tickers["KRW-MID"].liquidity_tier == "MEDIUM"
-    assert tickers["KRW-HIGH"].liquidity_tier == "HIGH"
+    assert tickers["KRW-LOW"].liquidity_tier is LiquidityTier.LOW
+    assert tickers["KRW-MID"].liquidity_tier is LiquidityTier.MEDIUM
+    assert tickers["KRW-HIGH"].liquidity_tier is LiquidityTier.HIGH

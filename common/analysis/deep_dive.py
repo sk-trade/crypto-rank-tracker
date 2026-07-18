@@ -1,22 +1,22 @@
 # common/analysis/deep_dive.py
 
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List
 
 import numpy as np
 
 import config
-from common.models import TickerData, Alert, SignalCandidate # Alert, SignalCandidate 추가
+from common.models import MarketRegime, MarketRegimeSnapshot, TickerData, TrendState
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
-def get_market_regime(enriched_tickers: Dict[str, TickerData]) -> Dict[str, Any]:
+def get_market_regime(enriched_tickers: Dict[str, TickerData]) -> MarketRegimeSnapshot:
     """BTC의 1시간봉 데이터로 현재 시장 체제를 분석합니다."""
     btc_ticker = enriched_tickers.get("KRW-BTC")
     required_candles = max(config.REGIME_ATR_LONG_PERIOD + 1, config.REGIME_RSI_PERIOD + 1)
     if not btc_ticker or len(btc_ticker.hourly_candles) < required_candles:
-        return {"regime": "UNKNOWN"}
+        return MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN)
 
     candles = btc_ticker.hourly_candles
     closes = np.array([candle.close_price for candle in candles])
@@ -36,7 +36,7 @@ def get_market_regime(enriched_tickers: Dict[str, TickerData]) -> Dict[str, Any]
                 abs(candle.high_price - previous.close_price),
                 abs(candle.low_price - previous.close_price),
             )
-            for previous, candle in zip(candles, candles[1:])
+            for previous, candle in zip(candles, candles[1:], strict=False)
         ]
     )
     atr_24h = np.mean(true_ranges[-config.REGIME_ATR_LONG_PERIOD :])
@@ -44,13 +44,21 @@ def get_market_regime(enriched_tickers: Dict[str, TickerData]) -> Dict[str, Any]
     vol_ratio = atr_6h / atr_24h if atr_24h > 0 else 1.0
 
     if vol_ratio > 1.8:
-        return {"regime": "HIGH_VOLATILITY", "rsi": rsi, "atr_ratio": vol_ratio}
+        return MarketRegimeSnapshot(
+            regime=MarketRegime.HIGH_VOLATILITY, rsi=rsi, atr_ratio=vol_ratio
+        )
     if rsi > 60 and vol_ratio < 1.5:
-        return {"regime": "TRENDING_BULL", "rsi": rsi, "atr_ratio": vol_ratio}
+        return MarketRegimeSnapshot(
+            regime=MarketRegime.TRENDING_BULL, rsi=rsi, atr_ratio=vol_ratio
+        )
     if rsi < 40 and vol_ratio < 1.5:
-        return {"regime": "TRENDING_BEAR", "rsi": rsi, "atr_ratio": vol_ratio}
+        return MarketRegimeSnapshot(
+            regime=MarketRegime.TRENDING_BEAR, rsi=rsi, atr_ratio=vol_ratio
+        )
     
-    return {"regime": "MEAN_REVERSION", "rsi": rsi, "atr_ratio": vol_ratio}
+    return MarketRegimeSnapshot(
+        regime=MarketRegime.MEAN_REVERSION, rsi=rsi, atr_ratio=vol_ratio
+    )
 
 
 def enrich_deep_dive_tickers(
@@ -74,8 +82,8 @@ def enrich_deep_dive_tickers(
             closes = [c.close_price for c in ticker.daily_candles]
             ma50 = np.mean(closes[-50:])
             ma200 = np.mean(closes[-200:])
-            ticker.is_above_ma50_daily = closes[-1] > ma50
-            ticker.is_above_ma200_daily = closes[-1] > ma200
+            ticker.is_above_ma50_daily = bool(closes[-1] > ma50)
+            ticker.is_above_ma200_daily = bool(closes[-1] > ma200)
             
         # [Hourly 분석] 단기 추세 (MA6 vs MA24)
         if len(ticker.hourly_candles) >= 24:
@@ -83,8 +91,11 @@ def enrich_deep_dive_tickers(
             ma6 = np.mean(h_closes[-6:])
             ma24 = np.mean(h_closes[-24:])
             
-            if ma6 > ma24 * 1.005: ticker.trend_1h_stable = "UP"
-            elif ma6 < ma24 * 0.995: ticker.trend_1h_stable = "DOWN"
-            else: ticker.trend_1h_stable = "NEUTRAL"
+            if ma6 > ma24 * 1.005:
+                ticker.trend_1h_stable = TrendState.UP
+            elif ma6 < ma24 * 0.995:
+                ticker.trend_1h_stable = TrendState.DOWN
+            else:
+                ticker.trend_1h_stable = TrendState.NEUTRAL
             
     return enriched_tickers

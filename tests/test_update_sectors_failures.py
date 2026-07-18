@@ -5,6 +5,12 @@ import aiohttp
 import pytest
 
 import update_sectors
+from common.models import (
+    MarketListing,
+    SectorTagResult,
+    SectorTagStatus,
+)
+from common.storage_client import StateErrorCode, StateSaveError
 
 
 class DummyResponse:
@@ -32,10 +38,37 @@ class DummySession:
         return DummyResponse(self.payload)
 
 
+def test_upbit_market_collection_returns_typed_listings():
+    result = asyncio.run(
+        update_sectors.get_upbit_krw_markets(
+            DummySession(
+                [
+                    {
+                        "market": "KRW-BTC",
+                        "english_name": "Bitcoin",
+                    },
+                    {"market": "BTC-USDT", "english_name": "Bitcoin"},
+                ]
+            )
+        )
+    )
+
+    assert result == {
+        "btc": MarketListing(
+            market="KRW-BTC",
+            english_name="Bitcoin",
+        )
+    }
+
+
 def test_main_raises_when_upbit_markets_empty(monkeypatch):
     monkeypatch.setattr(update_sectors.config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(update_sectors, "get_upbit_krw_markets", AsyncMock(return_value={}))
-    monkeypatch.setattr(update_sectors, "get_coingecko_coins_list", AsyncMock(return_value={"btc": "bitcoin"}))
+    monkeypatch.setattr(
+        update_sectors,
+        "get_coingecko_coins_list",
+        AsyncMock(return_value={"btc": ["bitcoin"]}),
+    )
     monkeypatch.setattr(update_sectors, "save_json", pytest.fail)
 
     class DummyClientSession:
@@ -47,13 +80,21 @@ def test_main_raises_when_upbit_markets_empty(monkeypatch):
 
     monkeypatch.setattr(aiohttp, "ClientSession", DummyClientSession)
 
-    with pytest.raises(RuntimeError, match="Upbit KRW 마켓 목록 조회 결과가 비어 있습니다."):
+    with pytest.raises(update_sectors.SectorUpdateError) as error:
         asyncio.run(update_sectors.main())
+    assert (
+        error.value.code
+        is update_sectors.SectorUpdateErrorCode.UPBIT_MARKETS_UNAVAILABLE
+    )
 
 
 def test_main_raises_when_coingecko_symbols_empty(monkeypatch):
     monkeypatch.setattr(update_sectors.config, "STATE_STORAGE_METHOD", "LOCAL")
-    monkeypatch.setattr(update_sectors, "get_upbit_krw_markets", AsyncMock(return_value={"btc": "KRW-BTC"}))
+    monkeypatch.setattr(
+        update_sectors,
+        "get_upbit_krw_markets",
+        AsyncMock(return_value={"btc": MarketListing(market="KRW-BTC")}),
+    )
     monkeypatch.setattr(update_sectors, "get_coingecko_coins_list", AsyncMock(return_value={}))
     monkeypatch.setattr(update_sectors, "save_json", pytest.fail)
 
@@ -66,19 +107,43 @@ def test_main_raises_when_coingecko_symbols_empty(monkeypatch):
 
     monkeypatch.setattr(aiohttp, "ClientSession", DummyClientSession)
 
-    with pytest.raises(RuntimeError, match="CoinGecko 코인 목록 조회 결과가 비어 있습니다."):
+    with pytest.raises(update_sectors.SectorUpdateError) as error:
         asyncio.run(update_sectors.main())
+    assert (
+        error.value.code
+        is update_sectors.SectorUpdateErrorCode.COINGECKO_LIST_UNAVAILABLE
+    )
 
 
 def test_main_reraises_save_json_failure(monkeypatch):
     monkeypatch.setattr(update_sectors.config, "STATE_STORAGE_METHOD", "LOCAL")
-    monkeypatch.setattr(update_sectors, "get_upbit_krw_markets", AsyncMock(return_value={"btc": "KRW-BTC"}))
-    monkeypatch.setattr(update_sectors, "get_coingecko_coins_list", AsyncMock(return_value={"btc": "bitcoin"}))
-    monkeypatch.setattr(update_sectors, "tag_market", AsyncMock(return_value=("KRW-BTC", ["Defi"])))
-    monkeypatch.setattr(update_sectors, "load_json", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        update_sectors,
+        "get_upbit_krw_markets",
+        AsyncMock(return_value={"btc": MarketListing(market="KRW-BTC")}),
+    )
+    monkeypatch.setattr(
+        update_sectors,
+        "get_coingecko_coins_list",
+        AsyncMock(return_value={"btc": ["bitcoin"]}),
+    )
+    monkeypatch.setattr(
+        update_sectors,
+        "tag_market",
+        AsyncMock(
+            return_value=SectorTagResult(
+                market="KRW-BTC",
+                status=SectorTagStatus.TAGGED,
+                categories=["Defi"],
+            )
+        ),
+    )
+    monkeypatch.setattr(update_sectors, "load_json", AsyncMock(return_value=None))
 
     async def raise_save(*args, **kwargs):
-        raise RuntimeError("save failed")
+        raise StateSaveError(
+            StateErrorCode.WRITE_FAILED, update_sectors.config.SECTOR_MAP_FILE_NAME
+        )
 
     monkeypatch.setattr(update_sectors, "save_json", raise_save)
 
@@ -91,5 +156,6 @@ def test_main_reraises_save_json_failure(monkeypatch):
 
     monkeypatch.setattr(aiohttp, "ClientSession", DummyClientSession)
 
-    with pytest.raises(RuntimeError, match="save failed"):
+    with pytest.raises(StateSaveError) as error:
         asyncio.run(update_sectors.main())
+    assert error.value.code is StateErrorCode.WRITE_FAILED

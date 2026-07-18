@@ -3,17 +3,23 @@
 import asyncio
 import datetime
 import logging
-import math
 from collections import Counter
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Literal, Optional
+from enum import StrEnum
+from typing import Any, Dict, List, Optional
 from weakref import WeakKeyDictionary
 
 import aiohttp
 from aiolimiter import AsyncLimiter
+from pydantic import ValidationError
 
 import config
-from common.models import CandleData
+from common.models import (
+    CandleData,
+    MarketListing,
+    MarketTicker,
+    OrderBookSnapshot,
+)
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
@@ -25,10 +31,40 @@ _LOOP_LIMITERS = WeakKeyDictionary()
 MAX_CANDLES_PER_REQUEST = 200
 MAX_RETRY_DELAY_SECONDS = 60.0
 
+class UpbitErrorCode(StrEnum):
+    INVALID_CANDLE_REQUEST = "invalid_candle_request"
+    CANDLE_REQUEST_FAILED = "candle_request_failed"
+    INVALID_CANDLE_RESPONSE = "invalid_candle_response"
+    CANDLE_RETRIES_EXHAUSTED = "candle_retries_exhausted"
+    MARKET_LIST_EMPTY = "market_list_empty"
+    INVALID_MARKET_RESPONSE = "invalid_market_response"
+    TICKER_LIST_EMPTY = "ticker_list_empty"
+    TICKER_SCOPE_MISMATCH = "ticker_scope_mismatch"
+    INVALID_TICKER_TURNOVER = "invalid_ticker_turnover"
+    INVALID_TICKER_RESPONSE = "invalid_ticker_response"
+    NETWORK_ERROR = "network_error"
+    UNEXPECTED_ERROR = "unexpected_error"
+
+
+class CandleTimeUnit(StrEnum):
+    MINUTES = "minutes"
+    DAYS = "days"
+
+
 class UpbitAPIError(Exception):
     """Upbit API 호출 실패 시 발생하는 사용자 정의 예외입니다."""
 
-    pass
+    def __init__(
+        self,
+        code: UpbitErrorCode,
+        *,
+        market: str | None = None,
+        details: Dict[str, Any] | None = None,
+    ):
+        super().__init__(code.value)
+        self.code = code
+        self.market = market
+        self.details = details or {}
 
 
 def _global_limiter() -> AsyncLimiter:
@@ -41,24 +77,6 @@ def _global_limiter() -> AsyncLimiter:
     return limiter
 
 
-def _positive_finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-        and float(value) > 0
-    )
-
-
-def _nonnegative_finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-        and float(value) >= 0
-    )
-
-
 def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
     """Interpret Upbit's UTC timestamp strings consistently as aware UTC values."""
     if timestamp.tzinfo is None:
@@ -67,30 +85,36 @@ def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
 
 
 def _candle_grid(
-    time_unit: Literal["minutes", "days", "weeks", "months"],
+    time_unit: CandleTimeUnit,
     minutes_unit: Optional[int],
     as_of: datetime.datetime,
 ) -> tuple[datetime.datetime, datetime.timedelta]:
     """Return the current open candle start and interval in Upbit's UTC grid."""
     now_utc = _as_utc(as_of)
-    if time_unit == "minutes":
+    if time_unit is CandleTimeUnit.MINUTES:
         if not minutes_unit:
-            raise ValueError("minutes_unit is required for minute candles")
+            raise UpbitAPIError(
+                UpbitErrorCode.INVALID_CANDLE_REQUEST,
+                details={"field": "minutes_unit"},
+            )
         interval = datetime.timedelta(minutes=minutes_unit)
         elapsed = now_utc - datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
         current_start = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) + (
             elapsed // interval
         ) * interval
-    elif time_unit == "days":
+    elif time_unit is CandleTimeUnit.DAYS:
         interval = datetime.timedelta(days=1)
         current_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
-        raise ValueError(f"Unsupported candle integrity grid: {time_unit}")
+        raise UpbitAPIError(
+            UpbitErrorCode.INVALID_CANDLE_REQUEST,
+            details={"field": "time_unit", "value": time_unit},
+        )
     return current_start, interval
 
 
 def _expected_candle_starts(
-    time_unit: Literal["minutes", "days", "weeks", "months"],
+    time_unit: CandleTimeUnit,
     count: int,
     minutes_unit: Optional[int],
     as_of: datetime.datetime,
@@ -104,7 +128,7 @@ def _expected_candle_starts(
 
 def normalize_completed_candles(
     candles: List[CandleData],
-    time_unit: Literal["minutes", "days", "weeks", "months"],
+    time_unit: CandleTimeUnit,
     count: int,
     minutes_unit: Optional[int] = None,
     as_of: Optional[datetime.datetime] = None,
@@ -137,15 +161,20 @@ def normalize_sparse_completed_candles(
     if not candles:
         return []
 
-    current_start, _ = _candle_grid("minutes", minutes_unit, as_of)
-    expected_starts = _expected_candle_starts("minutes", count, minutes_unit, as_of)
+    current_start, _ = _candle_grid(CandleTimeUnit.MINUTES, minutes_unit, as_of)
+    expected_starts = _expected_candle_starts(
+        CandleTimeUnit.MINUTES, count, minutes_unit, as_of
+    )
     market = candles[0].market
     candles_by_start: Dict[datetime.datetime, CandleData] = {}
     for candle in candles:
         timestamp = _as_utc(candle.timestamp)
         if candle.market != market or timestamp >= current_start:
             return []
-        if _candle_grid("minutes", minutes_unit, timestamp)[0] != timestamp:
+        if (
+            _candle_grid(CandleTimeUnit.MINUTES, minutes_unit, timestamp)[0]
+            != timestamp
+        ):
             return []
         if timestamp in candles_by_start:
             return []
@@ -249,11 +278,15 @@ async def _request_candle_page(
                 error,
             )
             if attempt == max_retries - 1:
-                raise UpbitAPIError(f"{market}: candle request failed") from error
+                raise UpbitAPIError(
+                    UpbitErrorCode.CANDLE_REQUEST_FAILED, market=market
+                ) from error
             await asyncio.sleep(2**attempt)
         except ValueError as error:
-            raise UpbitAPIError(f"{market}: invalid candle response") from error
-    raise UpbitAPIError(f"{market}: candle request exhausted retries")
+            raise UpbitAPIError(
+                UpbitErrorCode.INVALID_CANDLE_RESPONSE, market=market
+            ) from error
+    raise UpbitAPIError(UpbitErrorCode.CANDLE_RETRIES_EXHAUSTED, market=market)
 
 
 def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleData]:
@@ -261,24 +294,6 @@ def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleDa
     for item in page:
         if not isinstance(item, dict) or item.get("market") != market:
             raise ValueError(f"{market}: candle response market mismatch")
-        price_fields = (
-            "opening_price",
-            "high_price",
-            "low_price",
-            "trade_price",
-        )
-        if not all(_positive_finite_number(item.get(field)) for field in price_fields):
-            raise ValueError(f"{market}: candle prices must be positive finite numbers")
-        if not _nonnegative_finite_number(item.get("candle_acc_trade_volume")):
-            raise ValueError(f"{market}: candle volume must be a nonnegative finite number")
-        open_price = float(item["opening_price"])
-        high_price = float(item["high_price"])
-        low_price = float(item["low_price"])
-        close_price = float(item["trade_price"])
-        if low_price > min(open_price, close_price) or high_price < max(
-            open_price, close_price
-        ):
-            raise ValueError(f"{market}: candle OHLC values are inconsistent")
         candles.append(
             CandleData.model_validate(
                 {
@@ -288,11 +303,11 @@ def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleDa
                             item["candle_date_time_utc"].replace("Z", "+00:00")
                         )
                     ),
-                    "open_price": open_price,
-                    "high_price": high_price,
-                    "low_price": low_price,
-                    "close_price": close_price,
-                    "volume": float(item["candle_acc_trade_volume"]),
+                    "open_price": item["opening_price"],
+                    "high_price": item["high_price"],
+                    "low_price": item["low_price"],
+                    "close_price": item["trade_price"],
+                    "volume": item["candle_acc_trade_volume"],
                 }
             )
         )
@@ -312,7 +327,10 @@ def _same_slot_candle(
         raise ValueError(f"{market}: expected one same-slot seed candle")
     candle = candles[0]
     timestamp = _as_utc(candle.timestamp)
-    if _candle_grid("minutes", minutes_unit, timestamp)[0] != timestamp:
+    if (
+        _candle_grid(CandleTimeUnit.MINUTES, minutes_unit, timestamp)[0]
+        != timestamp
+    ):
         raise ValueError(f"{market}: off-grid same-slot seed candle")
     if timestamp > target:
         raise ValueError(f"{market}: same-slot seed is newer than its cutoff")
@@ -329,21 +347,46 @@ def _same_slot_candle(
     )
 
 # --- API 호출 함수 ---
-async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+async def get_all_krw_tickers(
+    session: aiohttp.ClientSession,
+) -> List[MarketTicker]:
     """Upbit의 모든 KRW 마켓 티커 정보를 가져옵니다."""
     try:
         async with session.get(
-            f"{UPBIT_API_BASE_URL}/market/all", timeout=10
+            f"{UPBIT_API_BASE_URL}/market/all",
+            params={"is_details": "true"},
+            timeout=10,
         ) as response:
             response.raise_for_status()
             markets_data = await response.json()
-            krw_markets = [
-                m["market"] for m in markets_data if m["market"].startswith("KRW-")
-            ]
-            warnings = {m["market"]: m.get("market_warning") for m in markets_data}
+            if not isinstance(markets_data, list):
+                raise UpbitAPIError(UpbitErrorCode.INVALID_MARKET_RESPONSE)
+            listings = []
+            for row in markets_data:
+                if not isinstance(row, dict) or not isinstance(row.get("market"), str):
+                    raise UpbitAPIError(UpbitErrorCode.INVALID_MARKET_RESPONSE)
+                if not row["market"].startswith("KRW-"):
+                    continue
+                try:
+                    listing = MarketListing.model_validate(row)
+                except ValidationError as error:
+                    raise UpbitAPIError(
+                        UpbitErrorCode.INVALID_MARKET_RESPONSE,
+                        market=row["market"],
+                    ) from error
+                if listing.market_event is None:
+                    raise UpbitAPIError(
+                        UpbitErrorCode.INVALID_MARKET_RESPONSE,
+                        market=listing.market,
+                    )
+                listings.append(listing)
+            krw_markets = [listing.market for listing in listings]
+            market_events = {
+                listing.market: listing.market_event for listing in listings
+            }
 
         if not krw_markets:
-            raise UpbitAPIError("KRW 마켓 목록을 가져오지 못했습니다.")
+            raise UpbitAPIError(UpbitErrorCode.MARKET_LIST_EMPTY)
 
         params = {"markets": ",".join(krw_markets)}
         async with session.get(
@@ -352,7 +395,7 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
             response.raise_for_status()
             tickers = await response.json()
             if not isinstance(tickers, list) or not tickers:
-                raise UpbitAPIError("티커 정보를 가져오지 못했습니다.")
+                raise UpbitAPIError(UpbitErrorCode.TICKER_LIST_EMPTY)
             requested_markets = set(krw_markets)
             ticker_markets = [
                 ticker.get("market") if isinstance(ticker, dict) else None
@@ -375,30 +418,53 @@ async def get_all_krw_tickers(session: aiohttp.ClientSession) -> List[Dict[str, 
                 or len(tickers) != len(krw_markets)
             ):
                 raise UpbitAPIError(
-                    "티커 응답의 KRW 마켓 범위가 목록과 일치하지 않습니다. "
-                    f"missing={missing_markets[:10]}, unexpected={unexpected_markets[:10]}, "
-                    f"duplicates={duplicate_markets[:10]}, invalid_rows={invalid_rows}"
+                    UpbitErrorCode.TICKER_SCOPE_MISMATCH,
+                    details={
+                        "missing": missing_markets,
+                        "unexpected": unexpected_markets,
+                        "duplicates": duplicate_markets,
+                        "invalid_rows": invalid_rows,
+                    },
                 )
+            parsed_tickers = []
             for ticker in tickers:
                 market = ticker["market"]
-                if not _positive_finite_number(ticker.get("acc_trade_price_24h")):
-                    raise UpbitAPIError(
-                        f"{market}: acc_trade_price_24h must be a positive finite number"
+                try:
+                    parsed_tickers.append(
+                        MarketTicker.model_validate(
+                            {
+                                **ticker,
+                                "market_event": market_events[market],
+                            }
+                        )
                     )
-                ticker["market_warning"] = warnings.get(ticker["market"])
-            return tickers
+                except ValidationError as error:
+                    code = (
+                        UpbitErrorCode.INVALID_TICKER_TURNOVER
+                        if any(
+                            tuple(issue["loc"]) == ("acc_trade_price_24h",)
+                            for issue in error.errors()
+                        )
+                        else UpbitErrorCode.INVALID_TICKER_RESPONSE
+                    )
+                    raise UpbitAPIError(
+                        code, market=market
+                    ) from error
+            return parsed_tickers
 
     except UpbitAPIError:
         raise
     except aiohttp.ClientError as e:
         logger.error(f"Upbit API 클라이언트 오류 (get_all_krw_tickers): {e}")
-        raise UpbitAPIError(f"네트워크/클라이언트 오류: {e}") from e
+        raise UpbitAPIError(UpbitErrorCode.NETWORK_ERROR) from e
     except Exception as e:
         logger.error(f"Upbit API 예상치 못한 오류 (get_all_krw_tickers): {e}")
-        raise UpbitAPIError(f"알 수 없는 오류: {e}") from e
+        raise UpbitAPIError(UpbitErrorCode.UNEXPECTED_ERROR) from e
 
 
-async def get_orderbooks(session: aiohttp.ClientSession, markets: List[str]) -> Dict[str, Dict[str, Any]]:
+async def get_orderbooks(
+    session: aiohttp.ClientSession, markets: List[str]
+) -> Dict[str, OrderBookSnapshot]:
     """Fetch orderbook snapshots; callers must fail closed for missing markets."""
     if not markets:
         return {}
@@ -413,25 +479,27 @@ async def get_orderbooks(session: aiohttp.ClientSession, markets: List[str]) -> 
                     raise ValueError("orderbook response must be a list")
                 requested_markets = set(markets)
                 orderbooks = {}
-                for book in payload:
-                    market = book.get("market") if isinstance(book, dict) else None
-                    units = book.get("orderbook_units") if isinstance(book, dict) else None
-                    valid_units = isinstance(units, list) and bool(units) and all(
-                        isinstance(unit, dict)
-                        and all(
-                            _positive_finite_number(unit.get(field))
-                            for field in ("bid_price", "bid_size", "ask_price", "ask_size")
+                for raw_book in payload:
+                    try:
+                        book = OrderBookSnapshot.model_validate(raw_book)
+                    except ValidationError:
+                        market = (
+                            raw_book.get("market")
+                            if isinstance(raw_book, dict)
+                            else None
                         )
-                        for unit in units
-                    )
-                    if (
-                        market not in requested_markets
-                        or market in orderbooks
-                        or not valid_units
-                    ):
-                        logger.warning("Ignoring malformed orderbook row for market %s", market)
+                        if market in requested_markets:
+                            logger.warning(
+                                "Ignoring malformed orderbook row for market %s",
+                                market,
+                            )
                         continue
-                    orderbooks[market] = book
+                    if (
+                        book.market not in requested_markets
+                        or book.market in orderbooks
+                    ):
+                        continue
+                    orderbooks[book.market] = book
                 return orderbooks
     except (aiohttp.ClientError, ValueError) as error:
         logger.warning("Orderbook collection failed: %s", error)
@@ -441,7 +509,7 @@ async def get_orderbooks(session: aiohttp.ClientSession, markets: List[str]) -> 
 async def get_candles(
     session: aiohttp.ClientSession,
     markets: List[str],
-    time_unit: Literal["minutes", "days", "weeks", "months"],
+    time_unit: CandleTimeUnit,
     count: int = 200,
     minutes_unit: Optional[int] = None,
     as_of: Optional[datetime.datetime] = None,
@@ -449,12 +517,12 @@ async def get_candles(
     same_slot_lookback_weeks: int = 0,
 ) -> Dict[str, List[CandleData]]:
     """
-    지정된 시간 단위(분, 일, 주, 월)에 대한 캔들 데이터를 병렬로 가져옵니다.
+    지정된 시간 단위(분, 일)에 대한 캔들 데이터를 병렬로 가져옵니다.
 
     Args:
         session: aiohttp ClientSession.
         markets: 마켓 코드 리스트.
-        time_unit: 'minutes', 'days', 'weeks', 'months' 중 하나.
+        time_unit: `CandleTimeUnit.MINUTES` 또는 `CandleTimeUnit.DAYS`.
         count: strict mode에서는 요청할 캔들 수, sparse mode에서는 최근 clock bar 수.
         minutes_unit: 분봉일 경우, 분 단위 (e.g., 1, 3, 5, 10, ...).
         synthesize_no_trade_intervals: 거래가 없어서 생략된 최근 분봉을 carry-forward로 채웁니다.
@@ -463,25 +531,34 @@ async def get_candles(
     if not markets:
         return {}
     if count <= 0 or same_slot_lookback_weeks < 0:
-        raise ValueError("candle counts must be positive")
+        raise UpbitAPIError(
+            UpbitErrorCode.INVALID_CANDLE_REQUEST,
+            details={"field": "count"},
+        )
     if synthesize_no_trade_intervals and (
-        time_unit != "minutes" or not minutes_unit or count >= MAX_CANDLES_PER_REQUEST
+        time_unit is not CandleTimeUnit.MINUTES
+        or not minutes_unit
+        or count >= MAX_CANDLES_PER_REQUEST
     ):
-        raise ValueError(
-            "bounded no-trade synthesis requires minute candles and fewer than 200 recent bars"
+        raise UpbitAPIError(
+            UpbitErrorCode.INVALID_CANDLE_REQUEST,
+            details={"field": "synthesize_no_trade_intervals"},
         )
     if same_slot_lookback_weeks and not synthesize_no_trade_intervals:
-        raise ValueError("same-slot lookback requires no-trade interval synthesis")
+        raise UpbitAPIError(
+            UpbitErrorCode.INVALID_CANDLE_REQUEST,
+            details={"field": "same_slot_lookback_weeks"},
+        )
 
     request_as_of = as_of or datetime.datetime.now(datetime.timezone.utc)
     request_cutoff, _ = _candle_grid(time_unit, minutes_unit, request_as_of)
 
     async def _fetch_single_market(market: str) -> tuple[str, List[CandleData]]:
         """단일 마켓의 캔들 데이터를 가져오는 내부 헬퍼 함수입니다."""
-        if time_unit == "minutes":
+        if time_unit is CandleTimeUnit.MINUTES:
             url = f"{UPBIT_API_BASE_URL}/candles/minutes/{minutes_unit}"
         else:
-            url = f"{UPBIT_API_BASE_URL}/candles/{time_unit}"
+            url = f"{UPBIT_API_BASE_URL}/candles/{time_unit.value}"
         if synthesize_no_trade_intervals:
             try:
                 recent_page = await _request_candle_page(
@@ -525,6 +602,12 @@ async def get_candles(
                     )
                     if sample is not None:
                         same_slot_candles.append(sample)
+                if len(same_slot_candles) != same_slot_lookback_weeks:
+                    logger.warning(
+                        "%s: rejected candle history with incomplete weekly same-slot coverage.",
+                        market,
+                    )
+                    return market, []
                 return market, [*same_slot_candles, *recent_candles]
             except (UpbitAPIError, KeyError, TypeError, ValueError) as error:
                 logger.warning("%s: sparse candle collection failed: %s", market, error)

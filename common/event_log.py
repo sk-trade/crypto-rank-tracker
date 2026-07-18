@@ -1,11 +1,24 @@
 """Build immutable scan events and resolve their later execution-aware outcomes."""
 
 import datetime
+import logging
 from typing import Dict, Iterable, List, Tuple
 
 import config
-from common.analysis.scanner import CandidateDecision
-from common.models import Alert, CandleData, ScanEvent, ScanOutcome, SignalCandidate, TickerData
+from common.models import (
+    Alert,
+    CandidateDecision,
+    CandleData,
+    DataQualityIssue,
+    Direction,
+    MarketTicker,
+    RejectionCode,
+    ScanDecision,
+    ScanEvent,
+    ScanOutcome,
+    SignalCandidate,
+    TickerData,
+)
 from common.outcomes import (
     PRIMARY_PERFORMANCE_TARGET,
     directional_net_return,
@@ -13,27 +26,32 @@ from common.outcomes import (
 )
 
 
+logger = logging.getLogger(config.APP_LOGGER_NAME)
+
+
 _EXECUTION_REJECTION_REASONS = frozenset(
     {
-        "market_warning",
-        "daily_turnover_below_minimum",
-        "orderbook_unavailable",
-        "orderbook_invalid",
-        "orderbook_depth_below_notional",
-        "spread_above_maximum",
-        "slippage_above_maximum",
-        "move_does_not_cover_estimated_costs",
+        RejectionCode.MARKET_WARNING,
+        RejectionCode.DAILY_TURNOVER_BELOW_MINIMUM,
+        RejectionCode.ORDERBOOK_UNAVAILABLE,
+        RejectionCode.ORDERBOOK_INVALID,
+        RejectionCode.ORDERBOOK_DEPTH_BELOW_NOTIONAL,
+        RejectionCode.SPREAD_ABOVE_MAXIMUM,
+        RejectionCode.SLIPPAGE_ABOVE_MAXIMUM,
+        RejectionCode.MOVE_DOES_NOT_COVER_ESTIMATED_COSTS,
     }
 )
 
 
-def _final_decision_for_rejected_candidate(reasons: List[str]) -> str:
+def _final_decision_for_rejected_candidate(
+    reasons: List[RejectionCode],
+) -> ScanDecision:
     """Keep the gate that rejected a candidate visible to later model analysis."""
-    if "market_regime_unknown" in reasons:
-        return "market_regime_blocked"
+    if RejectionCode.MARKET_REGIME_UNKNOWN in reasons:
+        return ScanDecision.MARKET_REGIME_BLOCKED
     if _EXECUTION_REJECTION_REASONS.intersection(reasons):
-        return "execution_blocked"
-    return "rejected_lightweight"
+        return ScanDecision.EXECUTION_BLOCKED
+    return ScanDecision.REJECTED_LIGHTWEIGHT
 
 
 def build_scan_events(
@@ -44,8 +62,8 @@ def build_scan_events(
     deep_dive_candidates: Iterable[str],
     alerts: Iterable[Alert],
     candidates: Iterable[SignalCandidate] = (),
-    data_quality_issues: Iterable[str] = (),
-    raw_tickers_by_market: Dict[str, dict] | None = None,
+    data_quality_issues: Iterable[DataQualityIssue] = (),
+    raw_tickers_by_market: Dict[str, MarketTicker] | None = None,
 ) -> List[ScanEvent]:
     """Capture every market's pre-decision state, including rejection paths."""
     deep_dive_markets = set(deep_dive_candidates)
@@ -66,30 +84,39 @@ def build_scan_events(
             else {}
         )
         if raw_ticker := raw_tickers_by_market.get(market):
-            feature_snapshot["raw_ticker"] = raw_ticker
-        eligible = decision.eligible if decision else False
-        reasons = list(decision.rejection_reasons) if decision else ["complete_candle_history_unavailable"]
+            feature_snapshot["raw_ticker"] = raw_ticker.model_dump(mode="json")
         if quality_issues:
-            final_decision = "data_quality_blocked"
-            reasons.extend(quality_issues)
+            feature_snapshot["data_quality_issues"] = [
+                issue.model_dump(mode="json") for issue in quality_issues
+            ]
+        eligible = decision.eligible if decision else False
+        reasons = (
+            list(decision.rejection_reasons)
+            if decision
+            else [RejectionCode.COMPLETE_CANDLE_HISTORY_UNAVAILABLE]
+        )
+        if quality_issues:
+            final_decision = ScanDecision.DATA_QUALITY_BLOCKED
+            reasons.extend(issue.code for issue in quality_issues)
         elif not ticker:
-            final_decision = "data_quality_blocked"
+            final_decision = ScanDecision.DATA_QUALITY_BLOCKED
         elif not eligible:
             final_decision = _final_decision_for_rejected_candidate(reasons)
         elif market not in deep_dive_markets:
-            final_decision = "deep_dive_data_blocked"
-            reasons.append("higher_timeframe_candle_history_unavailable")
+            final_decision = ScanDecision.DEEP_DIVE_DATA_BLOCKED
+            reasons.append(RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE)
         elif market in alerts_by_market:
-            final_decision = "alert_selected"
+            final_decision = ScanDecision.ALERT_SELECTED
         else:
-            final_decision = "candidate_not_alerted"
+            final_decision = ScanDecision.CANDIDATE_NOT_ALERTED
 
         direction = None
         signal_candle_start = None
         if ticker and ticker.candle_history and ticker.price_change_10m:
-            direction = "long" if ticker.price_change_10m > 0 else "short"
+            direction = (
+                Direction.LONG if ticker.price_change_10m > 0 else Direction.SHORT
+            )
             signal_candle_start = ticker.candle_history[-1].timestamp
-        alert = alerts_by_market.get(market)
         candidate = candidates_by_market.get(market)
         events.append(
             ScanEvent(
@@ -98,7 +125,7 @@ def build_scan_events(
                 market=market,
                 feature_snapshot=feature_snapshot,
                 candidate_eligible=eligible,
-                rejection_reasons=sorted(set(reasons)),
+                rejection_reasons=sorted(set(reasons), key=lambda reason: reason.value),
                 final_decision=final_decision,
                 model_version=config.SIGNAL_MODEL_VERSION,
                 direction=direction,
@@ -112,11 +139,26 @@ def build_scan_events(
 def resolve_scan_outcomes(
     events: Iterable[ScanEvent], candles_by_market: Dict[str, List[CandleData]]
 ) -> Tuple[List[ScanOutcome], List[ScanEvent]]:
-    """Resolve only events whose entry, exit, and complete holding path are available."""
+    """Resolve available outcomes and retire events outside the recovery window."""
     outcomes = []
     pending = []
     interval = datetime.timedelta(minutes=PRIMARY_PERFORMANCE_TARGET.execution_timeframe_minutes)
     holding = datetime.timedelta(minutes=PRIMARY_PERFORMANCE_TARGET.holding_period_minutes)
+    latest_completed = max(
+        (
+            candle.timestamp
+            for candles in candles_by_market.values()
+            for candle in candles
+        ),
+        default=None,
+    )
+    recovery_start = (
+        latest_completed
+        - interval * (config.RECENT_SCAN_HISTORY_BARS - 1)
+        if latest_completed is not None
+        else None
+    )
+    expired_event_ids = []
 
     for event in events:
         if not event.direction or not event.signal_candle_start:
@@ -131,6 +173,9 @@ def resolve_scan_outcomes(
             for offset in range(PRIMARY_PERFORMANCE_TARGET.holding_period_bars)
         ]
         if not entry or not exit_candle or any(candle is None for candle in path):
+            if recovery_start is not None and exit_start < recovery_start:
+                expired_event_ids.append(event.event_id)
+                continue
             pending.append(event)
             continue
         completed_path = [candle for candle in path if candle is not None]
@@ -154,5 +199,11 @@ def resolve_scan_outcomes(
                 mfe=mfe,
                 mae=mae,
             )
+        )
+    if expired_event_ids:
+        logger.warning(
+            "Retired %d unresolved outcome event(s) outside the candle recovery window: %s",
+            len(expired_event_ids),
+            ", ".join(expired_event_ids[:10]),
         )
     return outcomes, pending

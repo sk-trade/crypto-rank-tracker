@@ -5,28 +5,61 @@ import fcntl
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import config
-from common.models import AlertHistory, AnalysisState, RankState, ScanEvent, ScanOutcome
-from common.storage_client import StateBackendUnavailable, StateLoadError, load_json, save_json
+from common.models import (
+    AlertHistory,
+    AnalysisState,
+    NotificationBacklog,
+    NotificationOutbox,
+    RankState,
+    ScanClaim,
+    ScanClaimState,
+    ScanClaimStatus,
+    ScanEvent,
+    ScanOutcome,
+    SignalType,
+    StructureDirection,
+)
+from common.storage_client import (
+    StateBackendUnavailable,
+    StateErrorCode,
+    StateLoadError,
+    StateOperationError,
+    StateSaveError,
+    load_json,
+    save_json,
+)
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 IDEMPOTENCY_STATE_FILE_NAME = "processed_scan_keys.json"
 NOTIFICATION_OUTBOX_FILE_NAME = "notification_outbox.json"
 NOTIFICATION_BACKLOG_FILE_NAME = "notification_backlog.json"
 SCAN_CLAIM_LEASE_SECONDS = 600
+PersistedRecord = TypeVar("PersistedRecord", bound=BaseModel)
+
+
+class _LegacyCompletedScanClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scan_key: str = Field(min_length=1)
 
 
 # --- 순위 상태 관리 ---
 
 
+def _ordered_rank_states(states: List[RankState]) -> List[RankState]:
+    states_by_timestamp = {state.last_updated: state for state in states}
+    return sorted(states_by_timestamp.values(), key=lambda state: state.last_updated)
+
+
 async def load_rank_state_history(gcs_client=None) -> List[RankState]:
     """'순위' 상태 히스토리 리스트를 로드합니다."""
     filename = config.RANK_STATE_FILE_NAME
-    data = await load_json(filename, gcs_client)
+    data = await load_json(filename, gcs_client, reject_null=True)
 
     if data is None:
         logger.info(f"순위 상태 파일({filename})이 없어 초기 상태로 시작합니다.")
@@ -37,13 +70,13 @@ async def load_rank_state_history(gcs_client=None) -> List[RankState]:
         data = [data]
     elif not isinstance(data, list):
         raise StateLoadError(
-            f"순위 상태 형식 오류 ({filename}): JSON array 또는 legacy object가 필요합니다."
+            StateErrorCode.INVALID_SCHEMA, filename
         )
 
     try:
-        return [RankState.model_validate(s) for s in data]
+        return _ordered_rank_states([RankState.model_validate(s) for s in data])
     except ValidationError as error:
-        raise StateLoadError(f"순위 상태 내용 오류 ({filename})") from error
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename) from error
 
 
 async def save_rank_state_history(
@@ -52,8 +85,7 @@ async def save_rank_state_history(
     """새로운 '순위' 상태를 히스토리에 추가하여 저장합니다."""
     filename = config.RANK_STATE_FILE_NAME
 
-    updated_states = [state for state in old_states if state.last_updated != new_state.last_updated]
-    updated_states.append(new_state)
+    updated_states = _ordered_rank_states([*old_states, new_state])
     if len(updated_states) > config.STATE_HISTORY_COUNT:
         updated_states = updated_states[-config.STATE_HISTORY_COUNT:]
 
@@ -67,8 +99,7 @@ async def save_rank_state_history(
 
 def get_daily_log_filename() -> str:
     """오늘 날짜 기반의 로그 파일 이름을 반환합니다."""
-    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    return f"analysis_log_{today}.json"
+    return _get_daily_filename("analysis_log")
 
 
 def _get_daily_filename(prefix: str) -> str:
@@ -76,31 +107,108 @@ def _get_daily_filename(prefix: str) -> str:
     return f"{prefix}_{today}.json"
 
 
-async def _append_records(filename: str, records: List[ScanEvent] | List[ScanOutcome], gcs_client=None):
-    existing = await load_json(filename, gcs_client)
-    if not isinstance(existing, list):
-        existing = []
+def _get_hourly_filename(prefix: str, timestamp: datetime.datetime) -> str:
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise StateOperationError(
+            StateErrorCode.INVALID_ARGUMENT, f"{prefix}_timestamp"
+        )
+    hour = timestamp.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H")
+    return f"{prefix}_{hour}Z.json"
+
+
+def _validate_record_list(
+    filename: str, data: Any, record_type: type[PersistedRecord]
+) -> List[PersistedRecord]:
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename)
+    try:
+        return [record_type.model_validate(item) for item in data]
+    except ValidationError as error:
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename) from error
+
+
+async def _append_records(
+    filename: str,
+    records: List[PersistedRecord],
+    record_type: type[PersistedRecord],
+    gcs_client=None,
+) -> List[str]:
+    existing = await load_json(filename, gcs_client, reject_null=True)
+    existing_records = _validate_record_list(filename, existing, record_type)
     records_by_id = {
-        item.get("event_id"): item
-        for item in existing
-        if isinstance(item, dict) and item.get("event_id")
+        item.event_id: item.model_dump(mode="json") for item in existing_records
     }
-    for record in records:
-        records_by_id[record.event_id] = record.model_dump(mode="json")
+    incoming_by_id = {
+        record.event_id: record.model_dump(mode="json") for record in records
+    }
+    conflicting_ids = []
+    for event_id, payload in incoming_by_id.items():
+        existing_payload = records_by_id.get(event_id)
+        if existing_payload is None:
+            continue
+        elif existing_payload != payload:
+            conflicting_ids.append(event_id)
+    if conflicting_ids:
+        logger.error(
+            "Preserved %d immutable record(s) in %s after conflicting retry data: %s",
+            len(conflicting_ids),
+            filename,
+            ", ".join(conflicting_ids[:10]),
+        )
+    else:
+        records_by_id.update(incoming_by_id)
     await save_json(filename, list(records_by_id.values()), gcs_client)
+    return conflicting_ids
+
+
+async def _append_partitioned_records(
+    prefix: str,
+    records: List[PersistedRecord],
+    record_type: type[PersistedRecord],
+    timestamp_for_record: Callable[[PersistedRecord], datetime.datetime],
+    gcs_client=None,
+) -> List[str]:
+    records_by_file: Dict[str, List[PersistedRecord]] = {}
+    for record in records:
+        filename = _get_hourly_filename(prefix, timestamp_for_record(record))
+        records_by_file.setdefault(filename, []).append(record)
+
+    conflicting_ids = []
+    for filename in sorted(records_by_file):
+        conflicting_ids.extend(
+            await _append_records(
+                filename, records_by_file[filename], record_type, gcs_client
+            )
+        )
+    return conflicting_ids
 
 
 async def append_scan_events(events: List[ScanEvent], gcs_client=None):
-    await _append_records(_get_daily_filename("scan_events"), events, gcs_client)
+    return await _append_partitioned_records(
+        "scan_events",
+        events,
+        ScanEvent,
+        lambda event: event.observed_at,
+        gcs_client,
+    )
 
 
 async def append_scan_outcomes(outcomes: List[ScanOutcome], gcs_client=None):
-    await _append_records(_get_daily_filename("scan_outcomes"), outcomes, gcs_client)
+    return await _append_partitioned_records(
+        "scan_outcomes",
+        outcomes,
+        ScanOutcome,
+        lambda outcome: outcome.exit_candle_start,
+        gcs_client,
+    )
 
 
 async def load_pending_scan_events(gcs_client=None) -> List[ScanEvent]:
-    data = await load_json("pending_scan_events.json", gcs_client)
-    return [ScanEvent.model_validate(item) for item in data] if isinstance(data, list) else []
+    filename = "pending_scan_events.json"
+    data = await load_json(filename, gcs_client, reject_null=True)
+    return _validate_record_list(filename, data, ScanEvent)
 
 
 async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
@@ -112,20 +220,41 @@ async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
     )
 
 
+def _validate_scan_key(scan_key: Any) -> str:
+    if not isinstance(scan_key, str) or not scan_key:
+        raise StateOperationError(StateErrorCode.INVALID_ARGUMENT, "scan_key")
+    return scan_key
+
+
+def _validate_execution_id(execution_id: Any) -> str | None:
+    if execution_id is not None and (
+        not isinstance(execution_id, str) or not execution_id
+    ):
+        raise StateOperationError(StateErrorCode.INVALID_ARGUMENT, "execution_id")
+    return execution_id
+
+
 async def claim_scan_key(scan_key: str, execution_id: str | None = None, gcs_client=None) -> bool:
     """Atomically acquire or resume an in-progress completed-candle scan."""
-    if config.STATE_STORAGE_METHOD == "GCS":
+    scan_key = _validate_scan_key(scan_key)
+    execution_id = _validate_execution_id(execution_id)
+    if config.storage_method() is config.StorageMethod.GCS:
         if gcs_client is None:
-            raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
+            raise StateBackendUnavailable(
+                StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
+            )
         return await _claim_scan_key_in_gcs(scan_key, execution_id, gcs_client)
     return await asyncio.to_thread(_claim_scan_key_locally, scan_key, execution_id)
 
 
 async def complete_scan_key(scan_key: str, gcs_client=None) -> None:
     """Mark a claimed scan complete after its durable state or outbox handoff exists."""
-    if config.STATE_STORAGE_METHOD == "GCS":
+    scan_key = _validate_scan_key(scan_key)
+    if config.storage_method() is config.StorageMethod.GCS:
         if gcs_client is None:
-            raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
+            raise StateBackendUnavailable(
+                StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
+            )
         await _complete_scan_key_in_gcs(scan_key, gcs_client)
         return
     await asyncio.to_thread(_complete_scan_key_locally, scan_key)
@@ -133,62 +262,83 @@ async def complete_scan_key(scan_key: str, gcs_client=None) -> None:
 
 async def release_scan_key(scan_key: str, gcs_client=None) -> None:
     """Release a claim when a scan fails before external notification begins."""
-    if config.STATE_STORAGE_METHOD == "GCS":
+    scan_key = _validate_scan_key(scan_key)
+    if config.storage_method() is config.StorageMethod.GCS:
         if gcs_client is None:
-            raise StateBackendUnavailable("GCS state storage requires an initialized GCS client")
+            raise StateBackendUnavailable(
+                StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
+            )
         await _release_scan_key_in_gcs(scan_key, gcs_client)
         return
     await asyncio.to_thread(_release_scan_key_locally, scan_key)
 
 
-def _claim_status(claim: Dict[str, Any]) -> str:
-    # Legacy claim records were permanent completion markers.
-    return claim.get("status", "completed")
+def _parse_scan_claim_state(state: Any) -> ScanClaimState:
+    try:
+        if isinstance(state, dict) and isinstance(state.get("claims"), list):
+            claims = []
+            for claim in state["claims"]:
+                if isinstance(claim, dict) and "status" not in claim:
+                    legacy = _LegacyCompletedScanClaim.model_validate(claim)
+                    claims.append(
+                        ScanClaim(
+                            scan_key=legacy.scan_key,
+                            status=ScanClaimStatus.COMPLETED,
+                        )
+                    )
+                else:
+                    claims.append(claim)
+            state = {**state, "claims": claims}
+        return ScanClaimState.model_validate(state)
+    except ValidationError as error:
+        raise StateLoadError(
+            StateErrorCode.INVALID_SCHEMA, IDEMPOTENCY_STATE_FILE_NAME
+        ) from error
+
+
+def _decode_scan_claim_state(raw_state: str) -> ScanClaimState:
+    try:
+        state = json.loads(raw_state)
+    except json.JSONDecodeError as error:
+        raise StateLoadError(
+            StateErrorCode.INVALID_JSON, IDEMPOTENCY_STATE_FILE_NAME
+        ) from error
+    return _parse_scan_claim_state(state)
 
 
 def _claim_can_resume(
-    claim: Dict[str, Any], execution_id: str | None, now: datetime.datetime
+    claim: ScanClaim, execution_id: str | None, now: datetime.datetime
 ) -> bool:
-    if _claim_status(claim) != "in_progress":
+    if claim.status is not ScanClaimStatus.IN_PROGRESS:
         return False
-    if execution_id and claim.get("execution_id") == execution_id:
+    if execution_id and claim.execution_id == execution_id:
         return True
-    try:
-        claimed_at = datetime.datetime.fromisoformat(claim["claimed_at"])
-        if claimed_at.tzinfo is None:
-            claimed_at = claimed_at.replace(tzinfo=datetime.timezone.utc)
-    except (KeyError, TypeError, ValueError):
-        return True
-    return (now - claimed_at.astimezone(datetime.timezone.utc)).total_seconds() > SCAN_CLAIM_LEASE_SECONDS
+    return (now - claim.claimed_at).total_seconds() > SCAN_CLAIM_LEASE_SECONDS
 
 
 def _acquire_claim(
-    claims: List[Dict[str, Any]], scan_key: str, execution_id: str | None
-) -> tuple[bool, List[Dict[str, Any]]]:
+    state: ScanClaimState, scan_key: str, execution_id: str | None
+) -> tuple[bool, ScanClaimState]:
     now = datetime.datetime.now(datetime.timezone.utc)
-    for claim in claims:
-        if claim.get("scan_key") != scan_key:
+    for claim in state.claims:
+        if claim.scan_key != scan_key:
             continue
         if not _claim_can_resume(claim, execution_id, now):
-            return False, claims
-        claim.update(
-            {
-                "execution_id": execution_id,
-                "claimed_at": now.isoformat(),
-                "status": "in_progress",
-            }
+            return False, state
+        claim.execution_id = execution_id
+        claim.claimed_at = now
+        claim.status = ScanClaimStatus.IN_PROGRESS
+        claim.completed_at = None
+        return True, state
+    state.claims.append(
+        ScanClaim(
+            scan_key=scan_key,
+            execution_id=execution_id,
+            claimed_at=now,
+            status=ScanClaimStatus.IN_PROGRESS,
         )
-        claim.pop("completed_at", None)
-        return True, claims
-    claims.append(
-        {
-            "scan_key": scan_key,
-            "execution_id": execution_id,
-            "claimed_at": now.isoformat(),
-            "status": "in_progress",
-        }
     )
-    return True, claims
+    return True, state
 
 
 def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
@@ -200,17 +350,16 @@ def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
         try:
             try:
                 with open(state_path, encoding="utf-8") as state_file:
-                    state = json.load(state_file)
+                    state = _decode_scan_claim_state(state_file.read())
             except FileNotFoundError:
-                state = {"claims": []}
-            claims = state.get("claims", []) if isinstance(state, dict) else []
-            acquired, claims = _acquire_claim(claims, scan_key, execution_id)
+                state = ScanClaimState()
+            acquired, state = _acquire_claim(state, scan_key, execution_id)
             if not acquired:
                 return False
-            state = {"claims": claims[-config.IDEMPOTENCY_KEY_HISTORY_LIMIT :]}
+            state.claims = state.claims[-config.IDEMPOTENCY_KEY_HISTORY_LIMIT :]
             temporary_path = f"{state_path}.tmp"
             with open(temporary_path, "w", encoding="utf-8") as state_file:
-                json.dump(state, state_file, ensure_ascii=False)
+                json.dump(state.model_dump(mode="json"), state_file, ensure_ascii=False)
                 state_file.flush()
                 os.fsync(state_file.fileno())
             os.replace(temporary_path, state_path)
@@ -228,24 +377,19 @@ def _complete_scan_key_locally(scan_key: str) -> None:
         try:
             try:
                 with open(state_path, encoding="utf-8") as state_file:
-                    state = json.load(state_file)
+                    state = _decode_scan_claim_state(state_file.read())
             except FileNotFoundError:
                 return
-            claims = state.get("claims", []) if isinstance(state, dict) else []
-            changed = False
-            for claim in claims:
-                if claim.get("scan_key") == scan_key:
-                    claim["status"] = "completed"
-                    claim["completed_at"] = datetime.datetime.now(
-                        datetime.timezone.utc
-                    ).isoformat()
-                    changed = True
-                    break
-            if not changed:
+            claim = next(
+                (claim for claim in state.claims if claim.scan_key == scan_key), None
+            )
+            if claim is None:
                 return
+            claim.status = ScanClaimStatus.COMPLETED
+            claim.completed_at = datetime.datetime.now(datetime.timezone.utc)
             temporary_path = f"{state_path}.tmp"
             with open(temporary_path, "w", encoding="utf-8") as state_file:
-                json.dump({"claims": claims}, state_file, ensure_ascii=False)
+                json.dump(state.model_dump(mode="json"), state_file, ensure_ascii=False)
                 state_file.flush()
                 os.fsync(state_file.fileno())
             os.replace(temporary_path, state_path)
@@ -262,14 +406,15 @@ def _release_scan_key_locally(scan_key: str) -> None:
         try:
             try:
                 with open(state_path, encoding="utf-8") as state_file:
-                    state = json.load(state_file)
+                    state = _decode_scan_claim_state(state_file.read())
             except FileNotFoundError:
                 return
-            claims = state.get("claims", []) if isinstance(state, dict) else []
-            remaining = [claim for claim in claims if claim.get("scan_key") != scan_key]
+            state.claims = [
+                claim for claim in state.claims if claim.scan_key != scan_key
+            ]
             temporary_path = f"{state_path}.tmp"
             with open(temporary_path, "w", encoding="utf-8") as state_file:
-                json.dump({"claims": remaining}, state_file, ensure_ascii=False)
+                json.dump(state.model_dump(mode="json"), state_file, ensure_ascii=False)
                 state_file.flush()
                 os.fsync(state_file.fileno())
             os.replace(temporary_path, state_path)
@@ -282,7 +427,9 @@ async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_cl
     try:
         from google.api_core.exceptions import PreconditionFailed
     except ImportError as error:
-        raise RuntimeError("google-cloud-storage is required for GCS idempotency") from error
+        raise StateBackendUnavailable(
+            StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
+        ) from error
 
     blob = gcs_client.bucket(config.GCS_BUCKET_NAME).blob(IDEMPOTENCY_STATE_FILE_NAME)
     for _ in range(5):
@@ -296,32 +443,36 @@ async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_cl
                 )
             except PreconditionFailed:
                 continue
-            state = json.loads(raw_state)
+            state = _decode_scan_claim_state(raw_state)
         else:
-            state = {"claims": []}
+            state = ScanClaimState()
             generation = 0
-        claims = state.get("claims", []) if isinstance(state, dict) else []
-        acquired, claims = _acquire_claim(claims, scan_key, execution_id)
+        acquired, state = _acquire_claim(state, scan_key, execution_id)
         if not acquired:
             return False
+        state.claims = state.claims[-config.IDEMPOTENCY_KEY_HISTORY_LIMIT :]
         try:
             await asyncio.to_thread(
                 blob.upload_from_string,
-                json.dumps({"claims": claims[-config.IDEMPOTENCY_KEY_HISTORY_LIMIT :]}, ensure_ascii=False),
+                json.dumps(state.model_dump(mode="json"), ensure_ascii=False),
                 content_type="application/json",
                 if_generation_match=generation,
             )
             return True
         except PreconditionFailed:
             continue
-    raise RuntimeError("Could not atomically claim scan key after concurrent updates")
+    raise StateSaveError(
+        StateErrorCode.CONCURRENT_UPDATE_EXHAUSTED, IDEMPOTENCY_STATE_FILE_NAME
+    )
 
 
 async def _complete_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
     try:
         from google.api_core.exceptions import PreconditionFailed
     except ImportError as error:
-        raise RuntimeError("google-cloud-storage is required for GCS idempotency") from error
+        raise StateBackendUnavailable(
+            StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
+        ) from error
 
     blob = gcs_client.bucket(config.GCS_BUCKET_NAME).blob(IDEMPOTENCY_STATE_FILE_NAME)
     for _ in range(5):
@@ -335,37 +486,36 @@ async def _complete_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
             )
         except PreconditionFailed:
             continue
-        state = json.loads(raw_state)
-        claims = state.get("claims", []) if isinstance(state, dict) else []
-        changed = False
-        for claim in claims:
-            if claim.get("scan_key") == scan_key:
-                claim["status"] = "completed"
-                claim["completed_at"] = datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat()
-                changed = True
-                break
-        if not changed:
+        state = _decode_scan_claim_state(raw_state)
+        claim = next(
+            (claim for claim in state.claims if claim.scan_key == scan_key), None
+        )
+        if claim is None:
             return
+        claim.status = ScanClaimStatus.COMPLETED
+        claim.completed_at = datetime.datetime.now(datetime.timezone.utc)
         try:
             await asyncio.to_thread(
                 blob.upload_from_string,
-                json.dumps({"claims": claims}, ensure_ascii=False),
+                json.dumps(state.model_dump(mode="json"), ensure_ascii=False),
                 content_type="application/json",
                 if_generation_match=generation,
             )
             return
         except PreconditionFailed:
             continue
-    raise RuntimeError("Could not atomically complete scan key after concurrent updates")
+    raise StateSaveError(
+        StateErrorCode.CONCURRENT_UPDATE_EXHAUSTED, IDEMPOTENCY_STATE_FILE_NAME
+    )
 
 
 async def _release_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
     try:
         from google.api_core.exceptions import PreconditionFailed
     except ImportError as error:
-        raise RuntimeError("google-cloud-storage is required for GCS idempotency") from error
+        raise StateBackendUnavailable(
+            StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
+        ) from error
 
     blob = gcs_client.bucket(config.GCS_BUCKET_NAME).blob(IDEMPOTENCY_STATE_FILE_NAME)
     for _ in range(5):
@@ -379,20 +529,23 @@ async def _release_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
             )
         except PreconditionFailed:
             continue
-        state = json.loads(raw_state)
-        claims = state.get("claims", []) if isinstance(state, dict) else []
-        remaining = [claim for claim in claims if claim.get("scan_key") != scan_key]
+        state = _decode_scan_claim_state(raw_state)
+        state.claims = [
+            claim for claim in state.claims if claim.scan_key != scan_key
+        ]
         try:
             await asyncio.to_thread(
                 blob.upload_from_string,
-                json.dumps({"claims": remaining}, ensure_ascii=False),
+                json.dumps(state.model_dump(mode="json"), ensure_ascii=False),
                 content_type="application/json",
                 if_generation_match=generation,
             )
             return
         except PreconditionFailed:
             continue
-    raise RuntimeError("Could not atomically release scan key after concurrent updates")
+    raise StateSaveError(
+        StateErrorCode.CONCURRENT_UPDATE_EXHAUSTED, IDEMPOTENCY_STATE_FILE_NAME
+    )
 
 
 async def save_analysis_log(state: AnalysisState, gcs_client=None):
@@ -403,20 +556,77 @@ async def save_analysis_log(state: AnalysisState, gcs_client=None):
         mode="json", exclude={"tickers": {"__all__": {"candle_history"}}}
     )
 
-    try:
-        log_list = await load_json(filename, gcs_client)
-        if not isinstance(log_list, list):
-            log_list = []
+    log_list = await load_json(filename, gcs_client, reject_null=True)
+    if log_list is None:
+        log_list = []
+    elif not isinstance(log_list, list):
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename)
 
-        log_list.append(new_log_entry)
-        await save_json(filename, log_list, gcs_client)
-        logger.info(f"분석 로그 추가 완료: {filename}")
-
-    except Exception as e:
-        logger.error(f"'{filename}' 로그 파일 저장 실패: {e}", exc_info=True)
+    log_list.append(new_log_entry)
+    await save_json(filename, log_list, gcs_client)
+    logger.info(f"분석 로그 추가 완료: {filename}")
 
 
 # --- 알림 히스토리 관리 ---
+
+
+_LEGACY_ALERT_SIGNAL_TYPES = {
+    "BULL_MOMENTUM_SUSTAINED": SignalType.MOMENTUM_ACCELERATION,
+    "BEAR_MOMENTUM_SUSTAINED": SignalType.DOWNTREND_ACCELERATION,
+}
+_STRUCTURED_ALERT_DIRECTIONS = {
+    SignalType.BREAKOUT_START: StructureDirection.BULLISH,
+    SignalType.MOMENTUM_ACCELERATION: StructureDirection.BULLISH,
+    SignalType.BREAKDOWN_START: StructureDirection.BEARISH,
+    SignalType.DOWNTREND_ACCELERATION: StructureDirection.BEARISH,
+}
+
+
+def _migrate_alert_history_payload(
+    data: Dict[str, Any],
+) -> tuple[Dict[str, Any], bool]:
+    migrated_data: Dict[str, Any] = {}
+    migrated = False
+
+    for market, raw_alert_data in data.items():
+        if not isinstance(raw_alert_data, dict):
+            migrated_data[market] = raw_alert_data
+            continue
+
+        alert_data = dict(raw_alert_data)
+        raw_signal_type = alert_data.get("last_signal_type")
+        legacy_replacement = (
+            _LEGACY_ALERT_SIGNAL_TYPES.get(raw_signal_type)
+            if isinstance(raw_signal_type, str)
+            else None
+        )
+        if legacy_replacement is not None:
+            alert_data["last_signal_type"] = legacy_replacement.value
+            migrated = True
+
+        try:
+            signal_type = SignalType(alert_data.get("last_signal_type"))
+        except (TypeError, ValueError):
+            signal_type = None
+
+        missing_structure = (
+            "structure_level" not in alert_data
+            and "structure_direction" not in alert_data
+        )
+        if missing_structure:
+            direction = _STRUCTURED_ALERT_DIRECTIONS.get(signal_type)
+            if direction is not None:
+                alert_data["structure_level"] = alert_data.get("initial_price")
+                alert_data["structure_direction"] = direction.value
+                migrated = True
+            elif signal_type is not None and signal_type.is_failure:
+                alert_data["structure_level"] = None
+                alert_data["structure_direction"] = None
+                migrated = True
+
+        migrated_data[market] = alert_data
+
+    return migrated_data, migrated
 
 
 def _active_alert_history(
@@ -430,114 +640,100 @@ def _active_alert_history(
     }
 
 
+def _alert_history_file_name() -> str:
+    return (
+        config.SHADOW_ALERT_HISTORY_FILE_NAME
+        if config.SHADOW_MODE
+        else config.ALERT_HISTORY_FILE_NAME
+    )
+
+
 async def load_alert_history(gcs_client=None) -> Dict[str, AlertHistory]:
     """알림 히스토리 파일을 로드합니다."""
-    data = await load_json(config.ALERT_HISTORY_FILE_NAME, gcs_client)
+    filename = _alert_history_file_name()
+    data = await load_json(filename, gcs_client, reject_null=True)
     if data is None:
         return {}
     if not isinstance(data, dict):
-        raise StateLoadError(
-            f"알림 히스토리 형식 오류 ({config.ALERT_HISTORY_FILE_NAME}): JSON object가 필요합니다."
-        )
-
-    history = {
-        market: AlertHistory.model_validate(alert_data)
-        for market, alert_data in data.items()
-    }
-    return _active_alert_history(history)
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename)
+    migrated_data, migrated = _migrate_alert_history_payload(data)
+    try:
+        history = {
+            market: AlertHistory.model_validate(alert_data)
+            for market, alert_data in migrated_data.items()
+        }
+    except ValidationError as error:
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename) from error
+    active_history = _active_alert_history(history)
+    if migrated:
+        await save_alert_history(active_history, gcs_client)
+    return active_history
 
 
 async def save_alert_history(history: Dict[str, AlertHistory], gcs_client=None):
     """알림 히스토리를 저장하며, 24시간 이상된 기록은 자동으로 정리합니다."""
+    filename = _alert_history_file_name()
     cleaned_history = _active_alert_history(history)
     data_to_save = {m: ah.model_dump(mode="json") for m, ah in cleaned_history.items()}
-    await save_json(config.ALERT_HISTORY_FILE_NAME, data_to_save, gcs_client)
-    logger.info(f"알림 히스토리 저장 완료: {config.ALERT_HISTORY_FILE_NAME}")
+    await save_json(filename, data_to_save, gcs_client)
+    logger.info(f"알림 히스토리 저장 완료: {filename}")
 
 
-def _validate_notification_outbox(data: Any) -> Dict[str, Any]:
-    if not isinstance(data, dict):
+def _parse_notification_outbox(data: Any) -> NotificationOutbox:
+    try:
+        return NotificationOutbox.model_validate(data)
+    except ValidationError as error:
         raise StateLoadError(
-            f"알림 outbox 형식 오류 ({NOTIFICATION_OUTBOX_FILE_NAME}): JSON object가 필요합니다."
-        )
-    if data.get("status") not in {"prepared", "attempting", "delivered"}:
-        raise StateLoadError(
-            "알림 outbox status는 prepared, attempting 또는 delivered여야 합니다."
-        )
-    if not isinstance(data.get("delivery_id"), str) or not isinstance(data.get("message"), str):
-        raise StateLoadError("알림 outbox delivery_id와 message는 문자열이어야 합니다.")
-    history = data.get("alert_history")
-    if history is not None and (
-        not isinstance(history, dict)
-        or any(not isinstance(value, dict) for value in history.values())
-    ):
-        raise StateLoadError("알림 outbox alert_history는 JSON object 또는 null이어야 합니다.")
-    previous_history = data.get("previous_alert_history")
-    if previous_history is not None and (
-        not isinstance(previous_history, dict)
-        or any(not isinstance(value, dict) for value in previous_history.values())
-    ):
-        raise StateLoadError(
-            "알림 outbox previous_alert_history는 JSON object 또는 null이어야 합니다."
-        )
-    alert_markets = data.get("alert_markets", [])
-    if not isinstance(alert_markets, list) or any(
-        not isinstance(market, str) for market in alert_markets
-    ):
-        raise StateLoadError("알림 outbox alert_markets는 문자열 배열이어야 합니다.")
-    scan_key = data.get("scan_key")
-    if scan_key is not None and not isinstance(scan_key, str):
-        raise StateLoadError("알림 outbox scan_key는 문자열 또는 null이어야 합니다.")
-    kind = data.get("kind", "briefing")
-    if kind not in {"briefing", "alert", "data_quality"}:
-        raise StateLoadError(
-            "알림 outbox kind는 briefing, alert 또는 data_quality여야 합니다."
-        )
-    return data
+            StateErrorCode.INVALID_SCHEMA, NOTIFICATION_OUTBOX_FILE_NAME
+        ) from error
 
 
-async def load_notification_outbox(gcs_client=None) -> Optional[Dict[str, Any]]:
+async def load_notification_outbox(gcs_client=None) -> Optional[NotificationOutbox]:
     """Load the single pending webhook delivery, failing closed on corrupt state."""
     data = await load_json(NOTIFICATION_OUTBOX_FILE_NAME, gcs_client)
     if data is None:
         return None
-    return _validate_notification_outbox(data)
+    return _parse_notification_outbox(data)
 
 
-async def save_notification_outbox(outbox: Optional[Dict[str, Any]], gcs_client=None) -> None:
+async def save_notification_outbox(
+    outbox: Optional[NotificationOutbox], gcs_client=None
+) -> None:
     """Persist or clear the single pending webhook delivery."""
-    if outbox is not None:
-        _validate_notification_outbox(outbox)
-    await save_json(NOTIFICATION_OUTBOX_FILE_NAME, outbox, gcs_client)
+    payload = outbox.model_dump(mode="json") if outbox is not None else None
+    await save_json(NOTIFICATION_OUTBOX_FILE_NAME, payload, gcs_client)
 
 
-async def load_notification_backlog(gcs_client=None) -> List[Dict[str, Any]]:
+async def load_notification_backlog(gcs_client=None) -> List[NotificationOutbox]:
     """Load deferred prepared notifications in FIFO order."""
-    data = await load_json(NOTIFICATION_BACKLOG_FILE_NAME, gcs_client)
+    data = await load_json(
+        NOTIFICATION_BACKLOG_FILE_NAME, gcs_client, reject_null=True
+    )
     if data is None:
         return []
-    if not isinstance(data, list):
+    try:
+        return NotificationBacklog.model_validate(data).root
+    except ValidationError as error:
         raise StateLoadError(
-            f"알림 backlog 형식 오류 ({NOTIFICATION_BACKLOG_FILE_NAME}): JSON array가 필요합니다."
-        )
-    backlog = []
-    for item in data:
-        validated = _validate_notification_outbox(item)
-        if validated["status"] != "prepared":
-            raise StateLoadError("알림 backlog에는 prepared 상태만 저장할 수 있습니다.")
-        backlog.append(validated)
-    return backlog
+            StateErrorCode.INVALID_SCHEMA, NOTIFICATION_BACKLOG_FILE_NAME
+        ) from error
 
 
 async def save_notification_backlog(
-    backlog: List[Dict[str, Any]], gcs_client=None
+    backlog: List[NotificationOutbox], gcs_client=None
 ) -> None:
     """Persist the deferred notification FIFO after validating every record."""
-    for item in backlog:
-        validated = _validate_notification_outbox(item)
-        if validated["status"] != "prepared":
-            raise StateLoadError("알림 backlog에는 prepared 상태만 저장할 수 있습니다.")
-    await save_json(NOTIFICATION_BACKLOG_FILE_NAME, backlog, gcs_client)
+    try:
+        validated = NotificationBacklog.model_validate(backlog).root
+    except ValidationError as error:
+        raise StateSaveError(
+            StateErrorCode.INVALID_SCHEMA, NOTIFICATION_BACKLOG_FILE_NAME
+        ) from error
+    await save_json(
+        NOTIFICATION_BACKLOG_FILE_NAME,
+        [item.model_dump(mode="json") for item in validated],
+        gcs_client,
+    )
 
 
 # --- 로그 정리 ---
@@ -551,13 +747,20 @@ async def cleanup_old_logs(days_to_keep: int = 7, gcs_client=None):
     prefix = "analysis_log_"
 
     try:
-        if config.STATE_STORAGE_METHOD == "GCS" and gcs_client:
+        if config.storage_method() is config.StorageMethod.GCS:
+            if gcs_client is None:
+                raise StateBackendUnavailable(
+                    StateErrorCode.BACKEND_UNAVAILABLE, prefix
+                )
             await _cleanup_gcs_logs(gcs_client, prefix, cutoff_date)
         else:
             _cleanup_local_logs(prefix, cutoff_date)
-
-    except Exception as e:
-        logger.error(f"오래된 로그 파일 정리 실패: {e}", exc_info=True)
+    except StateBackendUnavailable:
+        raise
+    except Exception as error:
+        raise StateSaveError(
+            StateErrorCode.DELETE_FAILED, prefix, detail=str(error)
+        ) from error
 
 
 async def _cleanup_gcs_logs(gcs_client, prefix: str, cutoff_date: datetime.datetime):

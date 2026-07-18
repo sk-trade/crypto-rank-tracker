@@ -3,6 +3,7 @@
 import asyncio
 import datetime
 import logging
+from enum import StrEnum
 
 import aiohttp
 from common.notification.engine import AlertEngine
@@ -12,7 +13,6 @@ import functions_framework
 import config
 from common.analysis.utils import calculate_rankings
 from common.analysis.scanner import (
-    CandidateDecision,
     evaluate_candidate_eligibility,
     process_lightweight_indicators,
 )
@@ -22,7 +22,15 @@ from common.analysis.deep_dive import (
     enrich_deep_dive_tickers,
     get_market_regime,
 )
-from common.models import Alert, RankState, SignalCandidate
+from common.models import (
+    CandidateDecision,
+    DataQualityIssue,
+    MarketRegime,
+    MarketRegimeSnapshot,
+    RankState,
+    RejectionCode,
+    ScanHandoffState,
+)
 from common.event_log import build_scan_events, resolve_scan_outcomes
 from common.notification.main import (
     NotificationDeliveryError,
@@ -31,7 +39,11 @@ from common.notification.main import (
     recover_pending_notification,
 )
 from common.sector_loader import load_and_process_sectors
-from common.storage_client import create_gcs_client
+from common.storage_client import (
+    StateBackendUnavailable,
+    StateErrorCode,
+    create_gcs_client,
+)
 from common.state_manager import (
     append_scan_events,
     append_scan_outcomes,
@@ -45,7 +57,7 @@ from common.state_manager import (
     save_rank_state_history,
 )
 from common.upbit_client import (
-    UpbitAPIError,
+    CandleTimeUnit,
     get_all_krw_tickers,
     get_candles,
     get_orderbooks,
@@ -56,6 +68,19 @@ logging.basicConfig(
     level=config.LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(config.APP_LOGGER_NAME)
+
+
+class PipelineErrorCode(StrEnum):
+    INVALID_SCHEDULE_TIME = "invalid_schedule_time"
+    SCHEDULE_TIMEZONE_REQUIRED = "schedule_timezone_required"
+    EXECUTION_FAILED = "pipeline_execution_failed"
+
+
+class PipelineError(RuntimeError):
+    def __init__(self, code: PipelineErrorCode, *, field: str | None = None):
+        super().__init__(code.value)
+        self.code = code
+        self.field = field
 
 
 def filter_markets_with_complete_deep_dive_data(
@@ -79,45 +104,69 @@ def filter_markets_with_complete_deep_dive_data(
     return valid_markets
 
 
+def required_deep_dive_markets(candidate_markets: list[str]) -> list[str]:
+    """Return selected candidates plus the BTC benchmark used for market regime."""
+    return sorted(set(candidate_markets) | {"KRW-BTC"})
+
+
 def assess_scan_data_quality(
     all_markets: list[str], candles_10m: dict, minimum_success_rate: float
-) -> list[str]:
+) -> list[DataQualityIssue]:
     """Return operationally actionable reasons why a scan cannot produce signals."""
     if not all_markets:
-        return ["KRW market universe is empty."]
+        return [
+            DataQualityIssue(
+                code=RejectionCode.MARKET_UNIVERSE_EMPTY,
+                message="KRW market universe is empty.",
+            )
+        ]
 
     successful_markets = len(candles_10m)
     success_rate = successful_markets / len(all_markets)
     issues = []
     if success_rate < minimum_success_rate:
         issues.append(
-            f"10-minute candle coverage {successful_markets}/{len(all_markets)} ({success_rate:.1%}) is below the {minimum_success_rate:.0%} minimum."
+            DataQualityIssue(
+                code=RejectionCode.CANDLE_COVERAGE_BELOW_MINIMUM,
+                message=(
+                    f"10-minute candle coverage {successful_markets}/{len(all_markets)} "
+                    f"({success_rate:.1%}) is below the {minimum_success_rate:.0%} minimum."
+                ),
+                details={
+                    "successful_markets": successful_markets,
+                    "total_markets": len(all_markets),
+                    "success_rate": success_rate,
+                    "minimum_success_rate": minimum_success_rate,
+                },
+            )
         )
     if "KRW-BTC" not in candles_10m:
-        issues.append("KRW-BTC completed 10-minute candles are missing or stale.")
+        issues.append(
+            DataQualityIssue(
+                code=RejectionCode.BTC_CANDLE_HISTORY_UNAVAILABLE,
+                message="KRW-BTC completed 10-minute candles are missing or stale.",
+            )
+        )
     return issues
-
-
-def filter_candidates_by_market_regime(candidate_markets: list[str], market_regime: dict) -> list[str]:
-    """Fail closed when BTC data cannot establish a valid market regime."""
-    if market_regime.get("regime") == "UNKNOWN":
-        logger.warning("Blocking candidates because BTC market regime is UNKNOWN.")
-        return []
-    return candidate_markets
 
 
 def record_market_regime_block(
     candidate_markets: list[str],
     candidate_decisions: dict[str, CandidateDecision],
-    market_regime: dict,
+    market_regime: MarketRegimeSnapshot,
 ) -> list[str]:
     """Persist a fail-closed regime gate as a distinct event-log decision."""
-    if filter_candidates_by_market_regime(candidate_markets, market_regime):
+    if market_regime.regime is not MarketRegime.UNKNOWN:
         return candidate_markets
+    logger.warning("Blocking candidates because BTC market regime is UNKNOWN.")
     for market in candidate_markets:
         decision = candidate_decisions[market]
         candidate_decisions[market] = CandidateDecision(
-            False, [*decision.rejection_reasons, "market_regime_unknown"]
+            eligible=False,
+            rejection_reasons=[
+                *decision.rejection_reasons,
+                RejectionCode.MARKET_REGIME_UNKNOWN,
+            ],
         )
     return []
 
@@ -133,18 +182,24 @@ def _scheduled_scan_time(schedule_time: str | None) -> datetime.datetime:
     try:
         parsed = datetime.datetime.fromisoformat(normalized)
     except ValueError as error:
-        raise ValueError("X-CloudScheduler-ScheduleTime must be RFC 3339") from error
+        raise PipelineError(
+            PipelineErrorCode.INVALID_SCHEDULE_TIME,
+            field="X-CloudScheduler-ScheduleTime",
+        ) from error
     if parsed.tzinfo is None:
-        raise ValueError("X-CloudScheduler-ScheduleTime must include a timezone")
+        raise PipelineError(
+            PipelineErrorCode.SCHEDULE_TIMEZONE_REQUIRED,
+            field="X-CloudScheduler-ScheduleTime",
+        )
     return parsed.astimezone(datetime.timezone.utc)
 
 
 async def _settle_notification_scan_claim(
     error: NotificationDeliveryError, scan_key: str, gcs_client=None
 ) -> None:
-    if error.scan_handoff_durable:
+    if error.scan_handoff_state is ScanHandoffState.DURABLE:
         await complete_scan_key(scan_key, gcs_client)
-    elif error.scan_handoff_uncertain:
+    elif error.scan_handoff_state is ScanHandoffState.UNCERTAIN:
         logger.error(
             "Notification handoff is uncertain; retaining scan claim %s for retry reconciliation",
             scan_key,
@@ -157,17 +212,17 @@ async def run_check(
     execution_id: str | None = None, schedule_time: str | None = None
 ):
     """데이터 수집, 분석, 알림 전송의 핵심 파이프라인을 실행합니다."""
-    config.validate_storage_config()
+    storage_method = config.validate_storage_config()
 
     gcs_client = None
-    if config.STATE_STORAGE_METHOD == "GCS":
+    if storage_method is config.StorageMethod.GCS:
         try:
             gcs_client = create_gcs_client()
             logger.info("GCS 저장 모드로 실행됩니다.")
         except ImportError as e:
-            raise RuntimeError(
-                "GCS 모드로 설정되었으나 'google-cloud-storage' 라이브러리가 설치되지 않았습니다. "
-                "pip install google-cloud-storage 명령어로 설치해주세요."
+            raise StateBackendUnavailable(
+                StateErrorCode.BACKEND_UNAVAILABLE,
+                config.GCS_BUCKET_NAME or "GCS",
             ) from e
     else:
         logger.info("로컬 파일 저장 모드로 실행됩니다.")
@@ -199,12 +254,12 @@ async def run_check(
 
             # PHASE 1: 광역 스캔
             raw_tickers = await get_all_krw_tickers(session)
-            all_markets = [ticker["market"] for ticker in raw_tickers]
-            raw_tickers_map = {ticker["market"]: ticker for ticker in raw_tickers}
+            all_markets = [ticker.market for ticker in raw_tickers]
+            raw_tickers_map = {ticker.market: ticker for ticker in raw_tickers}
             candles_10m = await get_candles(
                 session,
                 all_markets,
-                time_unit="minutes",
+                time_unit=CandleTimeUnit.MINUTES,
                 minutes_unit=10,
                 count=config.RECENT_SCAN_HISTORY_BARS,
                 as_of=scan_started_at,
@@ -215,7 +270,10 @@ async def run_check(
                 all_markets, candles_10m, config.CANDLE_SUCCESS_RATE_MINIMUM
             )
             if data_quality_issues:
-                logger.error("Skipping scan due to data quality: %s", "; ".join(data_quality_issues))
+                logger.error(
+                    "Skipping scan due to data quality: %s",
+                    "; ".join(issue.message for issue in data_quality_issues),
+                )
                 if not await claim_scan_key(
                     scan_key, execution_id=execution_id, gcs_client=gcs_client
                 ):
@@ -224,7 +282,7 @@ async def run_check(
                         raise pending_delivery_error
                     return
                 claimed_scan_key = scan_key
-                await append_scan_events(
+                conflicting_event_ids = await append_scan_events(
                     build_scan_events(
                         scan_close_at,
                         all_markets,
@@ -238,9 +296,24 @@ async def run_check(
                     gcs_client,
                 )
                 scan_persisted = True
+                notification_issues = data_quality_issues
+                if conflicting_event_ids:
+                    notification_issues = [
+                        DataQualityIssue(
+                            code=RejectionCode.IMMUTABLE_SCAN_EVENT_CONFLICT,
+                            message=(
+                                "A retry produced evidence that conflicts with the first "
+                                "persisted scan; the original scan remains authoritative."
+                            ),
+                            details={
+                                "conflicting_event_count": len(conflicting_event_ids),
+                                "conflicting_event_ids": conflicting_event_ids[:10],
+                            },
+                        )
+                    ]
                 try:
                     await dispatch_data_quality_alert(
-                        data_quality_issues,
+                        notification_issues,
                         gcs_client=gcs_client,
                         scan_key=scan_key,
                     )
@@ -260,9 +333,9 @@ async def run_check(
             pending_events = await load_pending_scan_events(gcs_client)
             resolved_outcomes, pending_events = resolve_scan_outcomes(pending_events, candles_10m)
             current_rankings = calculate_rankings(raw_tickers)
-            lightweight_tickers = process_lightweight_indicators(candles_10m, raw_tickers_map)
+            lightweight_tickers = process_lightweight_indicators(candles_10m)
             assign_residual_momentum(lightweight_tickers, sectors, reverse_sector_map)
-            candidate_decisions = evaluate_candidate_eligibility(lightweight_tickers, current_rankings)
+            candidate_decisions = evaluate_candidate_eligibility(lightweight_tickers)
             candidate_markets = [
                 market for market, decision in candidate_decisions.items() if decision.eligible
             ]
@@ -275,7 +348,10 @@ async def run_check(
                     lightweight_tickers[market].execution_spread_bps = execution.spread_bps
                     lightweight_tickers[market].expected_slippage_bps = execution.expected_slippage_bps
                     if not execution.executable:
-                        candidate_decisions[market] = CandidateDecision(False, execution.rejection_reasons)
+                        candidate_decisions[market] = CandidateDecision(
+                            eligible=False,
+                            rejection_reasons=execution.rejection_reasons,
+                        )
                 candidate_markets = [
                     market for market, decision in candidate_decisions.items() if decision.eligible
                 ]
@@ -286,19 +362,18 @@ async def run_check(
                 logger.info(f"{len(candidate_markets)}개의 후보군 선정: {candidate_markets}")
 
             # PHASE 2: 심층 분석
-            final_candidates = {}
             enriched_tickers = lightweight_tickers.copy()
-            market_regime = {}
+            market_regime = MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN)
 
             if candidate_markets:
                 logger.info("Phase 2: 후보군 심층 분석 시작")
-                markets_to_fetch = list(set(candidate_markets + ["KRW-BTC", "KRW-ETH"]))
+                markets_to_fetch = required_deep_dive_markets(candidate_markets)
                 
                 tasks = [
                     get_candles(
                         session,
                         markets_to_fetch,
-                        time_unit="minutes",
+                        time_unit=CandleTimeUnit.MINUTES,
                         minutes_unit=60,
                         count=200,
                         as_of=scan_started_at,
@@ -306,7 +381,7 @@ async def run_check(
                     get_candles(
                         session,
                         markets_to_fetch,
-                        time_unit="days",
+                        time_unit=CandleTimeUnit.DAYS,
                         count=200,
                         as_of=scan_started_at,
                     ),
@@ -328,7 +403,7 @@ async def run_check(
                 enriched_tickers.update(deep_dive_enriched)
 
                 market_regime = get_market_regime(enriched_tickers)
-                logger.info(f"현재 시장 체제: {market_regime.get('regime', 'UNKNOWN')}")
+                logger.info("현재 시장 체제: %s", market_regime.regime.value)
                 candidate_markets = record_market_regime_block(
                     candidate_markets, candidate_decisions, market_regime
                 )
@@ -337,14 +412,9 @@ async def run_check(
             final_alerts = []
             candidates_list = []
             if candidate_markets: 
-                detection_universe = {
-                    market: enriched_tickers[market]
-                    for market in candidate_markets
-                    if market in enriched_tickers
-                }
                 candidates_list = detect_anomalies(
-                    detection_universe, 
-                    current_rankings,  
+                    candidate_markets,
+                    enriched_tickers,
                     sectors, 
                     reverse_sector_map
                 )
@@ -379,9 +449,40 @@ async def run_check(
                 candidates_list,
                 raw_tickers_by_market=raw_tickers_map,
             )
+            conflicting_event_ids = await append_scan_events(scan_events, gcs_client)
+            if conflicting_event_ids:
+                scan_persisted = True
+                conflict_issue = DataQualityIssue(
+                    code=RejectionCode.IMMUTABLE_SCAN_EVENT_CONFLICT,
+                    message=(
+                        "A retry produced evidence that conflicts with the first persisted "
+                        "scan; the original scan remains authoritative."
+                    ),
+                    details={
+                        "conflicting_event_count": len(conflicting_event_ids),
+                        "conflicting_event_ids": conflicting_event_ids[:10],
+                    },
+                )
+                try:
+                    await dispatch_data_quality_alert(
+                        [conflict_issue],
+                        gcs_client=gcs_client,
+                        scan_key=scan_key,
+                    )
+                except NotificationDeliveryError as error:
+                    await _settle_notification_scan_claim(error, scan_key, gcs_client)
+                    claimed_scan_key = None
+                    raise
+                except Exception:
+                    await release_scan_key(scan_key, gcs_client=gcs_client)
+                    claimed_scan_key = None
+                    raise
+                await complete_scan_key(scan_key, gcs_client)
+                if pending_delivery_error:
+                    raise pending_delivery_error
+                return
             if resolved_outcomes:
                 await append_scan_outcomes(resolved_outcomes, gcs_client)
-            await append_scan_events(scan_events, gcs_client)
             await save_pending_scan_events(
                 pending_events + [event for event in scan_events if event.direction], gcs_client
             )
@@ -428,7 +529,7 @@ async def run_check(
             except Exception:
                 logger.exception("Failed to release scan claim %s", claimed_scan_key)
         logger.critical(f"핵심 파이프라인 실행 중 예외 발생: {e}", exc_info=True)
-        raise RuntimeError("Failed to execute the main pipeline") from e
+        raise PipelineError(PipelineErrorCode.EXECUTION_FAILED) from e
 
 
 @functions_framework.http

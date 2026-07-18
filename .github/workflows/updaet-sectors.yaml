@@ -10,6 +10,9 @@ jobs:
   update-sectors:
     if: ${{ github.event_name == 'schedule' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: crypto-rank-tracker-sector-update
+      cancel-in-progress: false
     
     # GCS에 인증하고 Secret을 사용하기 위한 권한
     permissions:

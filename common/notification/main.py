@@ -1,6 +1,5 @@
 # common/notification/main
 
-import asyncio
 import dataclasses
 import datetime
 import hashlib
@@ -9,42 +8,24 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-
-@dataclasses.dataclass
-class DispatchResult:
-    sent: bool
-    reason: Optional[str] = None
-    status_code: Optional[int] = None
-    skipped: bool = False
-    delivery_uncertain: bool = False
-    delivery_id: Optional[str] = None
-    scan_key: Optional[str] = None
-    queued: bool = False
-
-
-class NotificationDeliveryError(RuntimeError):
-    """A configured delivery failed or could not be finalized durably."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        delivery_confirmed: bool = False,
-        scan_handoff_durable: bool = False,
-        scan_handoff_uncertain: bool = False,
-    ):
-        super().__init__(message)
-        self.delivery_confirmed = delivery_confirmed
-        self.scan_handoff_durable = scan_handoff_durable or delivery_confirmed
-        self.scan_handoff_uncertain = (
-            scan_handoff_uncertain and not self.scan_handoff_durable
-        )
-
 import config
-from common.models import Alert, AlertHistory, TickerData
-from common.notification.engine import AlertEngine
+from common.models import (
+    Alert,
+    AlertHistory,
+    DataQualityIssue,
+    DeliveryState,
+    DispatchCode,
+    DispatchOutcome,
+    MarketTicker,
+    MarketRegimeSnapshot,
+    NotificationErrorCode,
+    NotificationKind,
+    NotificationOutbox,
+    NotificationStatus,
+    ScanHandoffState,
+    TickerData,
+)
 from common.notification.formatter import NotificationFormatter
-from common.signals.detector import detect_anomalies, filter_market_wide_events
 from common.state_manager import (
     complete_scan_key,
     load_alert_history,
@@ -55,12 +36,40 @@ from common.state_manager import (
     save_notification_outbox,
 )
 
+
+@dataclasses.dataclass(frozen=True)
+class DispatchResult:
+    outcome: DispatchOutcome
+    code: Optional[DispatchCode] = None
+    detail: Optional[str] = None
+    status_code: Optional[int] = None
+    delivery_id: Optional[str] = None
+    scan_key: Optional[str] = None
+
+
+class NotificationDeliveryError(RuntimeError):
+    """A configured delivery failed or could not be finalized durably."""
+
+    def __init__(
+        self,
+        code: NotificationErrorCode,
+        *,
+        delivery_state: DeliveryState = DeliveryState.NOT_CONFIRMED,
+        scan_handoff_state: ScanHandoffState = ScanHandoffState.NOT_DURABLE,
+        detail: Optional[str] = None,
+    ):
+        super().__init__(detail or code.value)
+        self.code = code
+        self.delivery_state = delivery_state
+        self.scan_handoff_state = scan_handoff_state
+        self.detail = detail
+
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 MAX_NOTIFICATION_BACKLOG = 144
 
 
 async def dispatch_data_quality_alert(
-    issues: List[str], gcs_client=None, scan_key: str | None = None
+    issues: List[DataQualityIssue], gcs_client=None, scan_key: str | None = None
 ) -> DispatchResult:
     """Notify operators that market data is unusable without emitting a market briefing."""
     message = NotificationFormatter().format_data_quality_alert(issues)
@@ -68,26 +77,33 @@ async def dispatch_data_quality_alert(
         message,
         gcs_client=gcs_client,
         scan_key=scan_key,
-        notification_kind="data_quality",
+        notification_kind=NotificationKind.DATA_QUALITY,
     )
-    if result.sent:
-        logger.warning("Data-quality incident notification sent: %s", "; ".join(issues))
-    elif result.queued:
+    if result.outcome is DispatchOutcome.SENT:
+        logger.warning(
+            "Data-quality incident notification sent: %s",
+            "; ".join(issue.message for issue in issues),
+        )
+    elif result.outcome is DispatchOutcome.QUEUED:
         logger.warning("Data-quality incident notification queued behind a pending delivery.")
-    elif not result.skipped:
-        logger.error("Data-quality incident notification was not sent (%s): %s", result.reason, "; ".join(issues))
+    elif result.outcome is not DispatchOutcome.SKIPPED:
+        logger.error(
+            "Data-quality incident notification was not sent (%s): %s",
+            result.code,
+            "; ".join(issue.message for issue in issues),
+        )
     return result
 
 
 async def create_and_dispatch_notification(
-    raw_tickers: List[Dict[str, Any]],
+    raw_tickers: List[MarketTicker],
     enriched_tickers: Dict[str, TickerData],
     current_rankings: Dict[str, int],
     previous_rankings: Dict[str, int],
     SECTORS: Dict[str, List[str]],
     REVERSE_SECTOR_MAP: Dict[str, List[str]],
     alert_history: Dict[str, AlertHistory], 
-    market_regime: Dict[str, Any],
+    market_regime: MarketRegimeSnapshot,
     final_alerts: Optional[List[Alert]] = None,
     gcs_client=None,
     scan_key: str | None = None,
@@ -111,7 +127,9 @@ async def create_and_dispatch_notification(
     # 알림 전송
     if not message:
         logger.info("알림을 보낼 메시지가 없습니다.")
-        return DispatchResult(sent=False, reason="empty message", skipped=True)
+        return DispatchResult(
+            outcome=DispatchOutcome.SKIPPED, code=DispatchCode.EMPTY_MESSAGE
+        )
 
     # 우선순위 높은 알림이 있을 때만 @channel 멘션
     use_channel_mention = False
@@ -134,28 +152,16 @@ async def create_and_dispatch_notification(
         scan_key=scan_key,
         alert_markets=[alert.candidate.market for alert in final_alerts or []],
         previous_history=alert_history if final_alerts else None,
-        notification_kind="alert" if final_alerts else "briefing",
+        mention_channel=use_channel_mention,
+        notification_kind=(
+            NotificationKind.ALERT if final_alerts else NotificationKind.BRIEFING
+        ),
     )
-    if dispatch_result.sent:
+    if dispatch_result.outcome is DispatchOutcome.SENT:
         logger.info("알림 메시지를 생성하여 전송했습니다.")
-    elif dispatch_result.queued:
+    elif dispatch_result.outcome is DispatchOutcome.QUEUED:
         logger.info("알림 메시지를 기존 pending delivery 뒤에 저장했습니다.")
     return dispatch_result
-
-
-def _serialize_alert_history(
-    history: Optional[Dict[str, AlertHistory]],
-) -> Optional[Dict[str, Dict[str, Any]]]:
-    if history is None:
-        return None
-    return {market: entry.model_dump(mode="json") for market, entry in history.items()}
-
-
-def _deserialize_alert_history(payload: Dict[str, Dict[str, Any]]) -> Dict[str, AlertHistory]:
-    return {
-        market: AlertHistory.model_validate(entry)
-        for market, entry in payload.items()
-    }
 
 
 def _refresh_alert_history_for_delivery(
@@ -167,7 +173,7 @@ def _refresh_alert_history_for_delivery(
         if entry is None:
             continue
         is_initial_transition = (
-            entry.last_signal_type in {"BREAKOUT_START", "BREAKDOWN_START"}
+            entry.last_signal_type.starts_structure
             and entry.initial_timestamp == entry.last_alert_timestamp
         )
         entry.last_alert_timestamp = now
@@ -177,18 +183,18 @@ def _refresh_alert_history_for_delivery(
 
 
 def _merge_outbox_alert_history(
-    current: Dict[str, AlertHistory], outbox: Dict[str, Any]
+    current: Dict[str, AlertHistory], outbox: NotificationOutbox
 ) -> Dict[str, AlertHistory]:
-    history_payload = outbox.get("alert_history")
-    if history_payload is None:
+    if outbox.alert_history is None:
         return current
-    updates = _deserialize_alert_history(history_payload)
-    alert_markets = outbox.get("alert_markets", [])
-    if not alert_markets:
-        return updates
-    for market in alert_markets:
-        if market in updates:
-            current[market] = updates[market]
+    if not outbox.alert_markets:
+        return {
+            market: entry.model_copy(deep=True)
+            for market, entry in outbox.alert_history.items()
+        }
+    for market in outbox.alert_markets:
+        if market in outbox.alert_history:
+            current[market] = outbox.alert_history[market].model_copy(deep=True)
     return current
 
 
@@ -197,10 +203,7 @@ def _rebase_deferred_alert_entry(
     deferred: AlertHistory,
     new_previous: AlertHistory,
 ) -> AlertHistory:
-    if old_previous is None or deferred.last_signal_type in {
-        "BREAKOUT_START",
-        "BREAKDOWN_START",
-    }:
+    if old_previous is None or deferred.last_signal_type.starts_structure:
         rebased = deferred.model_copy(deep=True)
     else:
         old_previous_data = old_previous.model_dump(mode="python")
@@ -213,7 +216,7 @@ def _rebase_deferred_alert_entry(
 
     if rebased.last_alert_timestamp < new_previous.last_alert_timestamp:
         is_initial_transition = (
-            rebased.last_signal_type in {"BREAKOUT_START", "BREAKDOWN_START"}
+            rebased.last_signal_type.starts_structure
             and rebased.initial_timestamp == rebased.last_alert_timestamp
         )
         rebased.last_alert_timestamp = new_previous.last_alert_timestamp
@@ -223,40 +226,38 @@ def _rebase_deferred_alert_entry(
 
 
 def _rebase_deferred_notification(
-    outbox: Dict[str, Any], market: str, new_previous: AlertHistory
-) -> tuple[Dict[str, Any], AlertHistory]:
+    outbox: NotificationOutbox, market: str, new_previous: AlertHistory
+) -> tuple[NotificationOutbox, AlertHistory]:
     alert_history = {
-        key: dict(value) for key, value in (outbox.get("alert_history") or {}).items()
+        key: value.model_copy(deep=True)
+        for key, value in (outbox.alert_history or {}).items()
     }
     if market not in alert_history:
         raise ValueError(f"deferred alert history is missing {market}")
     previous_history = {
-        key: dict(value)
-        for key, value in (outbox.get("previous_alert_history") or {}).items()
+        key: value.model_copy(deep=True)
+        for key, value in (outbox.previous_alert_history or {}).items()
     }
-    old_previous = (
-        AlertHistory.model_validate(previous_history[market])
-        if market in previous_history
-        else None
-    )
-    deferred = AlertHistory.model_validate(alert_history[market])
+    old_previous = previous_history.get(market)
+    deferred = alert_history[market]
     rebased = _rebase_deferred_alert_entry(
         old_previous, deferred, new_previous
     )
-    previous_history[market] = new_previous.model_dump(mode="json")
-    alert_history[market] = rebased.model_dump(mode="json")
+    previous_history[market] = new_previous.model_copy(deep=True)
+    alert_history[market] = rebased
     return (
-        {
-            **outbox,
-            "previous_alert_history": previous_history,
-            "alert_history": alert_history,
-        },
+        outbox.model_copy(
+            update={
+                "previous_alert_history": previous_history,
+                "alert_history": alert_history,
+            }
+        ),
         rebased,
     )
 
 
 def _notification_delivery_id(
-    message: str, scan_key: str | None, notification_kind: str
+    message: str, scan_key: str | None, notification_kind: NotificationKind
 ) -> str:
     identity = (
         f"{scan_key}\0{notification_kind}"
@@ -267,49 +268,43 @@ def _notification_delivery_id(
 
 
 async def _persist_outbox_alert_history(
-    outbox: Dict[str, Any], gcs_client=None
+    outbox: NotificationOutbox, gcs_client=None
 ) -> None:
-    history_payload = outbox.get("alert_history")
-    if history_payload is None:
+    if outbox.alert_history is None:
         return
-    updates = _deserialize_alert_history(history_payload)
-    alert_markets = outbox.get("alert_markets", [])
-    if not alert_markets:
-        await save_alert_history(updates, gcs_client)
+    if not outbox.alert_markets:
+        await save_alert_history(outbox.alert_history, gcs_client)
         return
     current = await load_alert_history(gcs_client)
-    current = _merge_outbox_alert_history(
-        current,
-        {**outbox, "alert_history": _serialize_alert_history(updates)},
-    )
+    current = _merge_outbox_alert_history(current, outbox)
     await save_alert_history(current, gcs_client)
 
 
 async def _prepare_alert_history_for_delivery(
-    outbox: Dict[str, Any], gcs_client=None
-) -> Dict[str, Any]:
-    history_payload = outbox.get("alert_history")
+    outbox: NotificationOutbox, gcs_client=None
+) -> NotificationOutbox:
     backlog = await load_notification_backlog(gcs_client)
     rebased_backlog = [
-        item for item in backlog if item["delivery_id"] != outbox["delivery_id"]
+        item for item in backlog if item.delivery_id != outbox.delivery_id
     ]
     prepared = outbox
 
-    if history_payload is not None:
-        alert_markets = outbox.get("alert_markets", [])
+    if outbox.alert_history is not None:
+        alert_markets = outbox.alert_markets
         refreshed = _refresh_alert_history_for_delivery(
-            _deserialize_alert_history(history_payload), alert_markets
+            {
+                market: entry.model_copy(deep=True)
+                for market, entry in outbox.alert_history.items()
+            },
+            alert_markets,
         )
-        prepared = {
-            **outbox,
-            "alert_history": _serialize_alert_history(refreshed),
-        }
+        prepared = outbox.model_copy(update={"alert_history": refreshed})
         for market in alert_markets:
             predecessor = refreshed.get(market)
             if predecessor is None:
                 continue
             for index, deferred in enumerate(rebased_backlog):
-                if market not in deferred.get("alert_markets", []):
+                if market not in deferred.alert_markets:
                     continue
                 rebased_backlog[index], predecessor = _rebase_deferred_notification(
                     deferred, market, predecessor
@@ -318,7 +313,7 @@ async def _prepare_alert_history_for_delivery(
     if rebased_backlog != backlog:
         await save_notification_backlog(rebased_backlog, gcs_client)
     if any(
-        pending.get("alert_history") is not None
+        pending.alert_history is not None
         for pending in [prepared, *rebased_backlog]
     ):
         current = await load_alert_history(gcs_client)
@@ -329,10 +324,12 @@ async def _prepare_alert_history_for_delivery(
 
 
 async def _reconcile_pending_alert_history(
-    outbox: Dict[str, Any], backlog: List[Dict[str, Any]], gcs_client=None
+    outbox: NotificationOutbox,
+    backlog: List[NotificationOutbox],
+    gcs_client=None,
 ) -> None:
     if not any(
-        pending.get("alert_history") is not None
+        pending.alert_history is not None
         for pending in [outbox, *backlog]
     ):
         return
@@ -343,45 +340,44 @@ async def _reconcile_pending_alert_history(
 
 
 async def _rollback_outbox_alert_history(
-    outbox: Dict[str, Any], gcs_client=None
+    outbox: NotificationOutbox, gcs_client=None
 ) -> None:
-    previous_payload = outbox.get("previous_alert_history")
-    alert_markets = outbox.get("alert_markets", [])
-    if previous_payload is None or not alert_markets:
+    if outbox.previous_alert_history is None or not outbox.alert_markets:
         return
-    previous = _deserialize_alert_history(previous_payload)
     current = await load_alert_history(gcs_client)
-    for market in alert_markets:
-        if market in previous:
-            current[market] = previous[market]
+    for market in outbox.alert_markets:
+        if market in outbox.previous_alert_history:
+            current[market] = outbox.previous_alert_history[market]
         else:
             current.pop(market, None)
     await save_alert_history(current, gcs_client)
 
 
 async def _enqueue_deferred_notification(
-    outbox: Dict[str, Any], backlog: List[Dict[str, Any]], gcs_client=None
+    outbox: NotificationOutbox,
+    backlog: List[NotificationOutbox],
+    gcs_client=None,
 ) -> DispatchResult:
-    if any(item["delivery_id"] == outbox["delivery_id"] for item in backlog):
+    if any(item.delivery_id == outbox.delivery_id for item in backlog):
         return DispatchResult(
-            sent=False,
-            reason="notification already queued",
-            delivery_id=outbox["delivery_id"],
-            scan_key=outbox.get("scan_key"),
-            queued=True,
+            outcome=DispatchOutcome.QUEUED,
+            code=DispatchCode.ALREADY_QUEUED,
+            delivery_id=outbox.delivery_id,
+            scan_key=outbox.scan_key,
         )
-    if outbox["kind"] == "briefing":
+    if outbox.kind is NotificationKind.BRIEFING:
         removed_briefings = [
-            item for item in backlog if item.get("kind") == "briefing"
+            item for item in backlog if item.kind is NotificationKind.BRIEFING
         ]
-        for scan_key in {
-            item.get("scan_key") for item in removed_briefings if item.get("scan_key")
-        }:
+        for scan_key in {item.scan_key for item in removed_briefings if item.scan_key}:
             await complete_scan_key(scan_key, gcs_client)
-        backlog = [item for item in backlog if item.get("kind") != "briefing"]
+        backlog = [
+            item for item in backlog if item.kind is not NotificationKind.BRIEFING
+        ]
     if len(backlog) >= MAX_NOTIFICATION_BACKLOG:
         raise NotificationDeliveryError(
-            f"notification backlog reached {MAX_NOTIFICATION_BACKLOG} retained records"
+            NotificationErrorCode.BACKLOG_CAPACITY_EXCEEDED,
+            detail=f"backlog capacity is {MAX_NOTIFICATION_BACKLOG}",
         )
     backlog.append(outbox)
     try:
@@ -391,35 +387,34 @@ async def _enqueue_deferred_notification(
             persisted_backlog = await load_notification_backlog(gcs_client)
         except Exception:
             raise NotificationDeliveryError(
-                "notification backlog write outcome could not be verified",
-                scan_handoff_uncertain=True,
+                NotificationErrorCode.BACKLOG_WRITE_UNVERIFIED,
+                scan_handoff_state=ScanHandoffState.UNCERTAIN,
             ) from error
         if any(
-            item["delivery_id"] == outbox["delivery_id"]
+            item.delivery_id == outbox.delivery_id
             for item in persisted_backlog
         ):
             raise NotificationDeliveryError(
-                "notification backlog write committed without acknowledgement",
-                scan_handoff_durable=True,
+                NotificationErrorCode.BACKLOG_WRITE_COMMITTED_WITHOUT_ACK,
+                scan_handoff_state=ScanHandoffState.DURABLE,
             ) from error
         raise NotificationDeliveryError(
-            "notification backlog write did not persist"
+            NotificationErrorCode.BACKLOG_WRITE_NOT_PERSISTED
         ) from error
     try:
         await _persist_outbox_alert_history(outbox, gcs_client)
-        if scan_key := outbox.get("scan_key"):
+        if scan_key := outbox.scan_key:
             await complete_scan_key(scan_key, gcs_client)
     except Exception as error:
         raise NotificationDeliveryError(
-            "notification was queued but its durable scan handoff could not be finalized",
-            scan_handoff_durable=True,
+            NotificationErrorCode.QUEUED_HANDOFF_FINALIZATION_FAILED,
+            scan_handoff_state=ScanHandoffState.DURABLE,
         ) from error
     return DispatchResult(
-        sent=False,
-        reason="queued behind pending webhook delivery",
-        delivery_id=outbox["delivery_id"],
-        scan_key=outbox.get("scan_key"),
-        queued=True,
+        outcome=DispatchOutcome.QUEUED,
+        code=DispatchCode.QUEUED_BEHIND_PENDING,
+        delivery_id=outbox.delivery_id,
+        scan_key=outbox.scan_key,
     )
 
 
@@ -431,22 +426,26 @@ async def _queue_and_dispatch_notification(
     scan_key: str | None = None,
     alert_markets: Optional[List[str]] = None,
     previous_history: Optional[Dict[str, AlertHistory]] = None,
-    notification_kind: str = "briefing",
+    mention_channel: bool = False,
+    notification_kind: NotificationKind = NotificationKind.BRIEFING,
 ) -> DispatchResult:
     """Durably prepare a configured webhook before attempting the external side effect."""
     if not config.WEBHOOK_URL:
-        return await send_notification(message)
+        if config.SHADOW_MODE and updated_history is not None:
+            await save_alert_history(updated_history, gcs_client)
+        return await send_notification(message, mention_channel=mention_channel)
     delivery_id = _notification_delivery_id(message, scan_key, notification_kind)
-    outbox = {
-        "delivery_id": delivery_id,
-        "status": "prepared",
-        "message": message,
-        "alert_history": _serialize_alert_history(updated_history),
-        "previous_alert_history": _serialize_alert_history(previous_history),
-        "alert_markets": sorted(set(alert_markets or [])),
-        "scan_key": scan_key,
-        "kind": notification_kind,
-    }
+    outbox = NotificationOutbox(
+        delivery_id=delivery_id,
+        status=NotificationStatus.PREPARED,
+        message=message,
+        alert_history=updated_history,
+        previous_alert_history=previous_history,
+        alert_markets=sorted(set(alert_markets or [])),
+        scan_key=scan_key,
+        kind=notification_kind,
+        mention_channel=mention_channel,
+    )
     active = await load_notification_outbox(gcs_client)
     backlog = await load_notification_backlog(gcs_client)
     if scan_key:
@@ -454,27 +453,25 @@ async def _queue_and_dispatch_notification(
             (
                 pending
                 for pending in [*([active] if active else []), *backlog]
-                if pending.get("scan_key") == scan_key
+                if pending.scan_key == scan_key
             ),
             None,
         )
         if existing is not None:
             await complete_scan_key(scan_key, gcs_client)
             return DispatchResult(
-                sent=False,
-                reason="notification already durably owns this scan",
-                delivery_id=existing["delivery_id"],
+                outcome=DispatchOutcome.QUEUED,
+                code=DispatchCode.SCAN_ALREADY_OWNED,
+                delivery_id=existing.delivery_id,
                 scan_key=scan_key,
-                queued=True,
             )
     if active is not None:
-        if active["delivery_id"] == delivery_id:
+        if active.delivery_id == delivery_id:
             return DispatchResult(
-                sent=False,
-                reason="notification already owns the active outbox",
+                outcome=DispatchOutcome.QUEUED,
+                code=DispatchCode.ACTIVE_OUTBOX_ALREADY_OWNED,
                 delivery_id=delivery_id,
                 scan_key=scan_key,
-                queued=True,
             )
         return await _enqueue_deferred_notification(outbox, backlog, gcs_client)
     if backlog:
@@ -486,19 +483,19 @@ async def _queue_and_dispatch_notification(
             persisted_outbox = await load_notification_outbox(gcs_client)
         except Exception:
             raise NotificationDeliveryError(
-                "notification outbox write outcome could not be verified",
-                scan_handoff_uncertain=True,
+                NotificationErrorCode.OUTBOX_WRITE_UNVERIFIED,
+                scan_handoff_state=ScanHandoffState.UNCERTAIN,
             ) from error
         if (
             persisted_outbox is not None
-            and persisted_outbox["delivery_id"] == outbox["delivery_id"]
+            and persisted_outbox.delivery_id == outbox.delivery_id
         ):
             raise NotificationDeliveryError(
-                "notification outbox write committed without acknowledgement",
-                scan_handoff_durable=True,
+                NotificationErrorCode.OUTBOX_WRITE_COMMITTED_WITHOUT_ACK,
+                scan_handoff_state=ScanHandoffState.DURABLE,
             ) from error
         raise NotificationDeliveryError(
-            "notification outbox write did not persist"
+            NotificationErrorCode.OUTBOX_WRITE_NOT_PERSISTED
         ) from error
     try:
         return await _deliver_prepared_notification(outbox, gcs_client)
@@ -506,73 +503,86 @@ async def _queue_and_dispatch_notification(
         raise
     except Exception as error:
         raise NotificationDeliveryError(
-            "prepared notification could not be advanced durably",
-            scan_handoff_durable=True,
+            NotificationErrorCode.PREPARED_ADVANCE_FAILED,
+            scan_handoff_state=ScanHandoffState.DURABLE,
         ) from error
 
 
-async def _deliver_prepared_notification(outbox: Dict[str, Any], gcs_client=None) -> DispatchResult:
+async def _deliver_prepared_notification(
+    outbox: NotificationOutbox, gcs_client=None
+) -> DispatchResult:
     outbox = await _prepare_alert_history_for_delivery(outbox, gcs_client)
 
-    attempting = {**outbox, "status": "attempting"}
+    attempting = outbox.model_copy(update={"status": NotificationStatus.ATTEMPTING})
     await save_notification_outbox(attempting, gcs_client)
     result = await send_notification(
-        outbox["message"], delivery_id=outbox["delivery_id"]
+        outbox.message,
+        delivery_id=outbox.delivery_id,
+        mention_channel=outbox.mention_channel,
     )
-    result.delivery_id = outbox["delivery_id"]
-    result.scan_key = outbox.get("scan_key")
-    if result.sent:
-        delivered = {**outbox, "status": "delivered"}
+    result = dataclasses.replace(
+        result, delivery_id=outbox.delivery_id, scan_key=outbox.scan_key
+    )
+    if result.outcome is DispatchOutcome.SENT:
+        delivered = outbox.model_copy(update={"status": NotificationStatus.DELIVERED})
         try:
             await save_notification_outbox(delivered, gcs_client)
-            if scan_key := outbox.get("scan_key"):
+            if scan_key := outbox.scan_key:
                 await complete_scan_key(scan_key, gcs_client)
             await save_notification_outbox(None, gcs_client)
         except Exception as error:
             raise NotificationDeliveryError(
-                "webhook delivered but outbox finalization failed",
-                delivery_confirmed=True,
-                scan_handoff_durable=True,
+                NotificationErrorCode.DELIVERY_FINALIZATION_FAILED,
+                delivery_state=DeliveryState.CONFIRMED,
+                scan_handoff_state=ScanHandoffState.DURABLE,
             ) from error
         return result
 
-    if result.delivery_uncertain:
+    if result.outcome is DispatchOutcome.UNCERTAIN:
         try:
-            if scan_key := outbox.get("scan_key"):
+            if scan_key := outbox.scan_key:
                 await complete_scan_key(scan_key, gcs_client)
         except Exception as error:
             raise NotificationDeliveryError(
-                "webhook outcome is uncertain and scan completion failed",
-                scan_handoff_durable=True,
+                NotificationErrorCode.UNCERTAIN_DELIVERY_SCAN_COMPLETION_FAILED,
+                delivery_state=DeliveryState.UNCERTAIN,
+                scan_handoff_state=ScanHandoffState.DURABLE,
             ) from error
         raise NotificationDeliveryError(
-            f"webhook outcome is uncertain: {result.reason}",
-            scan_handoff_durable=True,
+            NotificationErrorCode.DELIVERY_OUTCOME_UNCERTAIN,
+            delivery_state=DeliveryState.UNCERTAIN,
+            scan_handoff_state=ScanHandoffState.DURABLE,
+            detail=result.detail,
         )
 
     try:
-        await save_notification_outbox({**outbox, "status": "prepared"}, gcs_client)
-        if scan_key := outbox.get("scan_key"):
+        await save_notification_outbox(
+            outbox.model_copy(update={"status": NotificationStatus.PREPARED}),
+            gcs_client,
+        )
+        if scan_key := outbox.scan_key:
             await complete_scan_key(scan_key, gcs_client)
     except Exception as error:
         raise NotificationDeliveryError(
-            f"webhook failed and retry state could not be restored: {result.reason}",
-            scan_handoff_durable=True,
+            NotificationErrorCode.RETRY_STATE_RESTORE_FAILED,
+            scan_handoff_state=ScanHandoffState.DURABLE,
+            detail=result.detail,
         ) from error
     raise NotificationDeliveryError(
-        f"configured webhook delivery failed: {result.reason}",
-        scan_handoff_durable=True,
+        NotificationErrorCode.DELIVERY_FAILED,
+        scan_handoff_state=ScanHandoffState.DURABLE,
+        detail=result.detail,
     )
 
 
 async def _promote_next_notification(
     gcs_client=None, *, exclude_delivery_id: str | None = None
-) -> Optional[Dict[str, Any]]:
+) -> Optional[NotificationOutbox]:
     backlog = await load_notification_backlog(gcs_client)
     filtered = [
         item
         for item in backlog
-        if item["delivery_id"] != exclude_delivery_id
+        if item.delivery_id != exclude_delivery_id
     ]
     if not filtered:
         if backlog:
@@ -585,30 +595,30 @@ async def _promote_next_notification(
 
 
 async def _complete_pending_notification_scans(
-    outbox: Optional[Dict[str, Any]],
-    backlog: List[Dict[str, Any]],
+    outbox: Optional[NotificationOutbox],
+    backlog: List[NotificationOutbox],
     gcs_client=None,
 ) -> None:
     scan_keys = {
-        item.get("scan_key")
-        for item in [*(backlog or []), *([outbox] if outbox else [])]
-        if item.get("scan_key")
+        item.scan_key
+        for item in [*backlog, *([outbox] if outbox else [])]
+        if item.scan_key
     }
     for scan_key in scan_keys:
         await complete_scan_key(scan_key, gcs_client)
 
 
 async def _cancel_pending_notifications(
-    outbox: Optional[Dict[str, Any]],
-    backlog: List[Dict[str, Any]],
+    outbox: Optional[NotificationOutbox],
+    backlog: List[NotificationOutbox],
     gcs_client=None,
 ) -> bool:
     preserve_ambiguous_attempt = (
-        outbox is not None and outbox["status"] == "attempting"
+        outbox is not None and outbox.status is NotificationStatus.ATTEMPTING
     )
     for deferred in reversed(backlog):
         await _rollback_outbox_alert_history(deferred, gcs_client)
-    if outbox is not None and outbox["status"] == "prepared":
+    if outbox is not None and outbox.status is NotificationStatus.PREPARED:
         await _rollback_outbox_alert_history(outbox, gcs_client)
     await _complete_pending_notification_scans(outbox, backlog, gcs_client)
     await save_notification_backlog([], gcs_client)
@@ -627,8 +637,8 @@ async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResu
         await _complete_pending_notification_scans(outbox, backlog, gcs_client)
     except Exception as error:
         raise NotificationDeliveryError(
-            "pending notification scan handoff could not be finalized",
-            scan_handoff_durable=True,
+            NotificationErrorCode.PENDING_SCAN_HANDOFF_FAILED,
+            scan_handoff_state=ScanHandoffState.DURABLE,
         ) from error
     if not config.WEBHOOK_URL:
         try:
@@ -637,63 +647,68 @@ async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResu
             )
         except Exception as error:
             raise NotificationDeliveryError(
-                "pending webhook cancellation could not be persisted",
-                scan_handoff_durable=True,
+                NotificationErrorCode.PENDING_CANCELLATION_FAILED,
+                scan_handoff_state=ScanHandoffState.DURABLE,
             ) from error
         if preserved_ambiguous_attempt:
             raise NotificationDeliveryError(
-                "webhook attempt outcome is uncertain; inspect the receiver using delivery_id "
-                f"{outbox['delivery_id']} before resetting or clearing the outbox",
-                scan_handoff_durable=True,
+                NotificationErrorCode.AMBIGUOUS_ATTEMPT_REQUIRES_RECONCILIATION,
+                delivery_state=DeliveryState.UNCERTAIN,
+                scan_handoff_state=ScanHandoffState.DURABLE,
+                detail=outbox.delivery_id,
             )
         representative = outbox or backlog[0]
         return DispatchResult(
-            sent=False,
-            reason="pending webhook delivery canceled because WEBHOOK_URL is not configured",
-            skipped=True,
-            delivery_id=representative["delivery_id"],
-            scan_key=representative.get("scan_key"),
+            outcome=DispatchOutcome.SKIPPED,
+            code=DispatchCode.PENDING_CANCELED,
+            delivery_id=representative.delivery_id,
+            scan_key=representative.scan_key,
         )
     if outbox is None:
         outbox = await _promote_next_notification(gcs_client)
         if outbox is None:
             return None
         backlog = await load_notification_backlog(gcs_client)
-    if outbox["status"] in {"attempting", "delivered"}:
+    if outbox.status in {
+        NotificationStatus.ATTEMPTING,
+        NotificationStatus.DELIVERED,
+    }:
         await _reconcile_pending_alert_history(outbox, backlog, gcs_client)
-    if outbox["status"] == "attempting":
+    if outbox.status is NotificationStatus.ATTEMPTING:
         try:
-            if scan_key := outbox.get("scan_key"):
+            if scan_key := outbox.scan_key:
                 await complete_scan_key(scan_key, gcs_client)
         except Exception as error:
             raise NotificationDeliveryError(
-                "uncertain webhook attempt could not complete its scan claim",
-                scan_handoff_durable=True,
+                NotificationErrorCode.UNCERTAIN_DELIVERY_SCAN_COMPLETION_FAILED,
+                delivery_state=DeliveryState.UNCERTAIN,
+                scan_handoff_state=ScanHandoffState.DURABLE,
             ) from error
         raise NotificationDeliveryError(
-            "webhook attempt outcome is uncertain; inspect the receiver using delivery_id "
-            f"{outbox['delivery_id']} before resetting or clearing the outbox",
-            scan_handoff_durable=True,
+            NotificationErrorCode.AMBIGUOUS_ATTEMPT_REQUIRES_RECONCILIATION,
+            delivery_state=DeliveryState.UNCERTAIN,
+            scan_handoff_state=ScanHandoffState.DURABLE,
+            detail=outbox.delivery_id,
         )
-    if outbox["status"] == "delivered":
+    if outbox.status is NotificationStatus.DELIVERED:
         try:
-            if scan_key := outbox.get("scan_key"):
+            if scan_key := outbox.scan_key:
                 await complete_scan_key(scan_key, gcs_client)
             await save_notification_outbox(None, gcs_client)
             await _promote_next_notification(
-                gcs_client, exclude_delivery_id=outbox["delivery_id"]
+                gcs_client, exclude_delivery_id=outbox.delivery_id
             )
         except Exception as error:
             raise NotificationDeliveryError(
-                "confirmed webhook delivery could not be finalized",
-                delivery_confirmed=True,
-                scan_handoff_durable=True,
+                NotificationErrorCode.CONFIRMED_DELIVERY_FINALIZATION_FAILED,
+                delivery_state=DeliveryState.CONFIRMED,
+                scan_handoff_state=ScanHandoffState.DURABLE,
             ) from error
         return DispatchResult(
-            sent=True,
-            reason="confirmed prior delivery finalized",
-            delivery_id=outbox["delivery_id"],
-            scan_key=outbox.get("scan_key"),
+            outcome=DispatchOutcome.SENT,
+            code=DispatchCode.PRIOR_DELIVERY_FINALIZED,
+            delivery_id=outbox.delivery_id,
+            scan_key=outbox.scan_key,
         )
     try:
         result = await _deliver_prepared_notification(outbox, gcs_client)
@@ -701,11 +716,11 @@ async def recover_pending_notification(gcs_client=None) -> Optional[DispatchResu
         raise
     except Exception as error:
         raise NotificationDeliveryError(
-            "pending prepared notification could not be advanced durably",
-            scan_handoff_durable=True,
+            NotificationErrorCode.PENDING_ADVANCE_FAILED,
+            scan_handoff_state=ScanHandoffState.DURABLE,
         ) from error
     await _promote_next_notification(
-        gcs_client, exclude_delivery_id=outbox["delivery_id"]
+        gcs_client, exclude_delivery_id=outbox.delivery_id
     )
     return result
 
@@ -720,7 +735,7 @@ def _update_alert_history(
         market = candidate.market
         signal_type = alert.signal_type
 
-        if signal_type in ["BREAKOUT_START", "BREAKDOWN_START"]:
+        if signal_type.starts_structure:
             history[market] = AlertHistory(
                 market=market,
                 last_alert_timestamp=now,
@@ -730,33 +745,37 @@ def _update_alert_history(
                 initial_timestamp=now,
                 initial_price=candidate.current_price,
                 structure_level=alert.structure_level,
-                structure_direction=("bullish" if signal_type == "BREAKOUT_START" else "bearish"),
+                structure_direction=signal_type.structure_direction,
             )
-        elif "ACCELERATION" in signal_type or "FAILED" in signal_type:
+        elif signal_type.updates_existing_structure:
             if market in history:
                 history[market].last_alert_timestamp = now
                 history[market].last_signal_type = signal_type
                 history[market].last_price = candidate.current_price
                 history[market].last_rvol = candidate.rvol
-                if "FAILED" in signal_type:
+                if signal_type.is_failure:
                     history[market].structure_level = None
                     history[market].structure_direction = None
     return history
 
 
 async def send_notification(
-    message: str, delivery_id: str | None = None
+    message: str,
+    delivery_id: str | None = None,
+    *,
+    mention_channel: bool = False,
 ) -> DispatchResult:
     """웹훅을 통해 메시지를 보냅니다. 전송 결과를 반환합니다."""
     if not config.WEBHOOK_URL:
         logger.warning("웹훅 URL이 설정되지 않았습니다. 알림을 보내지 않습니다.")
         return DispatchResult(
-            sent=False, reason="WEBHOOK_URL not configured", skipped=True
+            outcome=DispatchOutcome.SKIPPED,
+            code=DispatchCode.WEBHOOK_NOT_CONFIGURED,
         )
 
     payload: Dict[str, Any] = {"text": message}
     headers = {"X-Webhook-Delivery-ID": delivery_id} if delivery_id else None
-    if message.strip().startswith("@channel"):
+    if mention_channel:
         payload["link_names"] = True
 
     try:
@@ -766,28 +785,34 @@ async def send_notification(
             ) as response:
                 if response.ok:
                     logger.info("웹훅 알림 전송 성공.")
-                    return DispatchResult(sent=True, delivery_id=delivery_id)
+                    return DispatchResult(
+                        outcome=DispatchOutcome.SENT, delivery_id=delivery_id
+                    )
                 else:
                     error_text = await response.text()
                     logger.error(
                         f"웹훅 전송 실패 ({response.status}): {error_text}"
                     )
                     return DispatchResult(
-                        sent=False,
-                        reason=f"HTTP {response.status}",
+                        outcome=DispatchOutcome.FAILED,
+                        code=DispatchCode.HTTP_ERROR,
+                        detail=error_text,
                         status_code=response.status,
                         delivery_id=delivery_id,
                     )
     except (aiohttp.ClientConnectorError, aiohttp.InvalidURL) as e:
         logger.error(f"웹훅 연결 실패: {e}", exc_info=True)
         return DispatchResult(
-            sent=False, reason=str(e), delivery_id=delivery_id
+            outcome=DispatchOutcome.FAILED,
+            code=DispatchCode.CONNECTION_ERROR,
+            detail=str(e),
+            delivery_id=delivery_id,
         )
     except Exception as e:
         logger.error(f"웹훅 전송 중 예외 발생: {e}", exc_info=True)
         return DispatchResult(
-            sent=False,
-            reason=str(e),
-            delivery_uncertain=True,
+            outcome=DispatchOutcome.UNCERTAIN,
+            code=DispatchCode.UNEXPECTED_ERROR,
+            detail=str(e),
             delivery_id=delivery_id,
         )

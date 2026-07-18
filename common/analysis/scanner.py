@@ -1,21 +1,13 @@
 # common/analysis/scanner.py
 
 import logging
-from dataclasses import dataclass
 from typing import Dict, List
 import numpy as np
 
 import config
-from common.models import TickerData # 기존 모델 재사용
+from common.models import CandidateDecision, LiquidityTier, RejectionCode, TickerData
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
-
-
-@dataclass(frozen=True)
-class CandidateDecision:
-    eligible: bool
-    rejection_reasons: List[str]
-
 
 def _historical_price_surprise(candle_list: List) -> float | None:
     """Standardize the latest return using only earlier completed-bar returns."""
@@ -26,7 +18,7 @@ def _historical_price_surprise(candle_list: List) -> float | None:
     historical = candle_list[-(config.PRICE_SURPRISE_LOOKBACK_BARS + 1):-1]
     returns = [
         (current.close_price / previous.close_price - 1) * 100
-        for previous, current in zip(historical, historical[1:])
+        for previous, current in zip(historical, historical[1:], strict=False)
         if previous.close_price > 0
     ]
     if len(returns) < config.PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS:
@@ -56,11 +48,11 @@ def _assign_liquidity_tiers(tickers: Dict[str, TickerData]) -> None:
         if ticker.rolling_turnover is None:
             continue
         if ticker.rolling_turnover >= high_cutoff:
-            ticker.liquidity_tier = "HIGH"
+            ticker.liquidity_tier = LiquidityTier.HIGH
         elif ticker.rolling_turnover >= low_cutoff:
-            ticker.liquidity_tier = "MEDIUM"
+            ticker.liquidity_tier = LiquidityTier.MEDIUM
         else:
-            ticker.liquidity_tier = "LOW"
+            ticker.liquidity_tier = LiquidityTier.LOW
 
 
 def _robust_z_score(value: float, baseline: List[float]) -> float | None:
@@ -97,15 +89,14 @@ def _assign_cross_sectional_log_rvol_z_scores(tickers: Dict[str, TickerData]) ->
         tickers[market].cross_sectional_log_rvol_z_score = _robust_z_score(value, baseline)
 
 def process_lightweight_indicators(
-    candles_10m: Dict[str, List], 
-    raw_tickers_map: Dict[str, Dict]
+    candles_10m: Dict[str, List],
 ) -> Dict[str, TickerData]:
     """10분봉 데이터만으로 최소한의 필수 지표를 계산합니다."""
     lightweight_tickers = {}
     
     # 전체 시장의 RVOL 분포를 파악하기 위한 리스트
     all_rvols = []
-    for market, candle_list in candles_10m.items():
+    for _market, candle_list in candles_10m.items():
         if len(candle_list) >= 154:
             baseline_volumes = [c.volume for c in candle_list[-154:-10]]
             median_volume_24h = np.median(baseline_volumes)
@@ -119,7 +110,8 @@ def process_lightweight_indicators(
     effective_mad = max(mad, config.MIN_MAD_FLOOR)
 
     for market, candle_list in candles_10m.items():
-        if len(candle_list) < 2: continue
+        if len(candle_list) < 2:
+            continue
         
         ticker = TickerData(market=market, candle_history=candle_list)
         
@@ -158,20 +150,8 @@ def process_lightweight_indicators(
     return lightweight_tickers
 
 
-def select_candidates_for_deep_dive(
-    lightweight_tickers: Dict[str, TickerData],
-    current_rankings: Dict[str, int],
-    raw_tickers_map: Dict[str, Dict]
-) -> List[str]:
-    """
-    config에 설정된 동적 임계값을 적용하여 후보군을 선정합니다.
-    """
-    decisions = evaluate_candidate_eligibility(lightweight_tickers, current_rankings)
-    return [market for market, decision in decisions.items() if decision.eligible]
-
-
 def evaluate_candidate_eligibility(
-    lightweight_tickers: Dict[str, TickerData], current_rankings: Dict[str, int]
+    lightweight_tickers: Dict[str, TickerData],
 ) -> Dict[str, CandidateDecision]:
     """Evaluate every ticker and retain explicit reasons for rejected candidates."""
     decisions = {}
@@ -184,13 +164,19 @@ def evaluate_candidate_eligibility(
         liquidity_tier = ticker.liquidity_tier
         min_z_score = config.rvol_z_score_minimum(liquidity_tier)
         min_price_surprise = config.price_surprise_minimum(liquidity_tier)
-        is_strict_mode = liquidity_tier != "HIGH"
+        is_strict_mode = liquidity_tier is not LiquidityTier.HIGH
 
-        if price_surprise is None or liquidity_tier == "UNKNOWN":
-            decisions[market] = CandidateDecision(False, ["price_surprise_unavailable"])
+        if price_surprise is None or liquidity_tier is LiquidityTier.UNKNOWN:
+            decisions[market] = CandidateDecision(
+                eligible=False,
+                rejection_reasons=[RejectionCode.PRICE_SURPRISE_UNAVAILABLE],
+            )
             continue
         if conditional_z_score is None:
-            decisions[market] = CandidateDecision(False, ["conditional_volume_history_unavailable"])
+            decisions[market] = CandidateDecision(
+                eligible=False,
+                rejection_reasons=[RejectionCode.CONDITIONAL_VOLUME_HISTORY_UNAVAILABLE],
+            )
             continue
 
         # 필터 조건 확인
@@ -199,27 +185,35 @@ def evaluate_candidate_eligibility(
 
         # Wash Trading 방지
         if z_score > 5.0 and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE:
-            decisions[market] = CandidateDecision(False, ["suspected_wash_trading"])
+            decisions[market] = CandidateDecision(
+                eligible=False,
+                rejection_reasons=[RejectionCode.SUSPECTED_WASH_TRADING],
+            )
             continue
 
         # 메이저는 유연하게, 잡코인은 엄격하게
         if is_strict_mode:
             # 잡코인/중위권: 거래량과 가격이 동시에 터져야 함
             if has_volume_spike and has_price_spike:
-                decisions[market] = CandidateDecision(True, [])
+                decisions[market] = CandidateDecision(eligible=True)
             else:
                 reasons = []
                 if not has_volume_spike:
-                    reasons.append("volume_anomaly_below_threshold")
+                    reasons.append(RejectionCode.VOLUME_ANOMALY_BELOW_THRESHOLD)
                 if not has_price_spike:
-                    reasons.append("price_surprise_below_threshold")
-                decisions[market] = CandidateDecision(False, reasons)
+                    reasons.append(RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD)
+                decisions[market] = CandidateDecision(
+                    eligible=False, rejection_reasons=reasons
+                )
         else:
             # 메이저: 둘 중 하나만 터져도 감지 (선취매 혹은 뉴스 반응)
             if has_volume_spike or has_price_spike:
-                decisions[market] = CandidateDecision(True, [])
+                decisions[market] = CandidateDecision(eligible=True)
             else:
                 decisions[market] = CandidateDecision(
-                    False, ["volume_and_price_surprise_below_threshold"]
+                    eligible=False,
+                    rejection_reasons=[
+                        RejectionCode.VOLUME_AND_PRICE_SURPRISE_BELOW_THRESHOLD
+                    ],
                 )
     return decisions

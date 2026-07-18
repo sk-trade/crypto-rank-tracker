@@ -12,6 +12,15 @@ def test_gen2_deployment_uses_explicit_limits_and_separate_service_accounts():
     assert "max_instance_request_concurrency: 1" in workflow
 
 
+def test_production_deployments_are_serialized_and_stale_commits_are_rejected():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+
+    assert "group: crypto-rank-tracker-production-deploy" in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert 'CURRENT_MAIN_SHA="$(git rev-parse origin/main)"' in workflow
+    assert 'if [ "$GITHUB_SHA" != "$CURRENT_MAIN_SHA" ]; then' in workflow
+
+
 def test_all_pull_requests_verify_but_only_main_can_deploy():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
@@ -54,17 +63,35 @@ def test_sector_updater_uses_the_runtime_storage_identity():
     assert "GCP_SA_EMAIL" not in workflow
 
 
+def test_sector_updates_are_serialized_across_schedule_and_manual_runs():
+    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "group: crypto-rank-tracker-sector-update" in workflow
+    assert "cancel-in-progress: false" in workflow
+
+
 def test_deploy_verification_compiles_every_shipped_python_entrypoint():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
     assert "uv run python -m compileall main.py config.py update_sectors.py common tests" in workflow
 
 
+def test_pull_request_verification_runs_ruff_before_pytest():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+
+    lint_command = "uv run ruff check ."
+    test_command = "uv run python -m pytest"
+    assert lint_command in workflow
+    assert workflow.index(lint_command) < workflow.index(test_command)
+
+
 def test_deploy_verification_imports_every_required_module_from_the_wheel():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
     assert 'WHEEL_PATH="$(realpath dist/*.whl)"' in workflow
-    assert "uv run --isolated --with \"$WHEEL_PATH\"" in workflow
+    assert "uv run --no-cache --isolated --with \"$WHEEL_PATH\"" in workflow
     assert "import main, update_sectors, config, common.upbit_client, common.notification.main" in workflow
 
 
@@ -104,3 +131,15 @@ def test_sector_updater_receives_symbol_overrides():
     workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
 
     assert "CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES || '{}' }}" in workflow
+
+
+def test_webhook_credential_is_injected_from_secret_manager_not_plain_revision_env():
+    workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
+    environment_block = workflow.split("environment_variables: |", 1)[1].split(
+        "secrets:", 1
+    )[0]
+
+    assert "gcloud secrets versions add" in workflow
+    assert "roles/secretmanager.secretAccessor" in workflow
+    assert "secrets: ${{ steps.webhook_secret.outputs.mapping }}" in workflow
+    assert "WEBHOOK_URL=" not in environment_block

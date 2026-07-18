@@ -27,6 +27,28 @@ def test_rank_state_persists_across_reload_and_trims_oldest_entries(monkeypatch,
     assert [state.rankings["KRW-BTC"] for state in restored] == [1, 2]
 
 
+def test_delayed_rank_state_keeps_the_latest_market_time_as_the_next_baseline(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
+    monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "STATE_HISTORY_COUNT", 2)
+    newer = RankState(
+        last_updated=datetime.datetime(2026, 1, 1, 12, 10, tzinfo=datetime.timezone.utc),
+        rankings={"KRW-BTC": 1},
+    )
+    delayed = RankState(
+        last_updated=datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc),
+        rankings={"KRW-BTC": 2},
+    )
+
+    asyncio.run(save_rank_state_history(delayed, [newer]))
+    restored = asyncio.run(load_rank_state_history())
+
+    assert [state.last_updated.minute for state in restored] == [0, 10]
+    assert restored[-1] == newer
+
+
 def test_rank_state_corruption_is_explicit_not_empty_history(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
@@ -36,7 +58,7 @@ def test_rank_state_corruption_is_explicit_not_empty_history(monkeypatch, tmp_pa
         asyncio.run(load_rank_state_history())
 
 
-@pytest.mark.parametrize("payload", [{}, False, 0, ""])
+@pytest.mark.parametrize("payload", [{}, False, 0, "", None])
 def test_rank_state_wrong_shape_is_explicit_not_empty_history(
     monkeypatch, tmp_path, payload
 ):

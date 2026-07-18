@@ -1,7 +1,7 @@
 import datetime
 
 from common.analysis.scanner import evaluate_candidate_eligibility, process_lightweight_indicators
-from common.models import CandleData, TickerData
+from common.models import CandleData, LiquidityTier, RejectionCode, TickerData
 
 
 def _candle(market: str, timestamp: datetime.datetime, volume: float) -> CandleData:
@@ -31,7 +31,9 @@ def test_conditional_and_cross_sectional_volume_anomalies_are_separate():
     second = history("KRW-B", 10.0, 10.0)
     third = history("KRW-C", 20.0, 40.0)
 
-    tickers = process_lightweight_indicators({"KRW-A": first, "KRW-B": second, "KRW-C": third}, {})
+    tickers = process_lightweight_indicators(
+        {"KRW-A": first, "KRW-B": second, "KRW-C": third}
+    )
 
     assert tickers["KRW-A"].conditional_log_rvol_z_score is not None
     assert tickers["KRW-A"].conditional_log_rvol_z_score > 0
@@ -44,10 +46,12 @@ def test_candidate_selection_rejects_missing_conditional_history_even_with_cross
     ticker = TickerData(
         market="KRW-A",
         price_surprise=4.0,
-        liquidity_tier="HIGH",
+        liquidity_tier=LiquidityTier.HIGH,
         cross_sectional_log_rvol_z_score=8.0,
     )
 
-    decisions = evaluate_candidate_eligibility({"KRW-A": ticker}, {})
+    decisions = evaluate_candidate_eligibility({"KRW-A": ticker})
 
-    assert decisions["KRW-A"].rejection_reasons == ["conditional_volume_history_unavailable"]
+    assert decisions["KRW-A"].rejection_reasons == [
+        RejectionCode.CONDITIONAL_VOLUME_HISTORY_UNAVAILABLE
+    ]

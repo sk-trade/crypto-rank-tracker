@@ -33,6 +33,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Lint Python sources
+        run: uv run ruff check .
+
       - name: Run tests
         run: uv run python -m pytest
 
@@ -47,12 +50,15 @@ jobs:
           WHEEL_PATH="$(realpath dist/*.whl)"
           TEMP_DIR="$(mktemp -d)"
           cd "$TEMP_DIR"
-          uv run --isolated --with "$WHEEL_PATH" python -c "import main, update_sectors, config, common.upbit_client, common.notification.main"
+          uv run --no-cache --isolated --with "$WHEEL_PATH" python -c "import main, update_sectors, config, common.upbit_client, common.notification.main"
 
   deploy:
     needs: verify
     if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: crypto-rank-tracker-production-deploy
+      cancel-in-progress: false
 
     # GCP에 인증하기 위한 권한 설정
     permissions:
@@ -63,6 +69,15 @@ jobs:
       # GitHub 리포지토리의 코드를 가져옴
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Refuse stale main deployment
+        run: |
+          git fetch origin main --quiet
+          CURRENT_MAIN_SHA="$(git rev-parse origin/main)"
+          if [ "$GITHUB_SHA" != "$CURRENT_MAIN_SHA" ]; then
+            echo "::error::Refusing to deploy stale commit $GITHUB_SHA; current main is $CURRENT_MAIN_SHA."
+            exit 1
+          fi
 
       # Python 환경 설정
       - name: Set up Python
@@ -117,6 +132,34 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SA_EMAIL }}
 
+      - name: Sync webhook credential to Secret Manager
+        id: webhook_secret
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_RUNTIME_SA_EMAIL: ${{ secrets.GCP_RUNTIME_SA_EMAIL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET_ID: crypto-rank-tracker-webhook-url
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo 'mapping={}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! gcloud secrets describe "$WEBHOOK_SECRET_ID" --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
+            gcloud secrets create "$WEBHOOK_SECRET_ID" \
+              --project="$GCP_PROJECT_ID" \
+              --replication-policy=automatic
+          fi
+          printf '%s' "$WEBHOOK_URL" | gcloud secrets versions add "$WEBHOOK_SECRET_ID" \
+            --project="$GCP_PROJECT_ID" \
+            --data-file=-
+          gcloud secrets add-iam-policy-binding "$WEBHOOK_SECRET_ID" \
+            --project="$GCP_PROJECT_ID" \
+            --member="serviceAccount:$GCP_RUNTIME_SA_EMAIL" \
+            --role=roles/secretmanager.secretAccessor \
+            --quiet
+          echo "mapping=WEBHOOK_URL=projects/$GCP_PROJECT_ID/secrets/$WEBHOOK_SECRET_ID/versions/latest" >> "$GITHUB_OUTPUT"
+
       # Google Cloud Functions에 배포
       - name: Deploy Function
         id: deploy
@@ -137,7 +180,7 @@ jobs:
             STATE_STORAGE_METHOD=GCS
             GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
             GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
-            WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+          secrets: ${{ steps.webhook_secret.outputs.mapping }}
 
       - name: Authorize Scheduler invocation
         run: |

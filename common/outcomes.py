@@ -1,12 +1,10 @@
 """Fixed, execution-aware outcome definitions for signal evaluation."""
 
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Iterable
 
 import config
-
-
-Direction = Literal["long", "short"]
+from common.models import Direction
 
 
 @dataclass(frozen=True)
@@ -38,9 +36,9 @@ def directional_net_return(
     """Return a directional holding-period return after the fixed round-trip cost."""
     if entry_price <= 0 or exit_price <= 0:
         raise ValueError("entry_price and exit_price must be positive")
-    if direction == "long":
+    if direction is Direction.LONG:
         gross_return = exit_price / entry_price - 1
-    elif direction == "short":
+    elif direction is Direction.SHORT:
         gross_return = entry_price / exit_price - 1
     else:
         raise ValueError(f"Unsupported direction: {direction}")
@@ -63,8 +61,8 @@ def favorable_and_adverse_excursions(
     if min(high_values) <= 0 or min(low_values) <= 0:
         raise ValueError("highs and lows must be positive")
 
-    if direction == "long":
+    if direction is Direction.LONG:
         return max(high_values) / entry_price - 1, min(low_values) / entry_price - 1
-    if direction == "short":
+    if direction is Direction.SHORT:
         return entry_price / min(low_values) - 1, entry_price / max(high_values) - 1
     raise ValueError(f"Unsupported direction: {direction}")

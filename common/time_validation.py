@@ -42,12 +42,23 @@ def purged_walk_forward(
     return result
 
 
-def final_holdout(outcomes: Iterable[ScanOutcome], fraction: float = 0.2) -> tuple[List[ScanOutcome], List[ScanOutcome]]:
+def final_holdout(
+    outcomes: Iterable[ScanOutcome],
+    fraction: float = 0.2,
+    embargo: datetime.timedelta = datetime.timedelta(hours=1),
+) -> tuple[List[ScanOutcome], List[ScanOutcome]]:
     ordered = sorted(outcomes, key=lambda item: item.entry_candle_start)
+    if not 0 < fraction < 1 or embargo < datetime.timedelta(0):
+        raise ValueError("invalid holdout configuration")
     split = int(len(ordered) * (1 - fraction))
     if split < 1 or split == len(ordered):
         raise ValueError("insufficient outcomes for holdout")
-    return ordered[:split], ordered[split:]
+    holdout = ordered[split:]
+    boundary = holdout[0].entry_candle_start - embargo
+    train = [item for item in ordered[:split] if item.exit_candle_start < boundary]
+    if not train:
+        raise ValueError("insufficient purged outcomes for holdout")
+    return train, holdout
 
 
 def evaluate_outcomes(outcomes: Iterable[ScanOutcome], bootstrap_samples: int = 1_000) -> EvaluationReport:

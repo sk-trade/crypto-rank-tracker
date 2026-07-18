@@ -1,5 +1,6 @@
 import pytest
 
+from common.models import Direction
 from common.outcomes import (
     PRIMARY_PERFORMANCE_TARGET,
     directional_net_return,
@@ -15,13 +16,21 @@ def test_primary_target_is_fixed_to_one_hour_from_the_next_ten_minute_open():
 
 
 def test_directional_returns_deduct_the_fixed_round_trip_cost_for_both_directions():
-    assert directional_net_return(100.0, 110.0, "long") == pytest.approx(0.099)
-    assert directional_net_return(100.0, 90.0, "short") == pytest.approx((100 / 90) - 1 - 0.001)
+    assert directional_net_return(100.0, 110.0, Direction.LONG) == pytest.approx(
+        0.099
+    )
+    assert directional_net_return(100.0, 90.0, Direction.SHORT) == pytest.approx(
+        (100 / 90) - 1 - 0.001
+    )
 
 
 def test_mfe_and_mae_follow_the_signal_direction():
-    assert favorable_and_adverse_excursions(100.0, [105.0, 112.0], [98.0, 94.0], "long") == pytest.approx((0.12, -0.06))
-    assert favorable_and_adverse_excursions(100.0, [105.0, 112.0], [98.0, 94.0], "short") == pytest.approx((100 / 94 - 1, 100 / 112 - 1))
+    assert favorable_and_adverse_excursions(
+        100.0, [105.0, 112.0], [98.0, 94.0], Direction.LONG
+    ) == pytest.approx((0.12, -0.06))
+    assert favorable_and_adverse_excursions(
+        100.0, [105.0, 112.0], [98.0, 94.0], Direction.SHORT
+    ) == pytest.approx((100 / 94 - 1, 100 / 112 - 1))
 
 
 def test_outcome_calculation_rejects_invalid_prices_or_directions():

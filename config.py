@@ -1,11 +1,19 @@
 # config.py
 
 import os
+from enum import StrEnum
+
+from common.models import LiquidityTier
 
 # -- ENVIRONMENT & STORAGE CONFIGURATION --
 
 # 저장 방식 선택 ('GCS' 또는 'LOCAL')
 STATE_STORAGE_METHOD = os.environ.get("STATE_STORAGE_METHOD", "LOCAL")
+SHADOW_MODE = os.environ.get("SHADOW_MODE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 # GCP storage Settings
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
@@ -17,6 +25,7 @@ STATE_FILE_NAME = "upbit_market_state.json"
 RANK_STATE_FILE_NAME = "rank_state.json"
 SECTOR_MAP_FILE_NAME = "sectors.json"
 ALERT_HISTORY_FILE_NAME = "alert_history.json"
+SHADOW_ALERT_HISTORY_FILE_NAME = "shadow_alert_history.json"
 
 # -- EXTERNAL API & WEBHOOK CONFIGURATION --
 
@@ -34,12 +43,40 @@ STATE_HISTORY_COUNT = 12  # 순위 분석에 사용할 과거 데이터 수
 CANDLE_SUCCESS_RATE_MINIMUM = 0.95
 
 
-def validate_storage_config() -> None:
+class StorageMethod(StrEnum):
+    LOCAL = "LOCAL"
+    GCS = "GCS"
+
+
+class ConfigErrorCode(StrEnum):
+    INVALID_STORAGE_METHOD = "invalid_storage_method"
+    GCS_BUCKET_REQUIRED = "gcs_bucket_required"
+
+
+class StorageConfigError(RuntimeError):
+    def __init__(self, code: ConfigErrorCode, field: str):
+        super().__init__(code.value)
+        self.code = code
+        self.field = field
+
+
+def storage_method() -> StorageMethod:
+    try:
+        return StorageMethod(STATE_STORAGE_METHOD)
+    except ValueError as error:
+        raise StorageConfigError(
+            ConfigErrorCode.INVALID_STORAGE_METHOD, "STATE_STORAGE_METHOD"
+        ) from error
+
+
+def validate_storage_config() -> StorageMethod:
     """Fail early when the selected state backend is missing required settings."""
-    if STATE_STORAGE_METHOD not in {"LOCAL", "GCS"}:
-        raise RuntimeError("STATE_STORAGE_METHOD must be either LOCAL or GCS")
-    if STATE_STORAGE_METHOD == "GCS" and not GCS_BUCKET_NAME:
-        raise RuntimeError("GCS_BUCKET_NAME is required when STATE_STORAGE_METHOD=GCS")
+    method = storage_method()
+    if method is StorageMethod.GCS and not GCS_BUCKET_NAME:
+        raise StorageConfigError(
+            ConfigErrorCode.GCS_BUCKET_REQUIRED, "GCS_BUCKET_NAME"
+        )
+    return method
 
 
 # -- ANALYSIS & ALERTING POLICY --
@@ -66,18 +103,36 @@ PRICE_SURPRISE_LOOKBACK_BARS = 144
 PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS = 30
 ROLLING_TURNOVER_LOOKBACK_BARS = 144
 LIQUIDITY_TIER_QUANTILES = (0.33, 0.67)
-PRICE_SURPRISE_MINIMUMS = {"HIGH": 2.0, "MEDIUM": 2.5, "LOW": 3.0}
-RVOL_Z_SCORE_MINIMUMS = {"HIGH": 3.0, "MEDIUM": 4.0, "LOW": 5.0}
+PRICE_SURPRISE_MINIMUMS = {
+    LiquidityTier.HIGH: 2.0,
+    LiquidityTier.MEDIUM: 2.5,
+    LiquidityTier.LOW: 3.0,
+}
+RVOL_Z_SCORE_MINIMUMS = {
+    LiquidityTier.HIGH: 3.0,
+    LiquidityTier.MEDIUM: 4.0,
+    LiquidityTier.LOW: 5.0,
+}
 
 
-def price_surprise_minimum(liquidity_tier: str) -> float:
+def price_surprise_minimum(liquidity_tier: LiquidityTier) -> float:
     """Return the fixed policy threshold for a pre-decision liquidity tier."""
-    return PRICE_SURPRISE_MINIMUMS.get(liquidity_tier, PRICE_SURPRISE_MINIMUMS["LOW"])
+    tier = (
+        LiquidityTier.LOW
+        if liquidity_tier is LiquidityTier.UNKNOWN
+        else liquidity_tier
+    )
+    return PRICE_SURPRISE_MINIMUMS[tier]
 
 
-def rvol_z_score_minimum(liquidity_tier: str) -> float:
+def rvol_z_score_minimum(liquidity_tier: LiquidityTier) -> float:
     """Return the fixed policy threshold for a pre-decision liquidity tier."""
-    return RVOL_Z_SCORE_MINIMUMS.get(liquidity_tier, RVOL_Z_SCORE_MINIMUMS["LOW"])
+    tier = (
+        LiquidityTier.LOW
+        if liquidity_tier is LiquidityTier.UNKNOWN
+        else liquidity_tier
+    )
+    return RVOL_Z_SCORE_MINIMUMS[tier]
 
 # [1차 필터링 공통]
 SIGNAL_SCORE_CANDIDATE_MINIMUM = 0.5
