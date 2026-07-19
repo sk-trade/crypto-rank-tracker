@@ -3,6 +3,7 @@ import asyncio
 
 import pytest
 
+import common.upbit_client as upbit_client
 from common.models import (
     CandleData,
     MarketEvent,
@@ -173,6 +174,7 @@ def _raw_candle(
         "market": market, "candle_date_time_utc": timestamp.isoformat().replace("+00:00", "Z"),
         "opening_price": price, "high_price": price, "low_price": price,
         "trade_price": price, "candle_acc_trade_volume": volume,
+        "candle_acc_trade_price": price * volume,
     }
 
 
@@ -222,6 +224,7 @@ def test_sparse_normalization_fills_no_trade_slots_from_the_previous_close():
     assert [candle.timestamp.minute for candle in result] == [30, 40, 50]
     assert [candle.close_price for candle in result] == [100.0, 100.0, 110.0]
     assert [candle.volume for candle in result] == [0.0, 0.0, 5.0]
+    assert [candle.trade_value for candle in result] == [0.0, 0.0, None]
 
 
 @pytest.mark.parametrize(
@@ -275,7 +278,37 @@ def test_sparse_candle_collection_is_bounded_to_recent_and_weekly_slot_requests(
     assert candles[0].timestamp == datetime.datetime(2026, 6, 22, 11, 50, tzinfo=UTC)
     assert candles[1].timestamp == datetime.datetime(2026, 6, 29, 11, 50, tzinfo=UTC)
     assert candles[1].volume == 0.0
+    assert candles[-1].trade_value == 550.0
     assert [candle.timestamp.minute for candle in candles[-3:]] == [30, 40, 50]
+
+
+def test_sparse_candle_collection_paginates_for_replay_windows_over_200_bars():
+    as_of = datetime.datetime(2026, 7, 13, 12, 6, tzinfo=UTC)
+    latest = datetime.datetime(2026, 7, 13, 11, 50, tzinfo=UTC)
+    chronological = [
+        latest - datetime.timedelta(minutes=10 * offset)
+        for offset in range(201, -1, -1)
+    ]
+    newest_first = list(
+        reversed([_raw_candle(timestamp) for timestamp in chronological])
+    )
+    session = _Session([newest_first[:200], newest_first[200:]])
+
+    result = asyncio.run(
+        get_candles(
+            session,
+            ["KRW-BTC"],
+            CandleTimeUnit.MINUTES,
+            count=201,
+            minutes_unit=10,
+            as_of=as_of,
+            synthesize_no_trade_intervals=True,
+        )
+    )
+
+    assert len(result["KRW-BTC"]) == 201
+    assert len(session.calls) == 2
+    assert [call["count"] for call in session.calls] == [200, 200]
 
 
 def test_sparse_candle_collection_rejects_missing_weekly_same_slot_history():
@@ -380,6 +413,37 @@ def test_candle_transport_failure_exhausts_retries_and_fails_the_market(monkeypa
 
     assert result == {}
     assert len(session.calls) == 3
+
+
+def test_candle_rate_limit_uses_a_shared_cooldown_before_retry(monkeypatch):
+    as_of = datetime.datetime(2026, 7, 13, 12, 6, tzinfo=UTC)
+    row = _raw_candle(datetime.datetime(2026, 7, 13, 11, 50, tzinfo=UTC))
+    session = _Session(
+        [_Response([], status=429, headers={"Retry-After": "0.25"}), [row]]
+    )
+    delays = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+        loop = asyncio.get_running_loop()
+        upbit_client._LOOP_COOLDOWN_UNTIL[loop] = loop.time()
+
+    monkeypatch.setattr("common.upbit_client.asyncio.sleep", record_sleep)
+    result = asyncio.run(
+        get_candles(
+            session,
+            ["KRW-BTC"],
+            CandleTimeUnit.MINUTES,
+            count=1,
+            minutes_unit=10,
+            as_of=as_of,
+            synthesize_no_trade_intervals=True,
+        )
+    )
+
+    assert len(result["KRW-BTC"]) == 1
+    assert len(session.calls) == 2
+    assert delays[0] == 1.0
 
 
 def test_retry_after_accepts_http_date_and_caps_the_delay(monkeypatch):
