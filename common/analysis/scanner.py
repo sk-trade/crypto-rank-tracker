@@ -35,7 +35,12 @@ def _rolling_turnover(candle_list: List) -> float | None:
     prior_candles = candle_list[-(config.ROLLING_TURNOVER_LOOKBACK_BARS + 1):-1]
     if not prior_candles:
         return None
-    turnovers = [candle.close_price * candle.volume for candle in prior_candles]
+    turnovers = [
+        candle.trade_value
+        if candle.trade_value is not None
+        else candle.close_price * candle.volume
+        for candle in prior_candles
+    ]
     return float(np.median(turnovers)) if turnovers else None
 
 

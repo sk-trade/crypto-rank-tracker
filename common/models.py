@@ -149,7 +149,30 @@ class ScanDecision(StrEnum):
     DATA_QUALITY_BLOCKED = "data_quality_blocked"
     DEEP_DIVE_DATA_BLOCKED = "deep_dive_data_blocked"
     CANDIDATE_NOT_ALERTED = "candidate_not_alerted"
+    ATTENTION_QUEUED = "attention_queued"
     ALERT_SELECTED = "alert_selected"
+
+
+class AttentionStage(StrEnum):
+    DISCOVERED = "discovered"
+    BUILDING = "building"
+    CONFIRMED = "confirmed"
+    COOLING = "cooling"
+    FAILED = "failed"
+
+
+class EvidenceFamily(StrEnum):
+    ACTIVITY = "activity"
+    PRICE_STRUCTURE = "price_structure"
+    CONTEXT = "context"
+    EXECUTION = "execution"
+
+
+class EvidenceVerdict(StrEnum):
+    SUPPORTING = "supporting"
+    MIXED = "mixed"
+    RISK = "risk"
+    UNAVAILABLE = "unavailable"
 
 
 class Direction(StrEnum):
@@ -421,6 +444,7 @@ class CandleData(BaseModel):
     low_price: PositiveFiniteFloat
     close_price: PositiveFiniteFloat
     volume: NonNegativeFiniteFloat
+    trade_value: Optional[NonNegativeFiniteFloat] = None
 
     @model_validator(mode="after")
     def validate_ohlc(self) -> "CandleData":
@@ -477,6 +501,80 @@ class SignalCandidate(BaseModel):
     current_price: float
 
 
+class AttentionEvidence(BaseModel):
+    """One non-overlapping evidence family shown for an attention candidate."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    family: EvidenceFamily
+    verdict: EvidenceVerdict
+    summary: str
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AttentionStateEntry(BaseModel):
+    """Durable progression state for one market attention episode."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: KrwMarket
+    episode_id: str = Field(min_length=1)
+    first_seen_at: AwareDatetime
+    last_seen_at: AwareDatetime
+    consecutive_observations: int = Field(ge=1)
+    stage: AttentionStage
+    last_rank: Optional[int] = Field(default=None, ge=1)
+    last_price: PositiveFiniteFloat
+    last_relative_volume: Optional[NonNegativeFiniteFloat] = None
+    last_signal_score: Optional[float] = None
+    last_signal_type: Optional[SignalType] = None
+    structure_level: Optional[PositiveFiniteFloat] = None
+    structure_direction: Optional[StructureDirection] = None
+    cooling_observations: int = Field(default=0, ge=0)
+    material_change: bool = False
+    change_reasons: List[str] = Field(default_factory=list)
+
+
+class AttentionState(BaseModel):
+    """Latest bounded attention state, independent from webhook delivery state."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    updated_at: Optional[AwareDatetime] = None
+    entries: Dict[KrwMarket, AttentionStateEntry] = Field(default_factory=dict)
+
+
+class AttentionCandidate(BaseModel):
+    """Ranked item that tells a human which chart deserves attention and why."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: KrwMarket
+    attention_rank: int = Field(ge=1)
+    market_rank: Optional[int] = Field(default=None, ge=1)
+    market_rank_delta: Optional[int] = None
+    stage: AttentionStage
+    episode_id: str = Field(min_length=1)
+    first_seen_at: AwareDatetime
+    observed_at: AwareDatetime
+    consecutive_observations: int = Field(ge=1)
+    current_price: PositiveFiniteFloat
+    price_change_10m: Optional[float] = None
+    price_change_1h: Optional[float] = None
+    price_change_4h: Optional[float] = None
+    relative_volume: Optional[NonNegativeFiniteFloat] = None
+    conditional_volume_z: Optional[float] = None
+    price_surprise: Optional[float] = None
+    residual_momentum: Optional[float] = None
+    signal_score: Optional[float] = None
+    signal_type: Optional[SignalType] = None
+    structure_level: Optional[PositiveFiniteFloat] = None
+    structure_direction: Optional[StructureDirection] = None
+    material_change: bool
+    change_reasons: List[str] = Field(default_factory=list)
+    evidence: List[AttentionEvidence] = Field(default_factory=list)
+
+
 class Alert(BaseModel):
     """최종 알림 대상으로 확정된 시그널 객체입니다."""
 
@@ -524,6 +622,9 @@ class ScanEvent(BaseModel):
     direction: Optional[Direction] = None
     signal_score: Optional[float] = None
     signal_candle_start: Optional[datetime.datetime] = None
+    attention_stage: Optional[AttentionStage] = None
+    attention_rank: Optional[int] = Field(default=None, ge=1)
+    attention_episode_id: Optional[str] = None
 
 
 class ScanOutcome(BaseModel):

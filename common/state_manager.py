@@ -13,6 +13,7 @@ import config
 from common.models import (
     AlertHistory,
     AnalysisState,
+    AttentionState,
     NotificationBacklog,
     NotificationOutbox,
     RankState,
@@ -92,6 +93,27 @@ async def save_rank_state_history(
     data_to_save = [s.model_dump(mode="json") for s in updated_states]
     await save_json(filename, data_to_save, gcs_client)
     logger.info(f"순위 히스토리 저장 완료: {filename}")
+
+
+async def load_attention_state(gcs_client=None) -> AttentionState:
+    """Load candidate progression independently from notification delivery state."""
+    filename = config.ATTENTION_STATE_FILE_NAME
+    data = await load_json(filename, gcs_client, reject_null=True)
+    if data is None:
+        return AttentionState()
+    try:
+        return AttentionState.model_validate(data)
+    except ValidationError as error:
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename) from error
+
+
+async def save_attention_state(state: AttentionState, gcs_client=None) -> None:
+    """Persist the latest bounded attention episodes even when no webhook is configured."""
+    await save_json(
+        config.ATTENTION_STATE_FILE_NAME,
+        state.model_dump(mode="json"),
+        gcs_client,
+    )
 
 
 # --- 분석 로그 관리 ---

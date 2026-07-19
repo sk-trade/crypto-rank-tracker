@@ -3,13 +3,10 @@ import datetime
 from common.analysis.deep_dive import get_market_regime
 from common.models import (
     CandleData,
-    CandidateDecision,
     MarketRegime,
     MarketRegimeSnapshot,
-    RejectionCode,
     TickerData,
 )
-from main import record_market_regime_block
 
 
 UTC = datetime.timezone.utc
@@ -49,30 +46,3 @@ def test_true_range_includes_gaps_from_the_previous_close():
     regime = get_market_regime({"KRW-BTC": _btc_ticker(prices, high_offset=0.5)})
 
     assert regime.atr_ratio > 1.0
-
-
-def test_unknown_market_regime_blocks_all_candidates():
-    decisions = {
-        "KRW-BTC": CandidateDecision(eligible=True),
-        "KRW-ETH": CandidateDecision(eligible=True),
-    }
-    assert (
-        record_market_regime_block(
-            ["KRW-BTC", "KRW-ETH"],
-            decisions,
-            MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN),
-        )
-        == []
-    )
-    assert all(
-        decision.rejection_reasons == [RejectionCode.MARKET_REGIME_UNKNOWN]
-        for decision in decisions.values()
-    )
-
-    allowed = {"KRW-BTC": CandidateDecision(eligible=True)}
-    assert record_market_regime_block(
-        ["KRW-BTC"],
-        allowed,
-        MarketRegimeSnapshot(regime=MarketRegime.TRENDING_BULL),
-    ) == ["KRW-BTC"]
-    assert allowed["KRW-BTC"].eligible

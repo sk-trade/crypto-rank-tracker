@@ -10,7 +10,11 @@ import numpy as np
 from common.models import (
     Alert,
     AlertHistory,
+    AttentionCandidate,
+    AttentionStage,
     DataQualityIssue,
+    EvidenceFamily,
+    EvidenceVerdict,
     MarketTicker,
     MarketRegimeSnapshot,
     SignalType,
@@ -45,6 +49,7 @@ class NotificationFormatter:
         REVERSE_SECTOR_MAP: Dict[str, List[str]],
         alert_history: Dict[str, AlertHistory],
         market_regime: MarketRegimeSnapshot,
+        attention_queue: Optional[List[AttentionCandidate]] = None,
     ) -> str:
         """시장 브리핑 전체 메시지를 조립합니다."""
         kst = datetime.timezone(datetime.timedelta(hours=9))
@@ -60,17 +65,86 @@ class NotificationFormatter:
                 ["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str]
             )
 
+        if attention_queue:
+            parts.extend(
+                ["\n---", self._format_attention_queue(attention_queue, REVERSE_SECTOR_MAP)]
+            )
+
         if alerts:
-            parts.extend(["\n---", "⚡ **실시간 마켓 이벤트**"])
+            parts.extend(["\n---", "⚡ **중요 상태 변경**"])
             for alert in alerts[:10]:
                 parts.append(self._format_single_alert(alert, REVERSE_SECTOR_MAP, market_regime))
-        else:
+        elif not attention_queue:
             parts.append("\n---")
-            parts.append("✅ 특이사항 없음. 시장을 계속 주시합니다.")
+            parts.append("✅ 현재 관심 필터를 통과한 종목이 없습니다.")
 
         parts.append(self._format_top_10_ranking(current_rankings, previous_rankings))
 
         return "\n".join(parts)
+
+    def _format_attention_queue(
+        self,
+        candidates: List[AttentionCandidate],
+        reverse_sector_map: Dict[str, List[str]],
+    ) -> str:
+        """Render the compact chart-review queue without presenting a trade score."""
+        stage_labels = {
+            AttentionStage.DISCOVERED: "발견",
+            AttentionStage.BUILDING: "누적",
+            AttentionStage.CONFIRMED: "구조확인",
+            AttentionStage.COOLING: "약화",
+            AttentionStage.FAILED: "구조실패",
+        }
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        lines = [f"🎯 **관심종목 큐 ({len(candidates)}개)**"]
+        for candidate in candidates:
+            symbol = candidate.market.removeprefix("KRW-")
+            tags = reverse_sector_map.get(candidate.market, [])
+            tag = f" · {tags[0]}" if tags else ""
+            marker = "●" if candidate.material_change else "○"
+            market_rank = (
+                f"24h #{candidate.market_rank}"
+                if candidate.market_rank is not None
+                else "24h rank n/a"
+            )
+            if candidate.market_rank_delta:
+                arrow = "↑" if candidate.market_rank_delta > 0 else "↓"
+                market_rank += f" {arrow}{abs(candidate.market_rank_delta)}"
+            first_seen = candidate.first_seen_at.astimezone(kst).strftime("%H:%M")
+            chart_url = (
+                f"https://upbit.com/exchange?code=CRIX.UPBIT.{candidate.market}"
+            )
+            lines.append(
+                f"{candidate.attention_rank}. {marker} **{symbol}**{tag} "
+                f"[{stage_labels[candidate.stage]}] · {market_rank} · "
+                f"{first_seen}부터 {candidate.consecutive_observations}회 · "
+                f"[차트]({chart_url})"
+            )
+
+            evidence = {item.family: item for item in candidate.evidence}
+            activity = evidence.get(EvidenceFamily.ACTIVITY)
+            price = evidence.get(EvidenceFamily.PRICE_STRUCTURE)
+            if activity and price:
+                lines.append(
+                    f"   - 근거: {activity.summary} | {price.summary}"
+                )
+
+            context = evidence.get(EvidenceFamily.CONTEXT)
+            if context:
+                label = (
+                    "보조근거(n/a)"
+                    if context.verdict is EvidenceVerdict.UNAVAILABLE
+                    else "보조근거"
+                )
+                lines.append(f"   - {label}: {context.summary}")
+            risks = [
+                item.summary
+                for item in candidate.evidence
+                if item.verdict is EvidenceVerdict.RISK
+            ]
+            if risks:
+                lines.append(f"   - 반대/위험: {' | '.join(risks)}")
+        return "\n".join(lines)
 
     def _format_market_status(
         self,

@@ -1,5 +1,10 @@
+import datetime
+
+from common.attention import build_attention_queue
 from common.models import (
     Alert,
+    AttentionStage,
+    CandleData,
     DataQualityIssue,
     MarketRegime,
     MarketRegimeSnapshot,
@@ -72,3 +77,49 @@ def test_formatter_labels_cooldown_follow_up_alerts():
 
     for signal_type, title in expected_titles.items():
         assert title in _header_for(signal_type)
+
+
+def test_attention_queue_shows_progression_and_concrete_evidence_without_a_score():
+    observed_at = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+    candles = [
+        CandleData(
+            market="KRW-KAITO",
+            timestamp=observed_at - datetime.timedelta(minutes=10 * (20 - index)),
+            open_price=100.0,
+            high_price=101.0,
+            low_price=99.0,
+            close_price=100.0,
+            volume=100.0,
+        )
+        for index in range(21)
+    ]
+    ticker = TickerData(
+        market="KRW-KAITO",
+        candle_history=candles,
+        price_change_10m=0.4,
+        price_change_1h=1.2,
+        relative_volume=10.8,
+        conditional_log_rvol_z_score=5.4,
+        price_surprise=2.5,
+        rolling_turnover=100_000_000,
+    )
+    queue, _ = build_attention_queue(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: 42},
+        {ticker.market: 60},
+        [],
+        [],
+    )
+
+    rendered = NotificationFormatter()._format_attention_queue(
+        queue, {ticker.market: ["AI"]}
+    )
+
+    assert queue[0].stage is AttentionStage.DISCOVERED
+    assert "관심종목 큐" in rendered
+    assert "KAITO" in rendered
+    assert "24h #42 ↑18" in rendered
+    assert "RVOL 10.80x" in rendered
+    assert "Signal score" not in rendered

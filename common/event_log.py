@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Tuple
 import config
 from common.models import (
     Alert,
+    AttentionCandidate,
     CandidateDecision,
     CandleData,
     DataQualityIssue,
@@ -62,6 +63,8 @@ def build_scan_events(
     deep_dive_candidates: Iterable[str],
     alerts: Iterable[Alert],
     candidates: Iterable[SignalCandidate] = (),
+    attention_candidates: Iterable[AttentionCandidate] = (),
+    execution_rejections_by_market: Dict[str, List[RejectionCode]] | None = None,
     data_quality_issues: Iterable[DataQualityIssue] = (),
     raw_tickers_by_market: Dict[str, MarketTicker] | None = None,
 ) -> List[ScanEvent]:
@@ -69,7 +72,11 @@ def build_scan_events(
     deep_dive_markets = set(deep_dive_candidates)
     alerts_by_market = {alert.candidate.market: alert for alert in alerts}
     candidates_by_market = {candidate.market: candidate for candidate in candidates}
+    attention_by_market = {
+        candidate.market: candidate for candidate in attention_candidates
+    }
     quality_issues = list(data_quality_issues)
+    execution_rejections_by_market = execution_rejections_by_market or {}
     raw_tickers_by_market = raw_tickers_by_market or {}
     events = []
 
@@ -85,6 +92,10 @@ def build_scan_events(
         )
         if raw_ticker := raw_tickers_by_market.get(market):
             feature_snapshot["raw_ticker"] = raw_ticker.model_dump(mode="json")
+        if execution_rejections := execution_rejections_by_market.get(market):
+            feature_snapshot["execution_rejection_reasons"] = [
+                reason.value for reason in execution_rejections
+            ]
         if quality_issues:
             feature_snapshot["data_quality_issues"] = [
                 issue.model_dump(mode="json") for issue in quality_issues
@@ -95,18 +106,25 @@ def build_scan_events(
             if decision
             else [RejectionCode.COMPLETE_CANDLE_HISTORY_UNAVAILABLE]
         )
+        if (
+            ticker
+            and market not in deep_dive_markets
+            and (eligible or market in attention_by_market)
+        ):
+            reasons.append(RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE)
         if quality_issues:
             final_decision = ScanDecision.DATA_QUALITY_BLOCKED
             reasons.extend(issue.code for issue in quality_issues)
         elif not ticker:
             final_decision = ScanDecision.DATA_QUALITY_BLOCKED
+        elif market in alerts_by_market:
+            final_decision = ScanDecision.ALERT_SELECTED
+        elif market in attention_by_market:
+            final_decision = ScanDecision.ATTENTION_QUEUED
         elif not eligible:
             final_decision = _final_decision_for_rejected_candidate(reasons)
         elif market not in deep_dive_markets:
             final_decision = ScanDecision.DEEP_DIVE_DATA_BLOCKED
-            reasons.append(RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE)
-        elif market in alerts_by_market:
-            final_decision = ScanDecision.ALERT_SELECTED
         else:
             final_decision = ScanDecision.CANDIDATE_NOT_ALERTED
 
@@ -118,6 +136,7 @@ def build_scan_events(
             )
             signal_candle_start = ticker.candle_history[-1].timestamp
         candidate = candidates_by_market.get(market)
+        attention = attention_by_market.get(market)
         events.append(
             ScanEvent(
                 event_id=f"{observed_at.isoformat()}:{market}",
@@ -131,6 +150,9 @@ def build_scan_events(
                 direction=direction,
                 signal_score=candidate.signal_score if candidate else None,
                 signal_candle_start=signal_candle_start,
+                attention_stage=attention.stage if attention else None,
+                attention_rank=attention.attention_rank if attention else None,
+                attention_episode_id=attention.episode_id if attention else None,
             )
         )
     return events

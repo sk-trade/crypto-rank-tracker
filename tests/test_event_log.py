@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 import config
+from common.attention import build_attention_queue
 from common.analysis.deep_dive import enrich_deep_dive_tickers
 from common.event_log import build_scan_events, resolve_scan_outcomes
 from common.models import (
@@ -96,6 +97,7 @@ def test_scan_events_include_all_markets_and_rejection_decisions():
 
     by_market = {event.market: event for event in events}
     assert set(by_market) == {"KRW-BTC", "KRW-ETH", "KRW-XRP"}
+    assert {event.model_version for event in events} == {config.SIGNAL_MODEL_VERSION}
     assert by_market["KRW-BTC"].final_decision is ScanDecision.CANDIDATE_NOT_ALERTED
     assert by_market["KRW-ETH"].rejection_reasons == [
         RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD
@@ -134,6 +136,91 @@ def test_scan_events_preserve_execution_and_regime_blocking_stages():
     by_market = {event.market: event for event in events}
     assert by_market["KRW-BTC"].final_decision is ScanDecision.EXECUTION_BLOCKED
     assert by_market["KRW-ETH"].final_decision is ScanDecision.MARKET_REGIME_BLOCKED
+
+
+def test_scan_event_records_attention_queue_position_before_final_alert():
+    observed_at = datetime.datetime(2026, 6, 18, 0, 10, tzinfo=UTC)
+    ticker = TickerData(
+        market="KRW-BTC",
+        candle_history=[_candle(observed_at, 100.0, 101.0, 99.0)],
+        price_change_10m=0.5,
+    )
+    queue, _ = build_attention_queue(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: 3},
+        {ticker.market: 5},
+        [],
+        [],
+    )
+
+    event = build_scan_events(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: CandidateDecision(eligible=True)},
+        [],
+        [],
+        attention_candidates=queue,
+    )[0]
+
+    assert event.final_decision is ScanDecision.ATTENTION_QUEUED
+    assert event.attention_rank == 1
+    assert event.attention_stage == queue[0].stage
+    assert event.attention_episode_id == queue[0].episode_id
+    assert event.rejection_reasons == [
+        RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE
+    ]
+
+
+def test_cooling_attention_item_is_not_logged_as_only_a_filter_rejection():
+    observed_at = datetime.datetime(2026, 6, 18, 0, 10, tzinfo=UTC)
+    ticker = TickerData(
+        market="KRW-BTC",
+        candle_history=[_candle(observed_at, 100.0, 101.0, 99.0)],
+        price_change_10m=0.1,
+    )
+    _, state = build_attention_queue(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: 3},
+        {},
+        [],
+        [],
+    )
+    cooling, _ = build_attention_queue(
+        observed_at + datetime.timedelta(minutes=10),
+        [],
+        {ticker.market: ticker},
+        {ticker.market: 5},
+        {ticker.market: 3},
+        [],
+        [],
+        previous_state=state,
+    )
+
+    event = build_scan_events(
+        observed_at + datetime.timedelta(minutes=10),
+        [ticker.market],
+        {ticker.market: ticker},
+        {
+            ticker.market: CandidateDecision(
+                eligible=False,
+                rejection_reasons=[RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD],
+            )
+        },
+        [],
+        [],
+        attention_candidates=cooling,
+    )[0]
+
+    assert event.final_decision is ScanDecision.ATTENTION_QUEUED
+    assert event.rejection_reasons == [
+        RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE,
+        RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD,
+    ]
 
 
 def test_scan_event_records_alert_selection_without_claiming_delivery():

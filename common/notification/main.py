@@ -12,6 +12,7 @@ import config
 from common.models import (
     Alert,
     AlertHistory,
+    AttentionCandidate,
     DataQualityIssue,
     DeliveryState,
     DispatchCode,
@@ -105,10 +106,20 @@ async def create_and_dispatch_notification(
     alert_history: Dict[str, AlertHistory], 
     market_regime: MarketRegimeSnapshot,
     final_alerts: Optional[List[Alert]] = None,
+    attention_queue: Optional[List[AttentionCandidate]] = None,
+    suppress_unchanged_briefing: bool = False,
     gcs_client=None,
     scan_key: str | None = None,
 ) -> DispatchResult:
     """시장 브리핑을 생성하고, 최종 알림이 있을 경우 함께 전송합니다."""
+
+    if suppress_unchanged_briefing and not final_alerts and not attention_queue:
+        logger.info("새 관심종목이나 중요 상태 변경이 없어 webhook 전송을 건너뜁니다.")
+        return DispatchResult(
+            outcome=DispatchOutcome.SKIPPED,
+            code=DispatchCode.EMPTY_MESSAGE,
+            detail="no_material_attention_change",
+        )
 
     # 메시지 포매팅
     formatter = NotificationFormatter()
@@ -122,6 +133,7 @@ async def create_and_dispatch_notification(
         REVERSE_SECTOR_MAP=REVERSE_SECTOR_MAP,
         alert_history=alert_history,
         market_regime=market_regime,
+        attention_queue=attention_queue or [],
     )
     
     # 알림 전송
