@@ -13,6 +13,7 @@ from common.models import (
     Alert,
     AttentionCandidate,
     AttentionEvidence,
+    AttentionLane,
     AttentionStage,
     AttentionState,
     AttentionStateEntry,
@@ -37,6 +38,15 @@ class _StructureSnapshot:
     failed: bool = False
 
 
+@dataclass(frozen=True)
+class AttentionQueueResult:
+    """Visible cards, complete survivor evidence, and the next durable state."""
+
+    visible: List[AttentionCandidate]
+    all_candidates: List[AttentionCandidate]
+    state: AttentionState
+
+
 def build_attention_queue(
     observed_at: datetime.datetime,
     candidate_markets: Iterable[str],
@@ -49,10 +59,45 @@ def build_attention_queue(
     execution_decisions: Mapping[str, ExecutionDecision] | None = None,
     market_regime: MarketRegimeSnapshot | None = None,
     limit: int | None = None,
+    record_primary_exposures: bool | None = None,
 ) -> tuple[List[AttentionCandidate], AttentionState]:
-    """Advance attention episodes and return the highest-priority visible queue."""
+    """Compatibility wrapper returning only the currently visible cards."""
+    result = build_attention_result(
+        observed_at,
+        candidate_markets,
+        tickers,
+        current_rankings,
+        previous_rankings,
+        signal_candidates,
+        alerts,
+        previous_state=previous_state,
+        execution_decisions=execution_decisions,
+        market_regime=market_regime,
+        limit=limit,
+        record_primary_exposures=record_primary_exposures,
+    )
+    return result.visible, result.state
+
+
+def build_attention_result(
+    observed_at: datetime.datetime,
+    candidate_markets: Iterable[str],
+    tickers: Mapping[str, TickerData],
+    current_rankings: Mapping[str, int],
+    previous_rankings: Mapping[str, int],
+    signal_candidates: Iterable[SignalCandidate],
+    alerts: Iterable[Alert],
+    previous_state: AttentionState | None = None,
+    execution_decisions: Mapping[str, ExecutionDecision] | None = None,
+    market_regime: MarketRegimeSnapshot | None = None,
+    limit: int | None = None,
+    record_primary_exposures: bool | None = None,
+) -> AttentionQueueResult:
+    """Advance episodes and retain both guarded cards and every survivor."""
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
+    if limit is not None and limit < 1:
+        raise ValueError("attention queue limit must be positive")
 
     previous_state = previous_state or AttentionState()
     execution_decisions = execution_decisions or {}
@@ -113,6 +158,21 @@ def build_attention_queue(
                 signal_type=signal_type,
             )
 
+        recent_exposures = _recent_exposure_times(previous, observed_at)
+        lane = _attention_lane(
+            stage=stage,
+            consecutive_observations=consecutive,
+            context_available=_context_available(ticker),
+            previous=previous,
+            same_observation=same_observation,
+        )
+        focus_observations = previous.focus_observations if previous else 0
+        if lane is AttentionLane.FOCUS and not same_observation:
+            focus_observations += 1
+        confirmed_transition_seen = (
+            previous.confirmed_transition_seen if previous else False
+        ) or (stage is AttentionStage.CONFIRMED and _context_available(ticker))
+
         entry = AttentionStateEntry(
             market=market,
             episode_id=episode_id,
@@ -128,6 +188,10 @@ def build_attention_queue(
             structure_level=structure.level,
             structure_direction=structure.direction,
             cooling_observations=0,
+            focus_observations=focus_observations,
+            confirmed_transition_seen=confirmed_transition_seen,
+            primary_exposure_times=recent_exposures,
+            last_lane=lane,
             material_change=material_change,
             change_reasons=change_reasons,
         )
@@ -172,6 +236,10 @@ def build_attention_queue(
                     "structure_direction": structure.direction
                     or previous.structure_direction,
                     "cooling_observations": previous.cooling_observations + 1,
+                    "primary_exposure_times": _recent_exposure_times(
+                        previous, observed_at
+                    ),
+                    "last_lane": AttentionLane.COOLING_FAILED,
                     "material_change": True,
                     "change_reasons": [f"stage:{previous.stage.value}->{stage.value}"],
                 }
@@ -195,18 +263,76 @@ def build_attention_queue(
             )
         )
 
-    ranked = rank_attention_candidates(candidates)
-    visible_limit = config.ATTENTION_QUEUE_LIMIT if limit is None else limit
-    if visible_limit < 1:
-        raise ValueError("attention queue limit must be positive")
+    v3_ranked = rank_attention_candidates(candidates)
+    v3_positions = {
+        candidate.market: candidate.attention_rank for candidate in v3_ranked
+    }
+    with_shadow = [
+        candidate.model_copy(
+            update={"v3_shadow_rank": v3_positions[candidate.market]}
+        )
+        for candidate in candidates
+    ]
+    v4_ranked = rank_attention_candidates_v4(with_shadow)
+    by_market = {candidate.market: candidate for candidate in v4_ranked}
+
+    if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION:
+        ordered = v4_ranked
+        visible_markets = _guarded_visible_markets(v4_ranked)
+    elif config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V3_MODEL_VERSION:
+        ordered = [by_market[candidate.market] for candidate in v3_ranked]
+        visible_markets = [
+            candidate.market for candidate in ordered[: config.ATTENTION_QUEUE_LIMIT]
+        ]
+    else:
+        raise ValueError(
+            "ATTENTION_VISIBLE_MODEL must be attention-v4-c-guarded or attention-v3"
+        )
+
+    if limit is not None:
+        visible_markets = visible_markets[:limit]
+    visible_set = set(visible_markets)
+    should_record_exposures = (
+        attention_briefing_due(observed_at)
+        if record_primary_exposures is None
+        else record_primary_exposures
+    )
+    display_positions = {
+        market: index for index, market in enumerate(visible_markets, 1)
+    }
+    ranked = [
+        candidate.model_copy(
+            update={
+                "attention_rank": index,
+                "primary_selected": candidate.market in visible_set,
+                "displayed": (
+                    candidate.market in visible_set and should_record_exposures
+                ),
+                "display_rank": (
+                    display_positions.get(candidate.market)
+                    if should_record_exposures
+                    else None
+                ),
+            }
+        )
+        for index, candidate in enumerate(ordered, 1)
+    ]
+    ranked_by_market = {candidate.market: candidate for candidate in ranked}
+    visible = [ranked_by_market[market] for market in visible_markets]
     state = AttentionState(updated_at=observed_at, entries=updated_entries)
-    return ranked[:visible_limit], state
+    if should_record_exposures:
+        state = _record_primary_exposures(state, visible, observed_at)
+    return AttentionQueueResult(
+        visible=visible,
+        all_candidates=ranked,
+        state=state,
+    )
 
 
 def rank_attention_candidates(
     candidates: Sequence[AttentionCandidate],
 ) -> List[AttentionCandidate]:
-    """Apply a deterministic priority order without exposing a fake precision score."""
+    """Preserve the attention-v3 order for shadow comparison and rollback."""
 
     def sort_key(candidate: AttentionCandidate) -> tuple:
         stage_priority = {
@@ -237,8 +363,158 @@ def rank_attention_candidates(
 
     ordered = sorted(candidates, key=sort_key)
     return [
+        candidate.model_copy(
+            update={"attention_rank": index, "v3_shadow_rank": index}
+        )
+        for index, candidate in enumerate(ordered, 1)
+    ]
+
+
+def rank_attention_candidates_v4(
+    candidates: Sequence[AttentionCandidate],
+) -> List[AttentionCandidate]:
+    """Rank within structural lanes; only close Focus #2/#3 choices diversify."""
+    by_lane = {
+        lane: [candidate for candidate in candidates if candidate.lane is lane]
+        for lane in AttentionLane
+    }
+    ranked_by_lane = {
+        AttentionLane.FOCUS: _rank_focus_candidates(by_lane[AttentionLane.FOCUS]),
+        AttentionLane.EARLY: _rank_by_quality(by_lane[AttentionLane.EARLY]),
+        AttentionLane.ONGOING: _rank_ongoing_candidates(
+            by_lane[AttentionLane.ONGOING]
+        ),
+        AttentionLane.COOLING_FAILED: _rank_by_quality(
+            by_lane[AttentionLane.COOLING_FAILED]
+        ),
+        AttentionLane.DATA_LIMITED: _rank_by_quality(
+            by_lane[AttentionLane.DATA_LIMITED]
+        ),
+    }
+    ordered = []
+    for lane in [
+        AttentionLane.FOCUS,
+        AttentionLane.EARLY,
+        AttentionLane.ONGOING,
+        AttentionLane.COOLING_FAILED,
+        AttentionLane.DATA_LIMITED,
+    ]:
+        ordered.extend(
+            candidate.model_copy(update={"lane_rank": index})
+            for index, candidate in enumerate(ranked_by_lane[lane], 1)
+        )
+    return [
         candidate.model_copy(update={"attention_rank": index})
         for index, candidate in enumerate(ordered, 1)
+    ]
+
+
+def _rank_by_quality(
+    candidates: Sequence[AttentionCandidate],
+) -> List[AttentionCandidate]:
+    return sorted(candidates, key=lambda candidate: candidate.quality_score, reverse=True)
+
+
+def _rank_focus_candidates(
+    candidates: Sequence[AttentionCandidate],
+) -> List[AttentionCandidate]:
+    remaining = _rank_by_quality(candidates)
+    if not remaining:
+        return []
+
+    first = remaining.pop(0)
+    selected = [
+        first.model_copy(
+            update={"ranking_score": first.quality_score, "max_similarity": 0.0}
+        )
+    ]
+    lane_max = selected[0].quality_score
+    guarded_slots = max(config.ATTENTION_FOCUS_SLOTS - 1, 0)
+    for _ in range(min(guarded_slots, len(remaining))):
+        eligible = [
+            candidate
+            for candidate in remaining
+            if candidate.quality_score
+            >= lane_max - config.ATTENTION_V4_RERANK_QUALITY_WINDOW
+        ]
+        pool = eligible or [remaining[0]]
+        scored = []
+        for candidate in pool:
+            similarity = max(
+                (_candidate_similarity(candidate, prior) for prior in selected),
+                default=0.0,
+            )
+            repeat_ratio = min(
+                1.0,
+                candidate.primary_exposures_60m
+                / config.ATTENTION_V4_REPEAT_EXPOSURE_DIVISOR,
+            )
+            ranking_score = (
+                candidate.quality_score
+                - config.ATTENTION_V4_SIMILARITY_PENALTY * similarity
+                - config.ATTENTION_V4_REPEAT_PENALTY * repeat_ratio
+            )
+            scored.append(
+                candidate.model_copy(
+                    update={
+                        "ranking_score": ranking_score,
+                        "max_similarity": similarity,
+                    }
+                )
+            )
+        chosen = max(scored, key=lambda candidate: candidate.ranking_score)
+        selected.append(chosen)
+        remaining = [
+            candidate for candidate in remaining if candidate.market != chosen.market
+        ]
+
+    selected.extend(
+        candidate.model_copy(
+            update={
+                "ranking_score": candidate.quality_score,
+                "max_similarity": 0.0,
+            }
+        )
+        for candidate in _rank_by_quality(remaining)
+    )
+    return selected
+
+
+def _rank_ongoing_candidates(
+    candidates: Sequence[AttentionCandidate],
+) -> List[AttentionCandidate]:
+    scored = []
+    for candidate in candidates:
+        repeat_ratio = min(
+            1.0,
+            candidate.primary_exposures_60m
+            / config.ATTENTION_V4_REPEAT_EXPOSURE_DIVISOR,
+        )
+        scored.append(
+            candidate.model_copy(
+                update={
+                    "ranking_score": candidate.quality_score
+                    - config.ATTENTION_V4_ONGOING_REPEAT_PENALTY * repeat_ratio
+                }
+            )
+        )
+    return sorted(scored, key=lambda candidate: candidate.ranking_score, reverse=True)
+
+
+def _guarded_visible_markets(
+    candidates: Sequence[AttentionCandidate],
+) -> List[str]:
+    limits = {
+        AttentionLane.FOCUS: config.ATTENTION_FOCUS_SLOTS,
+        AttentionLane.EARLY: config.ATTENTION_EARLY_SLOTS,
+        AttentionLane.ONGOING: config.ATTENTION_ONGOING_SLOTS,
+    }
+    return [
+        candidate.market
+        for candidate in candidates
+        if candidate.lane in limits
+        and candidate.lane_rank is not None
+        and candidate.lane_rank <= limits[candidate.lane]
     ]
 
 
@@ -321,9 +597,17 @@ def _candidate_from_entry(
         if previous_rank is not None and market_rank is not None
         else None
     )
+    evidence = _build_evidence(ticker, execution, market_regime, structure)
+    quality_score = _quality_score(ticker, evidence)
     return AttentionCandidate(
         market=entry.market,
         attention_rank=1,
+        lane=entry.last_lane or AttentionLane.DATA_LIMITED,
+        score_version=config.ATTENTION_V4_MODEL_VERSION,
+        context_available=_context_available(ticker),
+        quality_score=quality_score,
+        ranking_score=quality_score,
+        primary_exposures_60m=len(entry.primary_exposure_times),
         market_rank=market_rank,
         market_rank_delta=rank_delta,
         stage=entry.stage,
@@ -345,7 +629,178 @@ def _candidate_from_entry(
         structure_direction=entry.structure_direction,
         material_change=entry.material_change,
         change_reasons=entry.change_reasons,
-        evidence=_build_evidence(ticker, execution, market_regime, structure),
+        evidence=evidence,
+    )
+
+
+def _attention_lane(
+    *,
+    stage: AttentionStage,
+    consecutive_observations: int,
+    context_available: bool,
+    previous: AttentionStateEntry | None,
+    same_observation: bool,
+) -> AttentionLane:
+    if stage in {AttentionStage.COOLING, AttentionStage.FAILED}:
+        return AttentionLane.COOLING_FAILED
+    if same_observation and previous and previous.last_lane is not None:
+        return previous.last_lane
+    if not context_available:
+        return AttentionLane.DATA_LIMITED
+    if stage is AttentionStage.DISCOVERED and consecutive_observations == 1:
+        return AttentionLane.EARLY
+    if stage in {AttentionStage.BUILDING, AttentionStage.CONFIRMED}:
+        focus_observations = previous.focus_observations if previous else 0
+        first_confirmed_transition = (
+            previous is not None
+            and previous.stage is not AttentionStage.CONFIRMED
+            and stage is AttentionStage.CONFIRMED
+            and not previous.confirmed_transition_seen
+        )
+        if (
+            focus_observations < config.ATTENTION_FOCUS_SCAN_LIMIT
+            or first_confirmed_transition
+        ):
+            return AttentionLane.FOCUS
+    return AttentionLane.ONGOING
+
+
+def _context_available(ticker: TickerData) -> bool:
+    return (
+        len(ticker.hourly_candles) >= config.ATTENTION_CONTEXT_MIN_HOURLY_BARS
+        and len(ticker.daily_candles) >= config.ATTENTION_CONTEXT_MIN_DAILY_BARS
+    )
+
+
+def _recent_exposure_times(
+    previous: AttentionStateEntry | None,
+    observed_at: datetime.datetime,
+) -> List[datetime.datetime]:
+    if previous is None:
+        return []
+    cutoff = observed_at - datetime.timedelta(
+        minutes=config.ATTENTION_PRIMARY_EXPOSURE_WINDOW_MINUTES
+    )
+    return [
+        exposure
+        for exposure in previous.primary_exposure_times
+        if cutoff <= exposure < observed_at
+    ]
+
+
+def _record_primary_exposures(
+    state: AttentionState,
+    visible: Sequence[AttentionCandidate],
+    observed_at: datetime.datetime,
+) -> AttentionState:
+    visible_markets = {candidate.market for candidate in visible}
+    entries = {}
+    for market, entry in state.entries.items():
+        exposures = list(entry.primary_exposure_times)
+        if market in visible_markets and observed_at not in exposures:
+            exposures.append(observed_at)
+        entries[market] = entry.model_copy(
+            update={"primary_exposure_times": exposures}
+        )
+    return state.model_copy(update={"entries": entries})
+
+
+def _quality_score(
+    ticker: TickerData,
+    evidence: Sequence[AttentionEvidence],
+) -> float:
+    activity_strength = _saturated_strength(
+        ticker.conditional_log_rvol_z_score,
+        config.rvol_z_score_minimum(ticker.liquidity_tier),
+    )
+    price_strength = _saturated_strength(
+        ticker.price_surprise,
+        config.price_surprise_minimum(ticker.liquidity_tier),
+    )
+    by_family = {item.family: item for item in evidence}
+    context_adjustment = _verdict_adjustment(
+        by_family[EvidenceFamily.CONTEXT].verdict,
+        config.ATTENTION_V4_CONTEXT_ADJUSTMENT,
+    )
+    execution_adjustment = _verdict_adjustment(
+        by_family[EvidenceFamily.EXECUTION].verdict,
+        config.ATTENTION_V4_EXECUTION_ADJUSTMENT,
+    )
+    score = (
+        config.ATTENTION_V4_ACTIVITY_WEIGHT * activity_strength
+        + config.ATTENTION_V4_PRICE_SURPRISE_WEIGHT * price_strength
+        + context_adjustment
+        + execution_adjustment
+    )
+    return min(max(score, 0.0), 1.0)
+
+
+def _saturated_strength(value: float | None, threshold: float) -> float:
+    if value is None or threshold <= 0:
+        return 0.0
+    saturation = threshold * config.ATTENTION_V4_STRENGTH_SATURATION_RATIO
+    return min(max(value, 0.0) / saturation, 1.0)
+
+
+def _verdict_adjustment(verdict: EvidenceVerdict, amount: float) -> float:
+    if verdict is EvidenceVerdict.SUPPORTING:
+        return amount
+    if verdict is EvidenceVerdict.RISK:
+        return -amount
+    return 0.0
+
+
+def _candidate_similarity(
+    left: AttentionCandidate,
+    right: AttentionCandidate,
+) -> float:
+    left_features = _similarity_features(left)
+    right_features = _similarity_features(right)
+    similarities = []
+    for left_value, right_value in zip(left_features, right_features, strict=True):
+        if left_value is None or right_value is None:
+            continue
+        similarities.append(1.0 - min(abs(left_value - right_value), 1.0))
+    return sum(similarities) / len(similarities) if similarities else 0.0
+
+
+def _similarity_features(
+    candidate: AttentionCandidate,
+) -> tuple[float | None, ...]:
+    def normalized(value: float | None, scale: float) -> float | None:
+        if value is None:
+            return None
+        return min(max(value / scale, 0.0), 1.0)
+
+    def direction(value: float | None) -> float | None:
+        if value is None:
+            return None
+        if value > 0:
+            return 1.0
+        if value < 0:
+            return 0.0
+        return 0.5
+
+    context = next(
+        (
+            item
+            for item in candidate.evidence
+            if item.family is EvidenceFamily.CONTEXT
+        ),
+        None,
+    )
+    trend = context.metrics.get("trend_1h") if context else None
+    trend_value = {
+        TrendState.UP.value: 1.0,
+        TrendState.DOWN.value: 0.0,
+        TrendState.NEUTRAL.value: 0.5,
+    }.get(trend)
+    return (
+        normalized(candidate.conditional_volume_z, config.MAX_Z_SCORE_CAP),
+        normalized(candidate.price_surprise, 5.0),
+        direction(candidate.price_change_10m),
+        direction(candidate.price_change_1h),
+        trend_value,
     )
 
 

@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0] - 2026-07-20
+
+### Added
+
+- Added the `attention-v4-c-guarded` lane model with independent `Focus Now`
+  (3), `Early Watch` (1), and `Ongoing` (1) card budgets plus folded
+  `Cooling / Failed` and `Data-limited` queues.
+- Added a bounded conservative quality score, Focus-only diversity/repeat
+  reranking, 60-minute primary-card exposure history, and an immediate
+  `ATTENTION_VISIBLE_MODEL=attention-v3` rollback switch.
+- Added per-survivor v3 shadow ranks, lane/display state, score provenance,
+  raw and eligible-context coverage, and first-seen evidence to immutable scan
+  events and replay observations.
+- Added replay comparison fields for v4 versus v3 shadow precision, pre-event
+  recall, time-to-move, and `AttentionYield` while retaining 10-minute,
+  60-minute, and daily inputs.
+
+### Changed
+
+- Made v4 visible by default while keeping every broad-filter survivor in the
+  complete queue; empty lane slots are no longer filled by a different lane.
+- Limited Early to the first discovered observation, Focus to the first three
+  building/confirmed observations plus one first confirmation transition, and
+  moved older live episodes to Ongoing.
+- Required 24 completed hourly bars and 200 completed daily bars for normal
+  lane placement. Incomplete candidates remain measurable as Data-limited
+  instead of receiving a missing-context advantage.
+- Reworded card direction as observed 10-minute/60-minute/daily alignment with
+  explicit contrary evidence and a non-predictive disclaimer.
+
+### Fixed
+
+- Counted repeat exposure only on scheduled briefing scans rather than every
+  internal 10-minute ranking pass.
+- Preserved all folded survivors in event and replay logs instead of measuring
+  only the production-visible Top K.
+
 ## [0.4.0] - 2026-07-19
 
 ### Added

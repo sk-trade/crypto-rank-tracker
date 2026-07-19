@@ -121,6 +121,8 @@ def load_dataset(
     evaluation_days: int,
     as_of: datetime.datetime | None = None,
 ) -> tuple[Dict[str, list[CandleData]], Dict[str, list[CandleData]], dict] | None:
+    required_ten_minute_count = replay_10m_bar_count(evaluation_days)
+    required_daily_count = replay_daily_bar_count(evaluation_days)
     manifest_path = cache_dir / "manifest.json"
     ten_minute_path = cache_dir / "candles-10m"
     daily_path = cache_dir / "candles-daily"
@@ -136,9 +138,26 @@ def load_dataset(
         )
     except ValueError:
         return None
+    cached_evaluation_days = manifest.get("evaluation_days")
+    if isinstance(cached_evaluation_days, bool) or not isinstance(
+        cached_evaluation_days, int
+    ):
+        return None
+    if cached_evaluation_days < evaluation_days:
+        return None
+    cached_ten_minute_count = manifest.get("ten_minute_bar_count")
+    cached_daily_count = manifest.get("daily_bar_count")
+    if cached_evaluation_days > evaluation_days and (
+        isinstance(cached_ten_minute_count, bool)
+        or not isinstance(cached_ten_minute_count, int)
+        or cached_ten_minute_count < required_ten_minute_count
+        or isinstance(cached_daily_count, bool)
+        or not isinstance(cached_daily_count, int)
+        or cached_daily_count < required_daily_count
+    ):
+        return None
     if (
         manifest.get("schema_version") != CACHE_SCHEMA_VERSION
-        or manifest.get("evaluation_days") != evaluation_days
         or manifest.get("complete", True) is not True
         or cached_as_of is None
         or (
@@ -156,6 +175,11 @@ def load_dataset(
 
 async def run(args: argparse.Namespace) -> ReplayReport:
     cache_dir = _tmp_path(Path(args.cache_dir))
+    output_dir_value = getattr(args, "output_dir", None)
+    output_dir = (
+        _tmp_path(Path(output_dir_value)) if output_dir_value else cache_dir
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
     requested_as_of = _parse_as_of(args.as_of) if args.as_of else None
     dataset = (
         None
@@ -173,7 +197,9 @@ async def run(args: argparse.Namespace) -> ReplayReport:
         save_dataset(cache_dir, *dataset)
     else:
         print(
-            f"Using cached dataset from {dataset[2]['as_of']} in {cache_dir}",
+            f"Using cached {dataset[2]['evaluation_days']}-day dataset from "
+            f"{dataset[2]['as_of']} in {cache_dir} for a "
+            f"{args.evaluation_days}-day replay",
             flush=True,
         )
 
@@ -200,9 +226,9 @@ async def run(args: argparse.Namespace) -> ReplayReport:
                 flush=True,
             )
 
-    observations_path = cache_dir / "observations.ndjson"
+    observations_path = output_dir / "observations.ndjson"
     descriptor, temporary = tempfile.mkstemp(
-        dir=cache_dir, prefix=".observations.", suffix=".ndjson.tmp", text=True
+        dir=output_dir, prefix=".observations.", suffix=".ndjson.tmp", text=True
     )
     temporary_path = Path(temporary)
     try:
@@ -213,6 +239,7 @@ async def run(args: argparse.Namespace) -> ReplayReport:
                 sectors,
                 reverse_sector_map,
                 evaluation_days=args.evaluation_days,
+                source_evaluation_days=manifest["evaluation_days"],
                 top_k=args.top_k,
                 requested_market_count=manifest["requested_market_count"],
                 progress=progress,
@@ -226,8 +253,8 @@ async def run(args: argparse.Namespace) -> ReplayReport:
         os.replace(temporary_path, observations_path)
     finally:
         temporary_path.unlink(missing_ok=True)
-    report_json = cache_dir / "report.json"
-    report_markdown = cache_dir / "report.md"
+    report_json = output_dir / "report.json"
+    report_markdown = output_dir / "report.md"
     _atomic_write_json(report_json, report.model_dump(mode="json"))
     _atomic_write_text(report_markdown, report.to_markdown())
     print(
@@ -258,6 +285,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--top-k", type=int, default=config.REPLAY_DEFAULT_TOP_K
     )
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument(
+        "--output-dir",
+        help=(
+            "report directory under /tmp; defaults to --cache-dir so a shared "
+            "long-window cache can feed separate comparison outputs"
+        ),
+    )
     parser.add_argument(
         "--as-of", help="timezone-aware ISO timestamp; defaults to current UTC"
     )

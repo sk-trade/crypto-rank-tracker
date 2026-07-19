@@ -2,23 +2,34 @@ import asyncio
 import datetime
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import config
 from common.models import CandleData, MarketEvent, MarketTicker
 from common.replay import (
+    REPLAY_ANALYSIS_TIMEFRAMES,
     REPLAY_VARIANT_ATTENTION,
     REPLAY_VARIANT_BASELINE,
     REPLAY_VARIANT_PROGRESSION,
+    REPLAY_VARIANT_V3_SHADOW,
+    ReplayEvidenceTier,
     aggregate_hourly_candles,
     replay_10m_bar_count,
     replay_daily_bar_count,
+    replay_evidence_tier,
     replay_feature_history,
     replay_warmup_10m_bars,
     run_point_in_time_replay,
 )
-from replay_upbit import _tmp_path, collect_dataset, load_dataset, save_dataset
+from replay_upbit import (
+    _tmp_path,
+    collect_dataset,
+    load_dataset,
+    run as run_replay,
+    save_dataset,
+)
 
 
 UTC = datetime.timezone.utc
@@ -50,10 +61,32 @@ def test_replay_window_adds_feature_warmup_and_future_outcomes():
 def test_replay_evaluation_days_are_configurable_but_bounded():
     assert replay_10m_bar_count(1) < replay_10m_bar_count(7)
     assert replay_10m_bar_count(7) < replay_10m_bar_count(30)
+    assert replay_10m_bar_count(30) < replay_10m_bar_count(60)
+    assert replay_10m_bar_count(60) < replay_10m_bar_count(90)
     assert replay_10m_bar_count(30) == replay_warmup_10m_bars() + 30 * 144 + 12
     assert replay_daily_bar_count(30) == 232
+    assert replay_10m_bar_count(90) == replay_warmup_10m_bars() + 90 * 144 + 12
+    assert replay_daily_bar_count(90) == 292
     with pytest.raises(ValueError):
         replay_10m_bar_count(config.REPLAY_MAX_EVALUATION_DAYS + 1)
+
+
+@pytest.mark.parametrize(
+    ("evaluation_days", "expected"),
+    [
+        (1, ReplayEvidenceTier.SMOKE),
+        (3, ReplayEvidenceTier.SMOKE),
+        (7, ReplayEvidenceTier.REGRESSION),
+        (30, ReplayEvidenceTier.OPERATING_ACCEPTANCE),
+        (59, ReplayEvidenceTier.OPERATING_ACCEPTANCE),
+        (60, ReplayEvidenceTier.REGIME_ROBUSTNESS),
+        (90, ReplayEvidenceTier.REGIME_ROBUSTNESS),
+    ],
+)
+def test_replay_evidence_tier_prevents_short_window_overclaiming(
+    evaluation_days, expected
+):
+    assert replay_evidence_tier(evaluation_days) is expected
 
 
 def test_replay_feature_history_matches_the_live_compact_layout():
@@ -99,16 +132,20 @@ def test_replay_cache_round_trip_is_restricted_to_tmp(tmp_path):
     manifest = {
         "schema_version": 1,
         "as_of": timestamp.isoformat(),
-        "evaluation_days": 7,
+        "evaluation_days": 30,
+        "ten_minute_bar_count": replay_10m_bar_count(30),
+        "daily_bar_count": replay_daily_bar_count(30),
     }
 
     save_dataset(tmp_path, candles, candles, manifest)
-    loaded = load_dataset(tmp_path, 7)
+    loaded = load_dataset(tmp_path, 30)
 
     assert loaded is not None
     assert load_dataset(tmp_path, 7, timestamp) is not None
+    assert load_dataset(tmp_path, 30, timestamp) is not None
+    assert load_dataset(tmp_path, 31, timestamp) is None
     assert load_dataset(
-        tmp_path, 7, timestamp + datetime.timedelta(minutes=10)
+        tmp_path, 30, timestamp + datetime.timedelta(minutes=10)
     ) is None
     assert loaded[0] == candles
     assert loaded[1] == candles
@@ -120,7 +157,7 @@ def test_replay_cache_round_trip_is_restricted_to_tmp(tmp_path):
     (tmp_path / "manifest.json").write_text(
         json.dumps(incomplete), encoding="utf-8"
     )
-    assert load_dataset(tmp_path, 7) is None
+    assert load_dataset(tmp_path, 30) is None
 
 
 def test_point_in_time_replay_runs_every_operational_scan_without_dropping_timeframes():
@@ -161,6 +198,9 @@ def test_point_in_time_replay_runs_every_operational_scan_without_dropping_timef
 
     assert report.variants[REPLAY_VARIANT_BASELINE].scans == 144
     assert report.signal_model_version == config.SIGNAL_MODEL_VERSION
+    assert report.source_evaluation_days == 1
+    assert report.evidence_tier is ReplayEvidenceTier.SMOKE
+    assert report.analysis_timeframes == REPLAY_ANALYSIS_TIMEFRAMES
     assert report.variants[REPLAY_VARIANT_BASELINE].precision_at_k == 1.0
     assert report.variants[REPLAY_VARIANT_ATTENTION].selected_observations == 0
     assert report.warmup_daily_bars == 200
@@ -175,11 +215,148 @@ def test_point_in_time_replay_runs_every_operational_scan_without_dropping_timef
     assert len(observations) == 144
     assert observations[0]["decision_at"] > observations[0]["signal_candle_start"]
     assert observations[0]["signal_model_version"] == config.SIGNAL_MODEL_VERSION
+    assert observations[0]["raw_market_coverage_ratio"] == 1.0
     assert REPLAY_VARIANT_BASELINE in observations[0]["variants"]
     assert REPLAY_VARIANT_PROGRESSION in observations[0]["variants"]
+    assert REPLAY_VARIANT_V3_SHADOW in observations[0]["variants"]
     assert "Precision@K" in report.to_markdown()
+    assert "Evidence: `smoke`" in report.to_markdown()
+    assert "Timeframes: 10m, 60m, 1d" in report.to_markdown()
     assert "First-Visible Episode Quality" in report.to_markdown()
+    assert "Eligible context coverage" in report.to_markdown()
+    assert "AttentionYield" in report.to_markdown()
     assert "Scheduled/non-empty 30m digests: 48 / 0" in report.to_markdown()
+    assert any("smoke/debug evidence only" in warning for warning in report.warnings)
+
+
+def test_replay_can_use_a_longer_same_end_cache_for_a_shorter_window():
+    source_days = 2
+    count = replay_10m_bar_count(source_days)
+    start = datetime.datetime(2026, 6, 1, tzinfo=UTC)
+    ten_minute = {
+        "KRW-BTC": [
+            _candle(
+                "KRW-BTC",
+                start + datetime.timedelta(minutes=10 * index),
+                100.0,
+            )
+            for index in range(count)
+        ],
+        "KRW-NEW": [
+            _candle(
+                "KRW-NEW",
+                start + datetime.timedelta(minutes=10 * index),
+                100.0,
+            )
+            for index in range(
+                count - replay_10m_bar_count(1),
+                count,
+            )
+        ],
+    }
+    daily_start = start - datetime.timedelta(days=replay_daily_bar_count(source_days))
+    daily = {
+        "KRW-BTC": [
+            _candle(
+                "KRW-BTC",
+                daily_start + datetime.timedelta(days=index),
+                100.0,
+            )
+            for index in range(replay_daily_bar_count(source_days))
+        ]
+    }
+
+    report = run_point_in_time_replay(
+        ten_minute,
+        daily,
+        {},
+        {},
+        evaluation_days=1,
+        source_evaluation_days=source_days,
+        top_k=1,
+        requested_market_count=2,
+    )
+
+    assert report.requested_evaluation_days == 1
+    assert report.source_evaluation_days == source_days
+    assert report.market_count == 1
+    assert report.market_coverage_ratio == 0.5
+    assert report.variants[REPLAY_VARIANT_BASELINE].scans == 144
+    assert any("Reused a 2-day cache" in warning for warning in report.warnings)
+
+
+def test_replay_run_reuses_superset_cache_and_separates_outputs(
+    tmp_path, monkeypatch
+):
+    source_days = 2
+    count = replay_10m_bar_count(source_days)
+    start = datetime.datetime(2026, 6, 1, tzinfo=UTC)
+    as_of = start + datetime.timedelta(minutes=10 * count)
+    candles = [
+        _candle(
+            "KRW-BTC",
+            start + datetime.timedelta(minutes=10 * index),
+            100.0,
+        )
+        for index in range(count)
+    ]
+    daily_start = start - datetime.timedelta(days=replay_daily_bar_count(source_days))
+    daily = [
+        _candle(
+            "KRW-BTC",
+            daily_start + datetime.timedelta(days=index),
+            100.0,
+        )
+        for index in range(replay_daily_bar_count(source_days))
+    ]
+    cache_dir = tmp_path / "cache"
+    output_dir = tmp_path / "report-1d"
+    manifest = {
+        "schema_version": 1,
+        "as_of": as_of.isoformat(),
+        "evaluation_days": source_days,
+        "requested_market_count": 1,
+        "ten_minute_market_count": 1,
+        "daily_market_count": 1,
+        "ten_minute_bar_count": count,
+        "daily_bar_count": len(daily),
+        "ten_minute_coverage_ratio": 1.0,
+        "coverage_below_minimum": False,
+        "requested_markets": ["KRW-BTC"],
+    }
+    save_dataset(
+        cache_dir,
+        {"KRW-BTC": candles},
+        {"KRW-BTC": daily},
+        manifest,
+    )
+
+    async def fake_sectors():
+        return {}, {}
+
+    monkeypatch.setattr("replay_upbit.load_and_process_sectors", fake_sectors)
+    report = asyncio.run(
+        run_replay(
+            SimpleNamespace(
+                cache_dir=str(cache_dir),
+                output_dir=str(output_dir),
+                as_of=as_of.isoformat(),
+                refresh=False,
+                evaluation_days=1,
+                top_k=1,
+            )
+        )
+    )
+
+    assert report.source_evaluation_days == source_days
+    assert not (cache_dir / "report.json").exists()
+    assert (output_dir / "report.json").exists()
+    assert (output_dir / "report.md").exists()
+    assert (output_dir / "observations.ndjson").exists()
+    payload = json.loads((output_dir / "report.json").read_text(encoding="utf-8"))
+    assert payload["requested_evaluation_days"] == 1
+    assert payload["source_evaluation_days"] == source_days
+    assert payload["analysis_timeframes"] == list(REPLAY_ANALYSIS_TIMEFRAMES)
 
 
 def test_point_in_time_replay_measures_nonempty_attention_progression():
@@ -219,6 +396,7 @@ def test_point_in_time_replay_measures_nonempty_attention_progression():
         ]
     }
 
+    observations = []
     report = run_point_in_time_replay(
         {"KRW-BTC": candles},
         daily,
@@ -226,6 +404,7 @@ def test_point_in_time_replay_measures_nonempty_attention_progression():
         {},
         evaluation_days=1,
         top_k=1,
+        observation_sink=observations.append,
     )
 
     attention = report.variants[REPLAY_VARIANT_ATTENTION]
@@ -233,9 +412,31 @@ def test_point_in_time_replay_measures_nonempty_attention_progression():
     assert report.attention_episode_count > 0
     assert report.attention_repeated_observations > 0
     assert report.nonempty_digest_scans > 0
+    assert report.attention_yield is not None
+    assert report.eligible_context_coverage_ratio > 0
+    assert report.variants[REPLAY_VARIANT_V3_SHADOW].selected_observations > 0
     assert report.progression_context_precision_lift is not None
     assert "building" in report.attention_stage_metrics
     assert "confirmed" in report.attention_stage_metrics
+    survivor_observation = next(
+        observation
+        for observation in observations
+        if observation["attention_queue"]
+    )
+    assert survivor_observation["visible_attention_markets"]
+    assert all(
+        candidate["v3_shadow_rank"] is not None
+        for candidate in survivor_observation["attention_queue"]
+    )
+    briefing_observation = next(
+        observation
+        for observation in observations
+        if observation["briefing_attention_markets"]
+    )
+    assert any(
+        candidate["displayed"]
+        for candidate in briefing_observation["attention_queue"]
+    )
 
 
 def test_replay_report_preserves_requested_market_coverage():

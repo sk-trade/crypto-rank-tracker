@@ -64,6 +64,7 @@ def build_scan_events(
     alerts: Iterable[Alert],
     candidates: Iterable[SignalCandidate] = (),
     attention_candidates: Iterable[AttentionCandidate] = (),
+    attention_coverage: Dict[str, float | int] | None = None,
     execution_rejections_by_market: Dict[str, List[RejectionCode]] | None = None,
     data_quality_issues: Iterable[DataQualityIssue] = (),
     raw_tickers_by_market: Dict[str, MarketTicker] | None = None,
@@ -78,6 +79,7 @@ def build_scan_events(
     quality_issues = list(data_quality_issues)
     execution_rejections_by_market = execution_rejections_by_market or {}
     raw_tickers_by_market = raw_tickers_by_market or {}
+    attention_coverage = attention_coverage or {}
     events = []
 
     for market in sorted(markets):
@@ -100,6 +102,8 @@ def build_scan_events(
             feature_snapshot["data_quality_issues"] = [
                 issue.model_dump(mode="json") for issue in quality_issues
             ]
+        if attention_coverage:
+            feature_snapshot["attention_coverage"] = dict(attention_coverage)
         eligible = decision.eligible if decision else False
         reasons = (
             list(decision.rejection_reasons)
@@ -137,6 +141,20 @@ def build_scan_events(
             signal_candle_start = ticker.candle_history[-1].timestamp
         candidate = candidates_by_market.get(market)
         attention = attention_by_market.get(market)
+        if attention:
+            feature_snapshot["attention"] = {
+                "lane": attention.lane.value,
+                "lane_rank": attention.lane_rank,
+                "primary_selected": attention.primary_selected,
+                "displayed": attention.displayed,
+                "display_rank": attention.display_rank,
+                "quality_score": attention.quality_score,
+                "ranking_score": attention.ranking_score,
+                "v3_shadow_rank": attention.v3_shadow_rank,
+                "primary_exposures_60m": attention.primary_exposures_60m,
+                "score_version": attention.score_version,
+                "context_available": attention.context_available,
+            }
         events.append(
             ScanEvent(
                 event_id=f"{observed_at.isoformat()}:{market}",
@@ -151,7 +169,34 @@ def build_scan_events(
                 signal_score=candidate.signal_score if candidate else None,
                 signal_candle_start=signal_candle_start,
                 attention_stage=attention.stage if attention else None,
+                attention_lane=attention.lane if attention else None,
                 attention_rank=attention.attention_rank if attention else None,
+                attention_lane_rank=attention.lane_rank if attention else None,
+                attention_primary_selected=(
+                    attention.primary_selected if attention else None
+                ),
+                attention_displayed=attention.displayed if attention else None,
+                attention_display_rank=(
+                    attention.display_rank if attention else None
+                ),
+                attention_quality_score=(
+                    attention.quality_score if attention else None
+                ),
+                attention_ranking_score=(
+                    attention.ranking_score if attention else None
+                ),
+                attention_v3_shadow_rank=(
+                    attention.v3_shadow_rank if attention else None
+                ),
+                attention_primary_exposures_60m=(
+                    attention.primary_exposures_60m if attention else None
+                ),
+                attention_score_version=(
+                    attention.score_version if attention else None
+                ),
+                attention_first_seen_at=(
+                    attention.first_seen_at if attention else None
+                ),
                 attention_episode_id=attention.episode_id if attention else None,
             )
         )

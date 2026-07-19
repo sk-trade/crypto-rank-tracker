@@ -6,7 +6,10 @@ import logging
 from enum import StrEnum
 
 import aiohttp
-from common.attention import attention_briefing_due, build_attention_queue
+from common.attention import (
+    attention_briefing_due,
+    build_attention_result,
+)
 from common.notification.engine import AlertEngine
 from common.signals.detector import detect_anomalies, filter_market_wide_events
 import functions_framework
@@ -94,7 +97,10 @@ def filter_markets_with_complete_deep_dive_data(
     valid_markets = [
         market
         for market in candidate_markets
-        if market in candles_60m and market in candles_daily
+        if len(candles_60m.get(market, []))
+        >= config.ATTENTION_CONTEXT_MIN_HOURLY_BARS
+        and len(candles_daily.get(market, []))
+        >= config.ATTENTION_CONTEXT_MIN_DAILY_BARS
     ]
     blocked_markets = sorted(set(candidate_markets) - set(valid_markets))
     if blocked_markets:
@@ -416,7 +422,12 @@ async def run_check(
                 results = await asyncio.gather(*tasks)
                 candles_60m, candles_daily = results[0], results[1]
                 deep_dive_evidence_markets = sorted(
-                    set(candles_60m) & set(candles_daily)
+                    market
+                    for market in markets_to_fetch
+                    if len(candles_60m.get(market, []))
+                    >= config.ATTENTION_CONTEXT_MIN_HOURLY_BARS
+                    and len(candles_daily.get(market, []))
+                    >= config.ATTENTION_CONTEXT_MIN_DAILY_BARS
                 )
                 deep_dive_candidate_markets = filter_markets_with_complete_deep_dive_data(
                     candidate_markets, candles_60m, candles_daily
@@ -424,7 +435,7 @@ async def run_check(
                 if candidate_markets and not deep_dive_candidate_markets:
                     logger.warning(
                         "No candidates have complete higher-timeframe evidence; "
-                        "broad-filter candidates remain visible in the attention queue."
+                        "broad-filter candidates remain recorded in the full queue as Data-limited."
                     )
 
                 deep_dive_enriched = enrich_deep_dive_tickers(
@@ -462,7 +473,7 @@ async def run_check(
                     
                     logger.info(f"최종 알림 생성: {len(final_alerts)}건")
 
-            attention_queue, attention_state = build_attention_queue(
+            attention_result = build_attention_result(
                 scan_close_at,
                 candidate_markets,
                 enriched_tickers,
@@ -474,16 +485,54 @@ async def run_check(
                 execution_decisions=execution_decisions,
                 market_regime=market_regime,
             )
+            attention_queue = attention_result.visible
+            all_attention_candidates = attention_result.all_candidates
+            attention_state = attention_result.state
+            raw_coverage_ratio = (
+                len(candles_10m) / len(all_markets) if all_markets else 0.0
+            )
+            active_candidate_markets = set(candidate_markets)
+            eligible_context_count = sum(
+                candidate.context_available
+                for candidate in all_attention_candidates
+                if candidate.market in active_candidate_markets
+            )
+            eligible_context_coverage_ratio = (
+                eligible_context_count / len(candidate_markets)
+                if candidate_markets
+                else 1.0
+            )
+            attention_coverage = {
+                "raw_market_count": len(candles_10m),
+                "raw_market_total": len(all_markets),
+                "raw_market_coverage_ratio": raw_coverage_ratio,
+                "eligible_candidate_count": len(candidate_markets),
+                "eligible_context_count": eligible_context_count,
+                "eligible_context_coverage_ratio": eligible_context_coverage_ratio,
+            }
             logger.info(
-                "관심종목 큐 생성: %d건 (%d건 material change)",
+                "관심종목 큐 생성: 주요 %d건 / 전체 %d건 (%d건 material change)",
                 len(attention_queue),
-                sum(candidate.material_change for candidate in attention_queue),
+                len(all_attention_candidates),
+                sum(
+                    candidate.material_change
+                    for candidate in all_attention_candidates
+                ),
+            )
+            logger.info(
+                "관심종목 coverage: raw %d/%d (%.1f%%), eligible context %d/%d (%.1f%%)",
+                len(candles_10m),
+                len(all_markets),
+                raw_coverage_ratio * 100,
+                eligible_context_count,
+                len(candidate_markets),
+                eligible_context_coverage_ratio * 100,
             )
             attention_digest_due = attention_briefing_due(scan_close_at)
             notification_attention_queue = (
-                attention_queue if attention_digest_due else []
+                all_attention_candidates if attention_digest_due else []
             )
-            if attention_queue and not attention_digest_due:
+            if all_attention_candidates and not attention_digest_due:
                 logger.info(
                     "관심종목 상태는 저장하고 다음 %d분 브리핑까지 webhook을 보류합니다.",
                     config.ATTENTION_BRIEFING_INTERVAL_MINUTES,
@@ -507,7 +556,8 @@ async def run_check(
                 deep_dive_evidence_markets,
                 final_alerts,
                 candidates_list,
-                attention_candidates=attention_queue,
+                attention_candidates=all_attention_candidates,
+                attention_coverage=attention_coverage,
                 execution_rejections_by_market={
                     market: decision.rejection_reasons
                     for market, decision in execution_decisions.items()

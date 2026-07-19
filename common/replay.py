@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import statistics
 from dataclasses import asdict, dataclass, field
+from enum import StrEnum
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -17,7 +18,7 @@ from common.analysis.scanner import (
 )
 from common.attention import (
     attention_briefing_due,
-    build_attention_queue,
+    build_attention_result,
     rank_attention_candidates,
     rank_filter_candidates,
     rank_structure_candidates,
@@ -37,6 +38,15 @@ REPLAY_VARIANT_FILTER = "activity_price_filter"
 REPLAY_VARIANT_STRUCTURE = "filter_plus_structure"
 REPLAY_VARIANT_PROGRESSION = "filter_plus_structure_progression_context"
 REPLAY_VARIANT_ATTENTION = "attention_full"
+REPLAY_VARIANT_V3_SHADOW = "attention_v3_shadow"
+REPLAY_ANALYSIS_TIMEFRAMES = ("10m", "60m", "1d")
+
+
+class ReplayEvidenceTier(StrEnum):
+    SMOKE = "smoke"
+    REGRESSION = "regression"
+    OPERATING_ACCEPTANCE = "operating_acceptance"
+    REGIME_ROBUSTNESS = "regime_robustness"
 
 
 class ReplayVariantMetrics(BaseModel):
@@ -74,12 +84,18 @@ class ReplayReport(BaseModel):
     evaluation_start: AwareDatetime
     evaluation_end: AwareDatetime
     requested_evaluation_days: int
+    source_evaluation_days: int
+    evidence_tier: ReplayEvidenceTier
+    analysis_timeframes: tuple[str, ...]
     scan_interval_minutes: int
     top_k: int
     requested_market_count: int
     market_count: int
     market_coverage_ratio: float
     market_coverage_meets_minimum: bool
+    eligible_candidate_observations: int
+    eligible_context_observations: int
+    eligible_context_coverage_ratio: float
     warmup_10m_bars: int
     warmup_daily_bars: int
     variants: Dict[str, ReplayVariantMetrics]
@@ -91,12 +107,16 @@ class ReplayReport(BaseModel):
     progression_context_recall_lift: float | None
     retention_precision_lift: float | None
     retention_recall_lift: float | None
+    v4_precision_lift_vs_v3: float | None
+    v4_recall_lift_vs_v3: float | None
+    v4_median_time_to_2pct_delta_vs_v3_minutes: float | None
     attention_episode_count: int
     attention_meaningful_episode_count: int
     attention_episode_precision: float | None
     attention_episode_average_abs_mfe_120m_pct: float | None
     attention_episode_median_time_to_1pct_minutes: float | None
     attention_episode_median_time_to_2pct_minutes: float | None
+    attention_yield: float | None
     attention_stage_metrics: Dict[str, ReplayStageMetrics]
     attention_visible_observations: int
     attention_repeated_observations: int
@@ -119,9 +139,21 @@ class ReplayReport(BaseModel):
                 f"`{self.evaluation_end.isoformat()}`"
             ),
             (
+                f"- Evidence: `{self.evidence_tier.value}` from "
+                f"{self.requested_evaluation_days} requested day(s); "
+                f"source cache {self.source_evaluation_days} day(s)"
+            ),
+            f"- Timeframes: {', '.join(self.analysis_timeframes)}",
+            (
                 f"- Markets: {self.market_count}/{self.requested_market_count} "
                 f"({self.market_coverage_ratio:.1%} coverage; "
                 f"minimum {'met' if self.market_coverage_meets_minimum else 'not met'})"
+            ),
+            (
+                "- Eligible context coverage: "
+                f"{self.eligible_context_observations}/"
+                f"{self.eligible_candidate_observations} "
+                f"({self.eligible_context_coverage_ratio:.1%})"
             ),
             f"- Scan interval: {self.scan_interval_minutes} minutes; top K: {self.top_k}",
             (
@@ -172,12 +204,19 @@ class ReplayReport(BaseModel):
                     "- Cooling/failed retention recall effect: "
                     f"{_fmt_points(self.retention_recall_lift)}"
                 ),
+                f"- v4 precision lift vs v3 shadow: {_fmt_points(self.v4_precision_lift_vs_v3)}",
+                f"- v4 pre-event recall lift vs v3 shadow: {_fmt_points(self.v4_recall_lift_vs_v3)}",
+                (
+                    "- v4 median time-to-2% delta vs v3 shadow: "
+                    f"{_fmt_minutes(self.v4_median_time_to_2pct_delta_vs_v3_minutes)}"
+                ),
                 "",
                 "## First-Visible Episode Quality",
                 "",
                 f"- Episodes: {self.attention_episode_count}",
                 f"- Meaningful episodes: {self.attention_meaningful_episode_count}",
                 f"- Episode precision: {_fmt_ratio(self.attention_episode_precision)}",
+                f"- AttentionYield: {_fmt_ratio(self.attention_yield)}",
                 (
                     "- Average 120m abs MFE: "
                     f"{_fmt_pct(self.attention_episode_average_abs_mfe_120m_pct)}"
@@ -443,6 +482,7 @@ def run_point_in_time_replay(
     reverse_sector_map: Mapping[str, List[str]],
     *,
     evaluation_days: int = config.REPLAY_DEFAULT_EVALUATION_DAYS,
+    source_evaluation_days: int | None = None,
     top_k: int = config.REPLAY_DEFAULT_TOP_K,
     requested_market_count: int | None = None,
     progress: Callable[[int, int, datetime.datetime], None] | None = None,
@@ -450,15 +490,30 @@ def run_point_in_time_replay(
 ) -> ReplayReport:
     """Replay production feature functions at each completed 10-minute decision point."""
     _validate_evaluation_days(evaluation_days)
+    source_days = (
+        evaluation_days
+        if source_evaluation_days is None
+        else source_evaluation_days
+    )
+    _validate_evaluation_days(source_days)
+    if source_days < evaluation_days:
+        raise ValueError("source_evaluation_days cannot be shorter than evaluation_days")
     if top_k < 1:
         raise ValueError("top_k must be positive")
     if "KRW-BTC" not in candles_10m:
         raise ValueError("KRW-BTC history is required for replay")
+    source_required_count = replay_10m_bar_count(source_days)
+    if len(candles_10m["KRW-BTC"]) < source_required_count:
+        raise ValueError("source replay history is shorter than source_evaluation_days")
 
     required_count = replay_10m_bar_count(evaluation_days)
-    aligned = _aligned_histories(candles_10m, required_count)
-    if "KRW-BTC" not in aligned:
+    source_aligned = _aligned_histories(candles_10m, source_required_count)
+    if "KRW-BTC" not in source_aligned:
         raise ValueError("KRW-BTC history is incomplete or misaligned")
+    aligned = {
+        market: candles[-required_count:]
+        for market, candles in source_aligned.items()
+    }
     reference = aligned["KRW-BTC"]
     hourly = aggregate_hourly_candles(aligned)
     outcome_bars = (
@@ -482,6 +537,7 @@ def run_point_in_time_replay(
             REPLAY_VARIANT_STRUCTURE,
             REPLAY_VARIANT_PROGRESSION,
             REPLAY_VARIANT_ATTENTION,
+            REPLAY_VARIANT_V3_SHADOW,
         ]
     }
     previous_rankings: Dict[str, int] = {}
@@ -493,11 +549,29 @@ def run_point_in_time_replay(
     material_change_scans = 0
     scheduled_digest_scans = 0
     nonempty_digest_scans = 0
+    eligible_candidate_observations = 0
+    eligible_context_observations = 0
     warnings = []
     warnings.append(
         "Historical orderbook snapshots are unavailable; execution-risk evidence "
         "is excluded from replay lift metrics."
     )
+    evidence_tier = replay_evidence_tier(evaluation_days)
+    if evidence_tier is ReplayEvidenceTier.SMOKE:
+        warnings.append(
+            "A 1-3 day replay is smoke/debug evidence only; it is not operating "
+            "acceptance evidence."
+        )
+    elif evidence_tier is ReplayEvidenceTier.REGRESSION:
+        warnings.append(
+            f"This window is shorter than the {config.REPLAY_OPERATING_ACCEPTANCE_DAYS}-day "
+            "operating acceptance window; use it for regression comparison only."
+        )
+    if source_days > evaluation_days:
+        warnings.append(
+            f"Reused a {source_days}-day cache for a {evaluation_days}-day evaluation; "
+            "market coverage reflects markets with complete longer-window history."
+        )
     expected_market_count = requested_market_count or len(candles_10m)
     if expected_market_count < len(candles_10m):
         raise ValueError("requested_market_count cannot be below collected coverage")
@@ -573,7 +647,7 @@ def run_point_in_time_replay(
             dict(reverse_sector_map),
         )
         signals = filter_market_wide_events(signals, enriched)
-        all_attention, attention_state = build_attention_queue(
+        attention_result = build_attention_result(
             observed_at,
             candidate_markets,
             enriched,
@@ -583,8 +657,10 @@ def run_point_in_time_replay(
             [],
             previous_state=attention_state,
             market_regime=market_regime,
-            limit=max(1, len(aligned)),
+            limit=top_k,
         )
+        all_attention = attention_result.all_candidates
+        attention_state = attention_result.state
 
         baseline = [
             market
@@ -608,13 +684,20 @@ def run_point_in_time_replay(
         ]
         progressed_candidates = rank_attention_candidates(active_attention)[:top_k]
         progressed = [candidate.market for candidate in progressed_candidates]
-        full_candidates = rank_attention_candidates(all_attention)[:top_k]
+        full_candidates = attention_result.visible
         full = [candidate.market for candidate in full_candidates]
+        briefing_due = attention_briefing_due(observed_at)
+        displayed_candidates = full_candidates if briefing_due else []
+        v3_shadow_candidates = sorted(
+            all_attention,
+            key=lambda candidate: candidate.v3_shadow_rank or 1_000_000,
+        )[:top_k]
+        v3_shadow = [candidate.market for candidate in v3_shadow_candidates]
         outcomes = {
             market: _future_outcome(candles, index)
             for market, candles in aligned.items()
         }
-        for candidate in full_candidates:
+        for candidate in displayed_candidates:
             outcome = outcomes[candidate.market]
             stage_accumulators.setdefault(
                 candidate.stage.value, _StageAccumulator()
@@ -626,6 +709,7 @@ def run_point_in_time_replay(
             REPLAY_VARIANT_STRUCTURE: structured,
             REPLAY_VARIANT_PROGRESSION: progressed,
             REPLAY_VARIANT_ATTENTION: full,
+            REPLAY_VARIANT_V3_SHADOW: v3_shadow,
         }
         for name, selected in selections.items():
             accumulators[name].add(
@@ -644,11 +728,21 @@ def run_point_in_time_replay(
                     "decision_at": observed_at.isoformat(),
                     "signal_candle_start": signal_candle_start.isoformat(),
                     "universe_size": len(aligned),
+                    "raw_market_coverage_ratio": market_coverage,
                     "filter_candidate_count": len(candidate_markets),
+                    "eligible_context_count": sum(
+                        candidate.context_available
+                        for candidate in all_attention
+                        if candidate.market in active_markets
+                    ),
                     "variants": selections,
                     "attention_queue": [
                         candidate.model_dump(mode="json")
-                        for candidate in full_candidates
+                        for candidate in all_attention
+                    ],
+                    "visible_attention_markets": full,
+                    "briefing_attention_markets": [
+                        candidate.market for candidate in displayed_candidates
                     ],
                     "meaningful_movers": sorted(meaningful_markets),
                     "outcomes": {
@@ -658,13 +752,19 @@ def run_point_in_time_replay(
                 }
             )
 
-        visible_observations += len(full_candidates)
+        visible_observations += len(displayed_candidates)
+        eligible_candidate_observations += len(candidate_markets)
+        eligible_context_observations += sum(
+            candidate.context_available
+            for candidate in all_attention
+            if candidate.market in active_markets
+        )
         scan_material_changes = sum(
-            candidate.material_change for candidate in full_candidates
+            candidate.material_change for candidate in displayed_candidates
         )
         material_changes += scan_material_changes
         material_change_scans += int(scan_material_changes > 0)
-        if attention_briefing_due(observed_at):
+        if briefing_due:
             scheduled_digest_scans += 1
             nonempty_digest_scans += int(bool(full_candidates))
         previous_rankings = current_rankings
@@ -677,6 +777,7 @@ def run_point_in_time_replay(
     structure_metrics = variants[REPLAY_VARIANT_STRUCTURE]
     progression_metrics = variants[REPLAY_VARIANT_PROGRESSION]
     attention_metrics = variants[REPLAY_VARIANT_ATTENTION]
+    v3_metrics = variants[REPLAY_VARIANT_V3_SHADOW]
     unchanged_repeats = max(visible_observations - material_changes, 0)
     episode_values = list(episode_outcomes.values())
     episode_count = len(episode_values)
@@ -701,6 +802,9 @@ def run_point_in_time_replay(
         evaluation_end=reference[last_index].timestamp
         + datetime.timedelta(minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES),
         requested_evaluation_days=evaluation_days,
+        source_evaluation_days=source_days,
+        evidence_tier=evidence_tier,
+        analysis_timeframes=REPLAY_ANALYSIS_TIMEFRAMES,
         scan_interval_minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES,
         top_k=top_k,
         requested_market_count=expected_market_count,
@@ -708,6 +812,13 @@ def run_point_in_time_replay(
         market_coverage_ratio=market_coverage,
         market_coverage_meets_minimum=(
             market_coverage >= config.CANDLE_SUCCESS_RATE_MINIMUM
+        ),
+        eligible_candidate_observations=eligible_candidate_observations,
+        eligible_context_observations=eligible_context_observations,
+        eligible_context_coverage_ratio=(
+            eligible_context_observations / eligible_candidate_observations
+            if eligible_candidate_observations
+            else 1.0
         ),
         warmup_10m_bars=warmup,
         warmup_daily_bars=200,
@@ -736,6 +847,16 @@ def run_point_in_time_replay(
         retention_recall_lift=_difference(
             attention_metrics.recall_at_k, progression_metrics.recall_at_k
         ),
+        v4_precision_lift_vs_v3=_difference(
+            attention_metrics.precision_at_k, v3_metrics.precision_at_k
+        ),
+        v4_recall_lift_vs_v3=_difference(
+            attention_metrics.recall_at_k, v3_metrics.recall_at_k
+        ),
+        v4_median_time_to_2pct_delta_vs_v3_minutes=_difference(
+            attention_metrics.median_time_to_2pct_minutes,
+            v3_metrics.median_time_to_2pct_minutes,
+        ),
         attention_episode_count=episode_count,
         attention_meaningful_episode_count=meaningful_episode_count,
         attention_episode_precision=(
@@ -753,6 +874,11 @@ def run_point_in_time_replay(
             outcome.time_to_2pct_minutes
             for outcome in episode_values
             if outcome.time_to_2pct_minutes is not None
+        ),
+        attention_yield=(
+            meaningful_episode_count / visible_observations
+            if visible_observations
+            else None
         ),
         attention_stage_metrics=stage_metrics,
         attention_visible_observations=visible_observations,
@@ -868,11 +994,26 @@ def _time_to_move(
 
 
 def _validate_evaluation_days(evaluation_days: int) -> None:
-    if not config.REPLAY_MIN_EVALUATION_DAYS <= evaluation_days <= config.REPLAY_MAX_EVALUATION_DAYS:
+    if not (
+        config.REPLAY_MIN_EVALUATION_DAYS
+        <= evaluation_days
+        <= config.REPLAY_MAX_EVALUATION_DAYS
+    ):
         raise ValueError(
             f"evaluation_days must be between {config.REPLAY_MIN_EVALUATION_DAYS} "
             f"and {config.REPLAY_MAX_EVALUATION_DAYS}"
         )
+
+
+def replay_evidence_tier(evaluation_days: int) -> ReplayEvidenceTier:
+    _validate_evaluation_days(evaluation_days)
+    if evaluation_days <= 3:
+        return ReplayEvidenceTier.SMOKE
+    if evaluation_days < config.REPLAY_OPERATING_ACCEPTANCE_DAYS:
+        return ReplayEvidenceTier.REGRESSION
+    if evaluation_days < config.REPLAY_ROBUSTNESS_MIN_EVALUATION_DAYS:
+        return ReplayEvidenceTier.OPERATING_ACCEPTANCE
+    return ReplayEvidenceTier.REGIME_ROBUSTNESS
 
 
 def _mean(values: Iterable[float]) -> float | None:

@@ -10,6 +10,7 @@ Set these environment variables for runtime behavior:
 - `GCS_BUCKET_NAME`: required bucket name when `STATE_STORAGE_METHOD=GCS`.
 - `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery. Local runs read it directly; production syncs the GitHub secret into Google Secret Manager and injects it as a runtime secret.
 - `SHADOW_MODE`: set to `true`, `1`, or `yes` for no-webhook evaluations that must retain production-equivalent cooldown state in isolated `shadow_alert_history.json` without advancing delivery-backed `alert_history.json`.
+- `ATTENTION_VISIBLE_MODEL`: defaults to `attention-v4-c-guarded`; set it to `attention-v3` for an immediate visible-ranking rollback while v4 fields and the v3 shadow order remain measurable.
 - `CG_API_KEY`: CoinGecko API key used by the sector updater.
 - `GCP_PROJECT_ID`: Google Cloud project identifier. Production workflows require it; local GCS use may omit it only when Application Default Credentials can infer the project.
 - `CG_SYMBOL_OVERRIDES`: optional JSON object mapping an ambiguous lower-case symbol to an explicit CoinGecko id, for example `{"pay":"tenx"}`. Values may also provide explicit `name` and `network` constraints. Unique CoinGecko symbols do not depend on provider display-name equality; ambiguous symbols without a valid override are left untagged.
@@ -56,10 +57,15 @@ Both commands can trigger live network traffic and service side effects. They ma
 
 - A broad price/activity filter decides which markets deserve inspection.
 - Candidates progress through `discovered`, `building`, `confirmed`, `cooling`, and `failed` episodes.
-- Structure confirmation, 1-hour and daily context, market regime, and orderbook feasibility remain visible evidence. Missing or risky supporting evidence does not silently remove a broad-filter candidate.
-- The webhook briefing shows rank movement, first-seen time, persistence, grouped activity/price/context/execution evidence, and a direct chart link. `signal_score` remains an internal ordering input and is not presented as probability.
+- The default `attention-v4-c-guarded` view has independent budgets: `Focus Now` 3, `Early Watch` 1, and `Ongoing` 1. Empty slots stay empty; additional survivors, cooling/failed episodes, and data-limited markets remain in the folded full queue.
+- Early is only the first discovered observation. Building/confirmed episodes receive three Focus scans plus one first confirmation transition, then move to Ongoing. Cooling/failed candidates never compete for a primary card.
+- The v4 quality score uses capped current activity and price-surprise strength with small context and execution adjustments. It does not use raw 4-hour movement, episode age, material-change flags, signal score, or market identity. The introduced weights are configurable operational defaults, not newly claimed backtest-fitted coefficients.
+- Focus #1 and Early #1 are always the highest-quality candidates in their lanes. Only close-quality Focus #2/#3 choices receive bounded similarity and prior-display penalties; Ongoing receives a bounded repeat penalty.
+- Normal lane placement requires at least 24 completed 60-minute bars and 200 completed daily bars. Missing context is neutral in scoring and explicitly listed as `Data-limited`, never rewarded or silently discarded.
+- The webhook briefing shows rank movement, first-seen time, grouped activity/price/context/execution evidence, contrary timeframes, and a direct chart link. Direction text describes observed alignment and explicitly says it is not a direction prediction; the internal score is not presented as probability.
 - State and immutable events retain every 10-minute queue transition. The current queue is sent as a deterministic 30-minute digest, while final structure alerts bypass the digest; scans between digests remain available for replay without producing broad-filter webhook churn.
 - Attention state and immutable scan events are stored independently from webhook delivery, so a no-webhook run still produces evaluation evidence.
+- Every survivor records its v4 lane/rank/display state and v3 shadow rank. Set `ATTENTION_VISIBLE_MODEL=attention-v3` to roll the visible list back without losing comparison evidence.
 
 ## Point-in-time replay
 
@@ -71,9 +77,20 @@ uv run python replay_upbit.py --evaluation-days 7
 
 An installed wheel also exposes the equivalent `crypto-rank-replay` command.
 
-The evaluation window accepts 1 through 30 days. Treat 1-3 day runs as smoke/debug evidence, use 7 days for fast regression comparisons, and use a same-end-time 30-day replay before making operating-like quality claims. A long-window result is partial evidence when warm-up-complete market coverage is below the production minimum (currently 95%). The collector adds the required feature warm-up separately: three weeks of 10-minute same-slot history, the recent 10-minute feature window, 200 completed daily bars, derived completed 60-minute bars, and 120 minutes of future outcome data. Upbit's 200-candle limit is paginated through the shared rate limiter, and historical turnover ranks use the API's actual candle KRW trade value rather than `close * volume` approximation.
+The evaluation window accepts 1 through 90 days. Treat 1-3 day runs as smoke/debug evidence, keep the 7-day default for fast regression comparisons, require a same-end-time 30-day replay before making operating-like quality claims, and use explicit 60- or 90-day runs to check whether conclusions survive broader market regimes. Every report labels that evidence tier. A long-window result is partial evidence when warm-up-complete market coverage is below the production minimum (currently 95%). The collector adds feature warm-up separately: three weeks of 10-minute same-slot history, the recent 10-minute feature window, 200 completed daily bars, derived completed 60-minute bars, and 120 minutes of future outcome data. These 10-minute, 60-minute, and daily inputs remain part of every replay tier. Upbit's 200-candle limit is paginated through the shared rate limiter, and historical turnover ranks use the API's actual candle KRW trade value rather than a `close * volume` approximation.
 
-The default cache and reports are written to `/tmp/crypto-rank-tracker-replay`. Any custom `--cache-dir` outside `/tmp` is rejected. Reuse the cache by default or pass `--refresh` to recollect it. Bulk replay collection uses a lower request rate than the scheduled scanner so both can share an IP without treating the API limit as normal control flow. The live queue retains up to 10 charts, while replay defaults to top 5 so ordering changes remain measurable when the broad filter returns fewer than 10 markets. `report.json` and `report.md` compare turnover ranking, the broad filter, structure ordering, active-candidate progression/context ordering, and cooling/failed retention in the full attention queue. Metrics include compression, Precision@K, Recall@K, 30/60/120-minute MFE, time-to-move, isolated incremental lift, first-visible episode quality, stage-conditioned quality, true repeat exposure, and scheduled digest pressure. `observations.ndjson` retains the concrete per-scan queues, comparison selections, meaningful movers, and joined future outcomes behind those aggregates.
+The default cache and reports are written to `/tmp/crypto-rank-tracker-replay`. Any custom `--cache-dir` or `--output-dir` outside `/tmp` is rejected. Reuse the cache by default or pass `--refresh` to recollect it. A complete longer cache can feed a shorter same-end-time replay; the report records the source window and warns that coverage then reflects the stable longer-history cohort. Use separate output directories so comparisons do not overwrite one another:
+
+```bash
+AS_OF=2026-07-19T01:20:00Z
+CACHE=/tmp/crypto-rank-replay-90d
+
+uv run python replay_upbit.py --evaluation-days 90 --as-of "$AS_OF" --cache-dir "$CACHE" --output-dir /tmp/crypto-rank-report-90d --refresh
+uv run python replay_upbit.py --evaluation-days 60 --as-of "$AS_OF" --cache-dir "$CACHE" --output-dir /tmp/crypto-rank-report-60d
+uv run python replay_upbit.py --evaluation-days 30 --as-of "$AS_OF" --cache-dir "$CACHE" --output-dir /tmp/crypto-rank-report-30d
+```
+
+If superset-cache coverage falls below 95%, collect a dedicated 30-day cache before treating the 30-day result as operating acceptance evidence. Bulk replay collection uses a lower request rate than the scheduled scanner so both can share an IP without treating the API limit as normal control flow. The live v4 queue displays at most five primary cards under fixed lane budgets, while replay keeps every survivor and the v3 shadow order. `report.json` and `report.md` compare turnover ranking, the broad filter, structure ordering, active-candidate progression/context ordering, v4 guarded cards, and v3 shadow selection. Metrics include raw and eligible-context coverage, compression, Precision@K, Recall@K, 30/60/120-minute MFE, time-to-move, v4-vs-v3 lift, first-visible episode quality, `AttentionYield`, stage-conditioned quality, true briefing exposure, and scheduled digest pressure. `observations.ndjson` retains every survivor, visible selections, comparison variants, meaningful movers, and joined future outcomes behind those aggregates.
 
 Historical candle replay does not reconstruct past orderbooks. Execution evidence is therefore marked unavailable and excluded from replay lift attribution; live scans continue to show current spread, depth, slippage, warning, and estimated-cost risk.
 

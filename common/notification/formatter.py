@@ -7,10 +7,12 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+import config
 from common.models import (
     Alert,
     AlertHistory,
     AttentionCandidate,
+    AttentionLane,
     AttentionStage,
     DataQualityIssue,
     EvidenceFamily,
@@ -87,7 +89,93 @@ class NotificationFormatter:
         candidates: List[AttentionCandidate],
         reverse_sector_map: Dict[str, List[str]],
     ) -> str:
-        """Render the compact chart-review queue without presenting a trade score."""
+        """Render guarded lane cards plus every folded broad-filter survivor."""
+        lane_labels = {
+            AttentionLane.FOCUS: "Focus Now",
+            AttentionLane.EARLY: "Early Watch",
+            AttentionLane.ONGOING: "Ongoing",
+            AttentionLane.COOLING_FAILED: "Cooling / Failed",
+            AttentionLane.DATA_LIMITED: "Data-limited",
+        }
+        slot_limits = {
+            AttentionLane.FOCUS: config.ATTENTION_FOCUS_SLOTS,
+            AttentionLane.EARLY: config.ATTENTION_EARLY_SLOTS,
+            AttentionLane.ONGOING: config.ATTENTION_ONGOING_SLOTS,
+        }
+        visible = [candidate for candidate in candidates if candidate.displayed]
+        if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V3_MODEL_VERSION:
+            lines = [
+                f"🎯 **관심종목 큐 · v3 rollback (주요 {len(visible)} / 전체 {len(candidates)})**"
+            ]
+            for candidate in sorted(
+                visible, key=lambda item: item.display_rank or 1_000_000
+            ):
+                lines.extend(
+                    self._format_attention_candidate(
+                        candidate, reverse_sector_map
+                    )
+                )
+            folded = [
+                candidate for candidate in candidates if not candidate.displayed
+            ]
+            if folded:
+                symbols = ", ".join(
+                    candidate.market.removeprefix("KRW-")
+                    for candidate in folded
+                )
+                lines.append(f"\n📁 **추가 필터 통과 ({len(folded)}개)**")
+                lines.append(f"- {symbols}")
+            return "\n".join(lines)
+
+        lines = [
+            f"🎯 **관심종목 큐 (주요 {len(visible)} / 전체 {len(candidates)})**"
+        ]
+        for lane in [
+            AttentionLane.FOCUS,
+            AttentionLane.EARLY,
+            AttentionLane.ONGOING,
+        ]:
+            lane_visible = [
+                candidate
+                for candidate in visible
+                if candidate.lane is lane
+            ]
+            lines.append(
+                f"\n**{lane_labels[lane]}** "
+                f"({len(lane_visible)}/{slot_limits[lane]})"
+            )
+            if not lane_visible:
+                lines.append("- 비어 있음")
+                continue
+            for candidate in lane_visible:
+                lines.extend(
+                    self._format_attention_candidate(
+                        candidate, reverse_sector_map
+                    )
+                )
+
+        folded = [candidate for candidate in candidates if not candidate.displayed]
+        if folded:
+            lines.append(f"\n📁 **추가 필터 통과 ({len(folded)}개)**")
+            for lane in AttentionLane:
+                lane_candidates = [
+                    candidate for candidate in folded if candidate.lane is lane
+                ]
+                if not lane_candidates:
+                    continue
+                symbols = ", ".join(
+                    candidate.market.removeprefix("KRW-")
+                    for candidate in lane_candidates
+                )
+                lines.append(f"- {lane_labels[lane]}: {symbols}")
+        return "\n".join(lines)
+
+    def _format_attention_candidate(
+        self,
+        candidate: AttentionCandidate,
+        reverse_sector_map: Dict[str, List[str]],
+    ) -> List[str]:
+        """Format one primary card with observational, non-predictive direction text."""
         stage_labels = {
             AttentionStage.DISCOVERED: "발견",
             AttentionStage.BUILDING: "누적",
@@ -96,55 +184,101 @@ class NotificationFormatter:
             AttentionStage.FAILED: "구조실패",
         }
         kst = datetime.timezone(datetime.timedelta(hours=9))
-        lines = [f"🎯 **관심종목 큐 ({len(candidates)}개)**"]
-        for candidate in candidates:
-            symbol = candidate.market.removeprefix("KRW-")
-            tags = reverse_sector_map.get(candidate.market, [])
-            tag = f" · {tags[0]}" if tags else ""
-            marker = "●" if candidate.material_change else "○"
-            market_rank = (
-                f"24h #{candidate.market_rank}"
-                if candidate.market_rank is not None
-                else "24h rank n/a"
-            )
-            if candidate.market_rank_delta:
-                arrow = "↑" if candidate.market_rank_delta > 0 else "↓"
-                market_rank += f" {arrow}{abs(candidate.market_rank_delta)}"
-            first_seen = candidate.first_seen_at.astimezone(kst).strftime("%H:%M")
-            chart_url = (
-                f"https://upbit.com/exchange?code=CRIX.UPBIT.{candidate.market}"
-            )
-            lines.append(
-                f"{candidate.attention_rank}. {marker} **{symbol}**{tag} "
-                f"[{stage_labels[candidate.stage]}] · {market_rank} · "
-                f"{first_seen}부터 {candidate.consecutive_observations}회 · "
-                f"[차트]({chart_url})"
-            )
+        symbol = candidate.market.removeprefix("KRW-")
+        tags = reverse_sector_map.get(candidate.market, [])
+        tag = f" · {tags[0]}" if tags else ""
+        marker = "●" if candidate.material_change else "○"
+        market_rank = (
+            f"24h #{candidate.market_rank}"
+            if candidate.market_rank is not None
+            else "24h rank n/a"
+        )
+        if candidate.market_rank_delta:
+            arrow = "↑" if candidate.market_rank_delta > 0 else "↓"
+            market_rank += f" {arrow}{abs(candidate.market_rank_delta)}"
+        first_seen = candidate.first_seen_at.astimezone(kst).strftime("%H:%M")
+        chart_url = f"https://upbit.com/exchange?code=CRIX.UPBIT.{candidate.market}"
+        lines = [
+            f"{candidate.display_rank or candidate.lane_rank}. {marker} **{symbol}**{tag} "
+            f"[{stage_labels[candidate.stage]}] · {market_rank} · "
+            f"{first_seen}부터 {candidate.consecutive_observations}회 · "
+            f"[차트]({chart_url})"
+        ]
 
-            evidence = {item.family: item for item in candidate.evidence}
-            activity = evidence.get(EvidenceFamily.ACTIVITY)
-            price = evidence.get(EvidenceFamily.PRICE_STRUCTURE)
-            if activity and price:
-                lines.append(
-                    f"   - 근거: {activity.summary} | {price.summary}"
-                )
+        evidence = {item.family: item for item in candidate.evidence}
+        activity = evidence.get(EvidenceFamily.ACTIVITY)
+        price = evidence.get(EvidenceFamily.PRICE_STRUCTURE)
+        if activity and price:
+            lines.append(f"   - 근거: {activity.summary} | {price.summary}")
 
-            context = evidence.get(EvidenceFamily.CONTEXT)
-            if context:
-                label = (
-                    "보조근거(n/a)"
-                    if context.verdict is EvidenceVerdict.UNAVAILABLE
-                    else "보조근거"
-                )
-                lines.append(f"   - {label}: {context.summary}")
-            risks = [
-                item.summary
-                for item in candidate.evidence
-                if item.verdict is EvidenceVerdict.RISK
-            ]
-            if risks:
-                lines.append(f"   - 반대/위험: {' | '.join(risks)}")
-        return "\n".join(lines)
+        context = evidence.get(EvidenceFamily.CONTEXT)
+        lines.append(f"   - 관찰: {self._format_direction_observation(candidate, context)}")
+        if context:
+            label = (
+                "보조근거(n/a)"
+                if context.verdict is EvidenceVerdict.UNAVAILABLE
+                else "보조근거"
+            )
+            lines.append(f"   - {label}: {context.summary}")
+            contrary = self._direction_contrary_evidence(candidate, context)
+            if contrary:
+                lines.append(f"   - 반대 관찰: {' | '.join(contrary)}")
+        risks = [
+            item.summary
+            for item in candidate.evidence
+            if item.verdict is EvidenceVerdict.RISK
+        ]
+        if risks:
+            lines.append(f"   - 반대/위험: {' | '.join(risks)}")
+        return lines
+
+    def _format_direction_observation(
+        self,
+        candidate: AttentionCandidate,
+        context,
+    ) -> str:
+        ten_minute = (
+            "상방 움직임"
+            if (candidate.price_change_10m or 0.0) > 0
+            else "하방 움직임"
+            if (candidate.price_change_10m or 0.0) < 0
+            else "보합"
+        )
+        trend = context.metrics.get("trend_1h") if context else None
+        hourly = {
+            "UP": "상방 정렬",
+            "DOWN": "하방 정렬",
+            "NEUTRAL": "혼재",
+        }.get(trend, "확인 불가")
+        daily_value = context.metrics.get("above_ma50_daily") if context else None
+        daily = (
+            "MA50 위"
+            if daily_value is True
+            else "MA50 아래"
+            if daily_value is False
+            else "확인 불가"
+        )
+        return f"10분 {ten_minute} · 60분 {hourly} · 일봉 {daily} · 방향 예측 아님"
+
+    def _direction_contrary_evidence(
+        self,
+        candidate: AttentionCandidate,
+        context,
+    ) -> List[str]:
+        direction_up = (candidate.price_change_10m or 0.0) > 0
+        direction_down = (candidate.price_change_10m or 0.0) < 0
+        trend = context.metrics.get("trend_1h")
+        daily = context.metrics.get("above_ma50_daily")
+        contrary = []
+        if direction_up and trend == "DOWN":
+            contrary.append("60분 하방 정렬")
+        elif direction_down and trend == "UP":
+            contrary.append("60분 상방 정렬")
+        if direction_up and daily is False:
+            contrary.append("일봉 MA50 아래")
+        elif direction_down and daily is True:
+            contrary.append("일봉 MA50 위")
+        return contrary
 
     def _format_market_status(
         self,

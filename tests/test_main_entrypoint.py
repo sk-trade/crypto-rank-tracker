@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import AsyncMock, Mock
 
 import main as app
+from common.attention import build_attention_queue
 from common.models import (
     AttentionState,
     CandleData,
@@ -245,14 +246,17 @@ def test_run_check_keeps_execution_risk_in_the_attention_pipeline(monkeypatch):
         ),
     }
     broad_candles = {market: [] for market in lightweight}
-    higher_timeframe = {
-        market: lightweight[market].candle_history for market in lightweight
+    hourly_context = {
+        market: lightweight[market].candle_history * 24 for market in lightweight
+    }
+    daily_context = {
+        market: lightweight[market].candle_history * 200 for market in lightweight
     }
     get_candles = AsyncMock(
-        side_effect=[broad_candles, higher_timeframe, higher_timeframe]
+        side_effect=[broad_candles, hourly_context, daily_context]
     )
     detect = Mock(return_value=[])
-    _, previous_attention = app.build_attention_queue(
+    _, previous_attention = build_attention_queue(
         timestamp,
         ["KRW-ADA"],
         lightweight,
@@ -364,6 +368,9 @@ def test_run_check_keeps_execution_risk_in_the_attention_pipeline(monkeypatch):
     assert events["KRW-XRP"].feature_snapshot["execution_rejection_reasons"] == [
         RejectionCode.SPREAD_ABOVE_MAXIMUM.value
     ]
+    assert events["KRW-XRP"].feature_snapshot["attention_coverage"][
+        "eligible_context_coverage_ratio"
+    ] == 1.0
     attention_queue = dispatch.await_args.kwargs["attention_queue"]
     assert {candidate.market for candidate in attention_queue} == {
         "KRW-ADA",
@@ -397,15 +404,15 @@ def test_historical_retry_skips_current_only_evidence_and_notifications(monkeypa
     monkeypatch.setattr(app, "save_attention_state", save_attention)
     dispatch = AsyncMock()
     monkeypatch.setattr(app, "create_and_dispatch_notification", dispatch)
-    build_queue = Mock()
-    monkeypatch.setattr(app, "build_attention_queue", build_queue)
+    build_result = Mock()
+    monkeypatch.setattr(app, "build_attention_result", build_result)
 
     import asyncio
 
     asyncio.run(app.run_check(schedule_time=scan_at.isoformat()))
 
     market_fetch.assert_not_awaited()
-    build_queue.assert_not_called()
+    build_result.assert_not_called()
     append_events.assert_not_awaited()
     save_rank.assert_not_awaited()
     save_attention.assert_not_awaited()

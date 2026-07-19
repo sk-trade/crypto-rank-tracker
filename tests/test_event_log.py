@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 import config
-from common.attention import build_attention_queue
+from common.attention import build_attention_queue, build_attention_result
 from common.analysis.deep_dive import enrich_deep_dive_tickers
 from common.event_log import build_scan_events, resolve_scan_outcomes
 from common.models import (
@@ -145,7 +145,7 @@ def test_scan_event_records_attention_queue_position_before_final_alert():
         candle_history=[_candle(observed_at, 100.0, 101.0, 99.0)],
         price_change_10m=0.5,
     )
-    queue, _ = build_attention_queue(
+    result = build_attention_result(
         observed_at,
         [ticker.market],
         {ticker.market: ticker},
@@ -162,13 +162,25 @@ def test_scan_event_records_attention_queue_position_before_final_alert():
         {ticker.market: CandidateDecision(eligible=True)},
         [],
         [],
-        attention_candidates=queue,
+        attention_candidates=result.all_candidates,
+        attention_coverage={
+            "raw_market_coverage_ratio": 1.0,
+            "eligible_context_coverage_ratio": 0.0,
+        },
     )[0]
 
     assert event.final_decision is ScanDecision.ATTENTION_QUEUED
     assert event.attention_rank == 1
-    assert event.attention_stage == queue[0].stage
-    assert event.attention_episode_id == queue[0].episode_id
+    assert event.attention_stage == result.all_candidates[0].stage
+    assert event.attention_episode_id == result.all_candidates[0].episode_id
+    assert event.attention_primary_selected is False
+    assert event.attention_displayed is False
+    assert event.attention_v3_shadow_rank == 1
+    assert event.attention_score_version == config.ATTENTION_V4_MODEL_VERSION
+    assert event.feature_snapshot["attention"]["lane"] == "data_limited"
+    assert event.feature_snapshot["attention_coverage"][
+        "raw_market_coverage_ratio"
+    ] == 1.0
     assert event.rejection_reasons == [
         RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE
     ]
@@ -190,7 +202,7 @@ def test_cooling_attention_item_is_not_logged_as_only_a_filter_rejection():
         [],
         [],
     )
-    cooling, _ = build_attention_queue(
+    cooling_result = build_attention_result(
         observed_at + datetime.timedelta(minutes=10),
         [],
         {ticker.market: ticker},
@@ -213,7 +225,7 @@ def test_cooling_attention_item_is_not_logged_as_only_a_filter_rejection():
         },
         [],
         [],
-        attention_candidates=cooling,
+        attention_candidates=cooling_result.all_candidates,
     )[0]
 
     assert event.final_decision is ScanDecision.ATTENTION_QUEUED

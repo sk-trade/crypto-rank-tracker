@@ -161,6 +161,14 @@ class AttentionStage(StrEnum):
     FAILED = "failed"
 
 
+class AttentionLane(StrEnum):
+    FOCUS = "focus_now"
+    EARLY = "early_watch"
+    ONGOING = "ongoing"
+    COOLING_FAILED = "cooling_failed"
+    DATA_LIMITED = "data_limited"
+
+
 class EvidenceFamily(StrEnum):
     ACTIVITY = "activity"
     PRICE_STRUCTURE = "price_structure"
@@ -531,6 +539,10 @@ class AttentionStateEntry(BaseModel):
     structure_level: Optional[PositiveFiniteFloat] = None
     structure_direction: Optional[StructureDirection] = None
     cooling_observations: int = Field(default=0, ge=0)
+    focus_observations: int = Field(default=0, ge=0)
+    confirmed_transition_seen: bool = False
+    primary_exposure_times: List[AwareDatetime] = Field(default_factory=list)
+    last_lane: Optional[AttentionLane] = None
     material_change: bool = False
     change_reasons: List[str] = Field(default_factory=list)
 
@@ -551,6 +563,18 @@ class AttentionCandidate(BaseModel):
 
     market: KrwMarket
     attention_rank: int = Field(ge=1)
+    lane: AttentionLane
+    lane_rank: Optional[int] = Field(default=None, ge=1)
+    primary_selected: bool = False
+    displayed: bool = False
+    display_rank: Optional[int] = Field(default=None, ge=1)
+    quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    ranking_score: float = 0.0
+    max_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    primary_exposures_60m: int = Field(default=0, ge=0)
+    v3_shadow_rank: Optional[int] = Field(default=None, ge=1)
+    score_version: str = Field(min_length=1)
+    context_available: bool = False
     market_rank: Optional[int] = Field(default=None, ge=1)
     market_rank_delta: Optional[int] = None
     stage: AttentionStage
@@ -623,7 +647,18 @@ class ScanEvent(BaseModel):
     signal_score: Optional[float] = None
     signal_candle_start: Optional[datetime.datetime] = None
     attention_stage: Optional[AttentionStage] = None
+    attention_lane: Optional[AttentionLane] = None
     attention_rank: Optional[int] = Field(default=None, ge=1)
+    attention_lane_rank: Optional[int] = Field(default=None, ge=1)
+    attention_primary_selected: Optional[bool] = None
+    attention_displayed: Optional[bool] = None
+    attention_display_rank: Optional[int] = Field(default=None, ge=1)
+    attention_quality_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    attention_ranking_score: Optional[float] = None
+    attention_v3_shadow_rank: Optional[int] = Field(default=None, ge=1)
+    attention_primary_exposures_60m: Optional[int] = Field(default=None, ge=0)
+    attention_score_version: Optional[str] = None
+    attention_first_seen_at: Optional[AwareDatetime] = None
     attention_episode_id: Optional[str] = None
 
 

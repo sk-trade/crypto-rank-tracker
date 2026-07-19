@@ -3,6 +3,7 @@ import asyncio
 
 import pytest
 
+import config
 import common.upbit_client as upbit_client
 from common.models import (
     CandleData,
@@ -110,10 +111,12 @@ def test_candle_request_rejects_unsupported_or_invalid_contracts():
 
 
 def test_deep_dive_gate_blocks_a_candidate_missing_either_timeframe():
+    hourly = [object()] * config.ATTENTION_CONTEXT_MIN_HOURLY_BARS
+    daily = [object()] * config.ATTENTION_CONTEXT_MIN_DAILY_BARS
     assert filter_markets_with_complete_deep_dive_data(
         ["KRW-BTC", "KRW-ETH", "KRW-XRP"],
-        {"KRW-BTC": [], "KRW-ETH": []},
-        {"KRW-BTC": [], "KRW-XRP": []},
+        {"KRW-BTC": hourly, "KRW-ETH": hourly},
+        {"KRW-BTC": daily, "KRW-XRP": daily},
     ) == ["KRW-BTC"]
 
 
