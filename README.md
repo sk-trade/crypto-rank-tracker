@@ -1,6 +1,6 @@
 # crypto-rank-tracker
 
-Scheduled tracker for Upbit KRW market ranking and anomaly reporting. The service polls market data on a schedule, derives sector/ranking signals, and sends webhook briefing or alert messages when configured to do so.
+Scheduled attention tracker for every Upbit KRW market. The service narrows the full market universe to a ranked queue of charts where price, activity, or relative behavior is changing. Signals, multi-timeframe structure, market regime, and execution checks explain or challenge each candidate; they are not automatic trade instructions.
 
 ## Configuration
 
@@ -28,12 +28,12 @@ Run the same checks used for local validation:
 
 ```bash
 uv run python -m pytest
-uv run python -m compileall main.py config.py update_sectors.py common tests
+uv run python -m compileall main.py config.py update_sectors.py replay_upbit.py common tests
 uv build
 WHEEL_PATH="$(realpath dist/*.whl)"
 TEMP_DIR="$(mktemp -d)"
 (cd "$TEMP_DIR" && uv run --no-cache --isolated --with "$WHEEL_PATH" python -c \
-  "import main, update_sectors, config, common.upbit_client, common.notification.main")
+  "import main, update_sectors, replay_upbit, config, common.upbit_client, common.notification.main")
 ```
 
 ## Local execution
@@ -51,6 +51,33 @@ uv run python update_sectors.py
 ```
 
 Both commands can trigger live network traffic and service side effects. They may read external market APIs, write state, and send webhook requests depending on configuration. Use them only when those effects are intended.
+
+## Attention queue
+
+- A broad price/activity filter decides which markets deserve inspection.
+- Candidates progress through `discovered`, `building`, `confirmed`, `cooling`, and `failed` episodes.
+- Structure confirmation, 1-hour and daily context, market regime, and orderbook feasibility remain visible evidence. Missing or risky supporting evidence does not silently remove a broad-filter candidate.
+- The webhook briefing shows rank movement, first-seen time, persistence, grouped activity/price/context/execution evidence, and a direct chart link. `signal_score` remains an internal ordering input and is not presented as probability.
+- State and immutable events retain every 10-minute queue transition. The current queue is sent as a deterministic 30-minute digest, while final structure alerts bypass the digest; scans between digests remain available for replay without producing broad-filter webhook churn.
+- Attention state and immutable scan events are stored independently from webhook delivery, so a no-webhook run still produces evaluation evidence.
+
+## Point-in-time replay
+
+Collect and replay the current Upbit KRW universe with disposable `/tmp` storage:
+
+```bash
+uv run python replay_upbit.py --evaluation-days 7
+```
+
+An installed wheel also exposes the equivalent `crypto-rank-replay` command.
+
+The evaluation window accepts 1 through 30 days. Treat 1-3 day runs as smoke/debug evidence, use 7 days for fast regression comparisons, and use a same-end-time 30-day replay before making operating-like quality claims. A long-window result is partial evidence when warm-up-complete market coverage is below the production minimum (currently 95%). The collector adds the required feature warm-up separately: three weeks of 10-minute same-slot history, the recent 10-minute feature window, 200 completed daily bars, derived completed 60-minute bars, and 120 minutes of future outcome data. Upbit's 200-candle limit is paginated through the shared rate limiter, and historical turnover ranks use the API's actual candle KRW trade value rather than `close * volume` approximation.
+
+The default cache and reports are written to `/tmp/crypto-rank-tracker-replay`. Any custom `--cache-dir` outside `/tmp` is rejected. Reuse the cache by default or pass `--refresh` to recollect it. Bulk replay collection uses a lower request rate than the scheduled scanner so both can share an IP without treating the API limit as normal control flow. The live queue retains up to 10 charts, while replay defaults to top 5 so ordering changes remain measurable when the broad filter returns fewer than 10 markets. `report.json` and `report.md` compare turnover ranking, the broad filter, structure ordering, active-candidate progression/context ordering, and cooling/failed retention in the full attention queue. Metrics include compression, Precision@K, Recall@K, 30/60/120-minute MFE, time-to-move, isolated incremental lift, first-visible episode quality, stage-conditioned quality, true repeat exposure, and scheduled digest pressure. `observations.ndjson` retains the concrete per-scan queues, comparison selections, meaningful movers, and joined future outcomes behind those aggregates.
+
+Historical candle replay does not reconstruct past orderbooks. Execution evidence is therefore marked unavailable and excluded from replay lift attribution; live scans continue to show current spread, depth, slippage, warning, and estimated-cost risk.
+
+Every replay report and per-decision observation records `SIGNAL_MODEL_VERSION`, preventing results from interim and final queue semantics from being silently mixed.
 
 ## Signal Safety
 
