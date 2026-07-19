@@ -6,11 +6,13 @@ Scheduled tracker for Upbit KRW market ranking and anomaly reporting. The servic
 
 Set these environment variables for runtime behavior:
 
-- `STATE_STORAGE_METHOD`: state backend selector used by the service.
+- `STATE_STORAGE_METHOD`: state backend selector; omit it for `LOCAL`, or set it explicitly to `LOCAL` or `GCS`. Any other value fails at startup.
 - `GCS_BUCKET_NAME`: required bucket name when `STATE_STORAGE_METHOD=GCS`.
-- `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery.
+- `WEBHOOK_URL`: outbound webhook destination for briefing and alert delivery. Local runs read it directly; production syncs the GitHub secret into Google Secret Manager and injects it as a runtime secret.
+- `SHADOW_MODE`: set to `true`, `1`, or `yes` for no-webhook evaluations that must retain production-equivalent cooldown state in isolated `shadow_alert_history.json` without advancing delivery-backed `alert_history.json`.
 - `CG_API_KEY`: CoinGecko API key used by the sector updater.
-- `GCP_PROJECT_ID`: Google Cloud project identifier used by deployment/runtime integration.
+- `GCP_PROJECT_ID`: Google Cloud project identifier. Production workflows require it; local GCS use may omit it only when Application Default Credentials can infer the project.
+- `CG_SYMBOL_OVERRIDES`: optional JSON object mapping an ambiguous lower-case symbol to an explicit CoinGecko id, for example `{"pay":"tenx"}`. Values may also provide explicit `name` and `network` constraints. Unique CoinGecko symbols do not depend on provider display-name equality; ambiguous symbols without a valid override are left untagged.
 
 ## Local setup
 
@@ -26,8 +28,12 @@ Run the same checks used for local validation:
 
 ```bash
 uv run python -m pytest
-uv run python -m compileall main.py config.py common tests
+uv run python -m compileall main.py config.py update_sectors.py common tests
 uv build
+WHEEL_PATH="$(realpath dist/*.whl)"
+TEMP_DIR="$(mktemp -d)"
+(cd "$TEMP_DIR" && uv run --no-cache --isolated --with "$WHEEL_PATH" python -c \
+  "import main, update_sectors, config, common.upbit_client, common.notification.main")
 ```
 
 ## Local execution
@@ -46,15 +52,44 @@ uv run python update_sectors.py
 
 Both commands can trigger live network traffic and service side effects. They may read external market APIs, write state, and send webhook requests depending on configuration. Use them only when those effects are intended.
 
+## Signal Safety
+
+- The broad scan builds 154 recent 10-minute clock bars per market and separately fetches three prior weekly same-slot observations. Upbit no-trade intervals carry the previous OHLC with zero volume; malformed responses, missing conditional samples, or unavailable orderbooks still block signals rather than falling back to a weaker rule.
+- Candidate execution checks require sufficient 24-hour turnover, two-sided orderbook depth for the configured KRW notional, acceptable spread/slippage, and movement that covers estimated round-trip costs.
+- Local state is stored under `state/`. Rank snapshots retain the most recent `STATE_HISTORY_COUNT` entries; malformed state files fail explicitly rather than silently resetting history.
+- The baseline model, threshold selector, and shadow-promotion policies are offline evaluation tools. They do not replace production alerts until frozen shadow-operation criteria are met.
+
 ## Deployment
 
 GitHub Actions is used for deployment flow control:
 
-- Pull requests run verification only.
+- Pull requests to any target branch run verification only.
 - Pushes to `main` and manual `workflow_dispatch` runs from `main` deploy after verification.
 - The deployment target is Cloud Function `crypto-rank-tracker` in `asia-northeast1`.
 - Cloud Scheduler runs every 10 minutes.
 - The deploy workflow exports requirements without development dependencies.
+- Configure distinct GitHub Secrets for `GCP_DEPLOYER_SA_EMAIL`, `GCP_RUNTIME_SA_EMAIL`,
+  and `GCP_SCHEDULER_SA_EMAIL`. The deployer authenticates GitHub Actions, the runtime
+  account accesses application resources, and the Scheduler account invokes the function.
+- Configure the `GCP_PROJECT_ID` and `GCP_WIF_PROVIDER` secrets for explicit project selection and Workload Identity Federation, plus the
+  `WEBHOOK_URL` GitHub secret when live notifications are required. The deploy workflow creates or updates `crypto-rank-tracker-webhook-url` in Secret Manager and injects only its resource reference into the Cloud Function revision.
+- Production workflows pin `STATE_STORAGE_METHOD=GCS` so the scheduled function and sector
+  updater share durable state. Configure the required `GCS_BUCKET_NAME` repository variable;
+  deployment and sector refresh fail before authentication when it is missing.
+- Configure `CG_SYMBOL_OVERRIDES` when symbol collisions need explicit CoinGecko identities.
+  The sector workflow also requires the `CG_API_KEY` secret.
+- Grant the deployer permission to deploy Cloud Functions, act as the runtime service account,
+  update the Cloud Run invoker policy, manage the Scheduler job, and create/update the designated
+  Secret Manager secret and its IAM policy. The workflow grants the runtime account
+  `roles/secretmanager.secretAccessor` on that secret and grants the Scheduler service account
+  `roles/run.invoker` on the deployed Gen2 service.
+- The Gen2 function is deployed with 512 MB memory, a 540-second service timeout, one maximum instance,
+  and one request per instance. Scheduler updates are idempotent, use the function URL
+  as their OIDC audience, and retry failed executions three times with bounded backoff. Retries use
+  `X-CloudScheduler-ScheduleTime` to keep the original completed-candle scan identity across time boundaries.
+- Configured webhook deliveries use durable outbox state and expose a stable `X-Webhook-Delivery-ID` header for receiver-side reconciliation. Definitive HTTP/connect failures remain retryable, while an in-flight attempt with an unknown outcome is held for operator review instead of being silently cleared or resent.
+- Market scans continue while an older delivery is pending. Later alerts and data-quality incidents are retained in FIFO order in `notification_backlog.json`; ordinary no-alert briefings coalesce to the latest scan. The backlog is bounded at 144 retained records, and a full backlog fails the scan explicitly so the notification is not silently discarded.
+- For an outbox in `attempting`, check the receiver for its delivery ID before editing state. If the receiver confirms delivery, preserve the record and change only its status to `delivered`; if it confirms no delivery, change only the status to `prepared`. Leave an unresolved attempt untouched. Removing `WEBHOOK_URL` cancels prepared and deferred work, but preserves an ambiguous active attempt and its delivery ID until the operator resolves it.
 
 ## Operational notes
 

@@ -3,27 +3,48 @@
 """분석된 데이터를 기반으로 사용자에게 보여질 최종 알림 메시지를 생성합니다."""
 
 import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
-from common.models import Alert, AlertHistory, TickerData
+from common.models import (
+    Alert,
+    AlertHistory,
+    DataQualityIssue,
+    MarketTicker,
+    MarketRegimeSnapshot,
+    SignalType,
+    TickerData,
+)
 
 
 class NotificationFormatter:
     """분석된 데이터와 알림 객체를 기반으로 사용자 메시지를 생성하는 클래스입니다."""
 
+    def format_data_quality_alert(self, issues: List[DataQualityIssue]) -> str:
+        """Format an operational incident without presenting market analysis as valid."""
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        now_kst = datetime.datetime.now(kst)
+        details = "\n".join(f"- [{issue.code.value}] {issue.message}" for issue in issues)
+        return "\n".join(
+            [
+                f"🚨 **시장 데이터 품질 장애 ({now_kst.strftime('%H:%M')} KST)**",
+                "이번 스캔의 시장 데이터가 기준에 미달해 시그널과 일반 브리핑을 생성하지 않았습니다.",
+                details,
+            ]
+        )
+
     def format_daily_briefing(
         self,
         alerts: List[Alert],
-        raw_tickers: List[Dict[str, Any]],
+        raw_tickers: List[MarketTicker],
         enriched_tickers: Dict[str, TickerData],
         current_rankings: Dict[str, int],
         previous_rankings: Dict[str, int],
         SECTORS: Dict[str, List[str]],
         REVERSE_SECTOR_MAP: Dict[str, List[str]],
         alert_history: Dict[str, AlertHistory],
-        market_regime: Dict[str, Any],
+        market_regime: MarketRegimeSnapshot,
     ) -> str:
         """시장 브리핑 전체 메시지를 조립합니다."""
         kst = datetime.timezone(datetime.timedelta(hours=9))
@@ -32,12 +53,12 @@ class NotificationFormatter:
         parts = [f"📊 **업비트 마켓 브리핑 ({now_kst.strftime('%H:%M')} KST)**"]
         parts.append(self._format_market_status(raw_tickers, enriched_tickers))
 
-        try:
-            # lightweight_tickers에는 1시간 데이터가 없으므로 예외 처리
-            if leading_sectors_str := self._format_leading_sectors(enriched_tickers, SECTORS):
-                parts.extend(["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str])
-        except Exception:
-            pass
+        if leading_sectors_str := self._format_leading_sectors(
+            enriched_tickers, SECTORS
+        ):
+            parts.extend(
+                ["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str]
+            )
 
         if alerts:
             parts.extend(["\n---", "⚡ **실시간 마켓 이벤트**"])
@@ -52,7 +73,9 @@ class NotificationFormatter:
         return "\n".join(parts)
 
     def _format_market_status(
-        self, raw_tickers: List[Dict[str, Any]], enriched_tickers: Dict[str, TickerData]
+        self,
+        raw_tickers: List[MarketTicker],
+        enriched_tickers: Dict[str, TickerData],
     ) -> str:
         """시장 현황 요약 문자열을 생성합니다."""
         gainers = sum(
@@ -67,11 +90,11 @@ class NotificationFormatter:
         )
         mood = "강세" if gainers > losers * 1.2 else "약세" if losers > gainers * 1.2 else "보합"
 
-        total_24h = sum(t.get("acc_trade_price_24h", 0) for t in raw_tickers)
+        total_24h = sum(ticker.acc_trade_price_24h for ticker in raw_tickers)
         major_24h = sum(
-            t.get("acc_trade_price_24h", 0)
-            for t in raw_tickers
-            if t["market"] in ["KRW-BTC", "KRW-ETH"]
+            ticker.acc_trade_price_24h
+            for ticker in raw_tickers
+            if ticker.market in {"KRW-BTC", "KRW-ETH"}
         )
         major_pct = (major_24h / total_24h * 100) if total_24h > 0 else 0
 
@@ -93,7 +116,8 @@ class NotificationFormatter:
         all_changes_1h = [t.price_change_1h for t in enriched_tickers.values() if t.price_change_1h is not None]
         all_changes_4h = [t.price_change_4h for t in enriched_tickers.values() if t.price_change_4h is not None]
         
-        if not all_changes_1h or not all_changes_4h: return None
+        if not all_changes_1h or not all_changes_4h:
+            return None
         
         market_avg_1h = np.mean(all_changes_1h)
         market_avg_4h = np.mean(all_changes_4h)
@@ -115,7 +139,8 @@ class NotificationFormatter:
             tickers = [enriched_tickers.get(c) for c in coins if enriched_tickers.get(c)]
             valid_tickers = [t for t in tickers if t.price_change_1h is not None and t.price_change_4h is not None]
             
-            if len(valid_tickers) < 4: continue # 최소 4개 종목 이상인 섹터만 분석
+            if len(valid_tickers) < 4:
+                continue  # 최소 4개 종목 이상인 섹터만 분석
             
             # 섹터 지표 계산
             avg_return_1h = np.mean([t.price_change_1h for t in valid_tickers])
@@ -183,41 +208,42 @@ class NotificationFormatter:
                     change_str = f" (↑{change})"
                 elif change < 0:
                     change_str = f" (↓{abs(change)})"
-            rank_strs.append(f"{rank}. {market.split('-')[1]}{change_str}")
+            rank_strs.append(
+                f"{rank}. {market.removeprefix('KRW-')}{change_str}"
+            )
 
-        return f"\n---\n🏆 **24h 거래대금 TOP 10:**\n" + " | ".join(rank_strs)
+        return "\n---\n🏆 **24h 거래대금 TOP 10:**\n" + " | ".join(rank_strs)
 
     def _format_single_alert(
         self,
         alert: Alert,
         reverse_sector_map: Dict[str, List[str]],
-        market_regime: Dict[str, Any],
+        market_regime: MarketRegimeSnapshot,
     ) -> str:
         """단일 알림을 객관적인 Signal Checklist 포맷으로 생성합니다."""
         candidate = alert.candidate
         ticker = alert.ticker_data
         market = candidate.market
-        tag = reverse_sector_map.get(market, [""])[0]
+        tags = reverse_sector_map.get(market, [])
+        tag = tags[0] if tags else ""
 
         signal_map = {
-            "MOMENTUM_ACCELERATION": "상승 모멘텀 가속",
-            "DOWNTREND_ACCELERATION": "하락 모멘텀 가속",
-            "BREAKOUT_START": "초기 돌파 시작",
-            "BREAKDOWN_START": "초기 이탈 시작",
-            "BULL_MOMENTUM_SUSTAINED": "상승 모멘텀 지속",
-            "BULL_MOMENTUM_FAILED": "상승 모멘텀 실패",
-            "BEAR_MOMENTUM_SUSTAINED": "하락 모멘텀 지속",
-            "BEAR_MOMENTUM_FAILED": "하락 모멘텀 실패",
+            SignalType.MOMENTUM_ACCELERATION: "상승 모멘텀 가속",
+            SignalType.DOWNTREND_ACCELERATION: "하락 모멘텀 가속",
+            SignalType.BREAKOUT_START: "초기 돌파 시작",
+            SignalType.BREAKDOWN_START: "초기 이탈 시작",
+            SignalType.BULL_MOMENTUM_FAILED: "상승 모멘텀 실패",
+            SignalType.BEAR_MOMENTUM_FAILED: "하락 모멘텀 실패",
         }
-        signal_title = signal_map.get(alert.signal_type, "주요 변동")
+        signal_title = signal_map[alert.signal_type]
         
         icon = "🔥" if (candidate.price_change or 0) > 0 else "🧊"
         header = (
-            f"{icon} **{market.split('-')[1]}{f' ({tag})' if tag else ''}: "
-            f"{signal_title}** (신뢰도: {candidate.confidence:.0%})"
+            f"{icon} **{market.removeprefix('KRW-')}{f' ({tag})' if tag else ''}: "
+            f"{signal_title}** (Signal score: {candidate.signal_score:.2f})"
         )
 
-        decoupling_score = ticker.decoupling_score
+        residual_score = ticker.residual_momentum_score
 
         checklist = [
             "```",
@@ -227,10 +253,10 @@ class NotificationFormatter:
             f"[ 1hr ] Trend           : {ticker.trend_1h_stable}",
             f"[Daily] Above MA50      : {ticker.is_above_ma50_daily}",
             f"[Daily] Above MA200     : {ticker.is_above_ma200_daily}",
-            f"[Market] Regime        : {market_regime.get('regime', 'N/A')}",
+            f"[Market] Regime        : {market_regime.regime.value}",
         ]
-        if decoupling_score is not None:
-                checklist.append(f"[Market] Decoupling    : {decoupling_score:+.1f}%p vs BTC")
+        if residual_score is not None:
+            checklist.append(f"[Market] Residual momentum: {residual_score:+.2f} sigma")
         
         checklist.append("```")
         

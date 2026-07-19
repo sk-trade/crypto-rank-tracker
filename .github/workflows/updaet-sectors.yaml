@@ -8,7 +8,11 @@ on:
 
 jobs:
   update-sectors:
+    if: ${{ github.event_name == 'schedule' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: crypto-rank-tracker-sector-update
+      cancel-in-progress: false
     
     # GCS에 인증하고 Secret을 사용하기 위한 권한
     permissions:
@@ -40,12 +44,27 @@ jobs:
     - name: Install dependencies
       run: uv sync --frozen
 
+    - name: Validate durable state configuration
+      env:
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
+      run: |
+        if [ -z "$GCP_PROJECT_ID" ]; then
+          echo "::error::GCP_PROJECT_ID repository secret is required for Google Cloud sector storage."
+          exit 1
+        fi
+        if [ -z "$GCS_BUCKET_NAME" ]; then
+          echo "::error::GCS_BUCKET_NAME repository variable is required for durable production state."
+          exit 1
+        fi
+
     # Google Cloud에 인증 (GCS에 업로드하기 위해 필요)
     - name: Authenticate to Google Cloud
       uses: 'google-github-actions/auth@v2'
       with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
         workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-        service_account: ${{ secrets.GCP_SA_EMAIL }}
+        service_account: ${{ secrets.GCP_RUNTIME_SA_EMAIL }}
 
     # 섹터 업데이트 스크립트 실행
     - name: Run sector update script
@@ -53,7 +72,7 @@ jobs:
       env:
         # GitHub Repository Secret에 'CG_API_KEY'라는 이름으로 키를 저장해야 함
         CG_API_KEY: ${{ secrets.CG_API_KEY }}
-        # GCS 업로드를 위해 GCP 관련 환경 변수도 전달
-        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }} # 프로젝트 ID가 필요하다면
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
-        STATE_STORAGE_METHOD: ${{ vars.STATE_STORAGE_METHOD }}
+        STATE_STORAGE_METHOD: GCS
+        CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES || '{}' }}

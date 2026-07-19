@@ -3,8 +3,7 @@ name: Deploy to Google Cloud Functions
 on:
   push:
     branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  pull_request: {}
   workflow_dispatch:
 
 jobs:
@@ -34,19 +33,32 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Lint Python sources
+        run: uv run ruff check .
+
       - name: Run tests
         run: uv run python -m pytest
 
       - name: Compile Python sources
-        run: uv run python -m compileall main.py config.py common tests
+        run: uv run python -m compileall main.py config.py update_sectors.py common tests
 
       - name: Build package
         run: uv build
+
+      - name: Verify built package imports
+        run: |
+          WHEEL_PATH="$(realpath dist/*.whl)"
+          TEMP_DIR="$(mktemp -d)"
+          cd "$TEMP_DIR"
+          uv run --no-cache --isolated --with "$WHEEL_PATH" python -c "import main, update_sectors, config, common.upbit_client, common.notification.main"
 
   deploy:
     needs: verify
     if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: crypto-rank-tracker-production-deploy
+      cancel-in-progress: false
 
     # GCP에 인증하기 위한 권한 설정
     permissions:
@@ -57,6 +69,15 @@ jobs:
       # GitHub 리포지토리의 코드를 가져옴
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Refuse stale main deployment
+        run: |
+          git fetch origin main --quiet
+          CURRENT_MAIN_SHA="$(git rev-parse origin/main)"
+          if [ "$GITHUB_SHA" != "$CURRENT_MAIN_SHA" ]; then
+            echo "::error::Refusing to deploy stale commit $GITHUB_SHA; current main is $CURRENT_MAIN_SHA."
+            exit 1
+          fi
 
       # Python 환경 설정
       - name: Set up Python
@@ -82,6 +103,20 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Validate durable state configuration
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCS_BUCKET_NAME: ${{ vars.GCS_BUCKET_NAME }}
+        run: |
+          if [ -z "$GCP_PROJECT_ID" ]; then
+            echo "::error::GCP_PROJECT_ID repository secret is required for Google Cloud deployment."
+            exit 1
+          fi
+          if [ -z "$GCS_BUCKET_NAME" ]; then
+            echo "::error::GCS_BUCKET_NAME repository variable is required for durable production state."
+            exit 1
+          fi
+
       # uv에서 requirements.txt 생성 (GCF 배포용)
       - name: Generate requirements.txt
         run: |
@@ -93,55 +128,101 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: 'google-github-actions/auth@v2'
         with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SA_EMAIL }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA_EMAIL }}
+
+      - name: Sync webhook credential to Secret Manager
+        id: webhook_secret
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_RUNTIME_SA_EMAIL: ${{ secrets.GCP_RUNTIME_SA_EMAIL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET_ID: crypto-rank-tracker-webhook-url
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo 'mapping={}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! gcloud secrets describe "$WEBHOOK_SECRET_ID" --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
+            gcloud secrets create "$WEBHOOK_SECRET_ID" \
+              --project="$GCP_PROJECT_ID" \
+              --replication-policy=automatic
+          fi
+          printf '%s' "$WEBHOOK_URL" | gcloud secrets versions add "$WEBHOOK_SECRET_ID" \
+            --project="$GCP_PROJECT_ID" \
+            --data-file=-
+          gcloud secrets add-iam-policy-binding "$WEBHOOK_SECRET_ID" \
+            --project="$GCP_PROJECT_ID" \
+            --member="serviceAccount:$GCP_RUNTIME_SA_EMAIL" \
+            --role=roles/secretmanager.secretAccessor \
+            --quiet
+          echo "mapping=WEBHOOK_URL=projects/$GCP_PROJECT_ID/secrets/$WEBHOOK_SECRET_ID/versions/latest" >> "$GITHUB_OUTPUT"
 
       # Google Cloud Functions에 배포
       - name: Deploy Function
         id: deploy
         uses: 'google-github-actions/deploy-cloud-functions@v3'
         with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
           name: crypto-rank-tracker          # 배포할 함수 이름
           runtime: python311                # 파이썬 런타임 버전
           entry_point: main                 # 진입점 함수 이름
           region: asia-northeast1                  # 리전
           source_dir: ./                    # 소스 코드 디렉토리
-          service_account: ${{ secrets.GCP_SA_EMAIL }} # 서비스 계정
+          service_account: ${{ secrets.GCP_RUNTIME_SA_EMAIL }}
           memory: 512M
-          timeout: 540                      # ← 타임아웃 (초 단위)
-          max_instances: 1                  # ← 최대 동시 인스턴스
+          service_timeout: 540s
+          max_instance_count: 1
+          max_instance_request_concurrency: 1
           environment_variables: |          # 환경 변수 설정
-            STATE_STORAGE_METHOD=${{ vars.STATE_STORAGE_METHOD }}
+            STATE_STORAGE_METHOD=GCS
+            GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
             GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
-            WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+          secrets: ${{ steps.webhook_secret.outputs.mapping }}
+
+      - name: Authorize Scheduler invocation
+        run: |
+          gcloud run services add-iam-policy-binding crypto-rank-tracker \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --region=asia-northeast1 \
+            --member="serviceAccount:${{ secrets.GCP_SCHEDULER_SA_EMAIL }}" \
+            --role="roles/run.invoker"
 
       # Cloud Scheduler 설정 (10분마다 실행)
       - name: Create Cloud Scheduler Job
         run: |
           # Cloud Function URL 가져오기
-          FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
+          FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --project="${{ secrets.GCP_PROJECT_ID }}" --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
 
           echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
 
-          # 기존 잡 삭제 (없어도 무시)
-          gcloud scheduler jobs delete crypto-rank-tracker-scheduler \
-            --location=asia-northeast1 --quiet || true
-
-          # 새로운 잡 생성
-          gcloud scheduler jobs create http crypto-rank-tracker-scheduler \
-            --location=asia-northeast1 \
-            --schedule="*/10 * * * *" \
-            --uri="$FUNCTION_URL" \
-            --http-method=POST \
-            --oidc-service-account-email=${{ secrets.GCP_SA_EMAIL }} \
-            --attempt-deadline=15m \
-            --time-zone="Asia/Seoul" \
+          SCHEDULER_ARGS=(
+            --project=${{ secrets.GCP_PROJECT_ID }}
+            --location=asia-northeast1
+            --schedule="*/10 * * * *"
+            --uri="$FUNCTION_URL"
+            --http-method=POST
+            --oidc-service-account-email=${{ secrets.GCP_SCHEDULER_SA_EMAIL }}
+            --oidc-token-audience="$FUNCTION_URL"
+            --attempt-deadline=15m
+            --max-retry-attempts=3
+            --min-backoff=30s
+            --max-backoff=5m
+            --max-doublings=2
+            --time-zone="Asia/Seoul"
             --description="10분마다 업비트 랭킹 체크"
+          )
+
+          if ! gcloud scheduler jobs update http crypto-rank-tracker-scheduler "${SCHEDULER_ARGS[@]}"; then
+            gcloud scheduler jobs create http crypto-rank-tracker-scheduler "${SCHEDULER_ARGS[@]}"
+          fi
 
       # 배포 결과 확인
       - name: Verify deployment
         run: |
           echo "Function deployed successfully!"
-          gcloud functions describe crypto-rank-tracker --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)"
+          gcloud functions describe crypto-rank-tracker --project="${{ secrets.GCP_PROJECT_ID }}" --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)"
           echo "Scheduler job created/updated:"
-          gcloud scheduler jobs describe crypto-rank-tracker-scheduler --location=asia-northeast1
+          gcloud scheduler jobs describe crypto-rank-tracker-scheduler --project="${{ secrets.GCP_PROJECT_ID }}" --location=asia-northeast1
