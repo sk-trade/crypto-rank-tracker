@@ -13,6 +13,7 @@ from common.replay import (
     REPLAY_VARIANT_ATTENTION,
     REPLAY_VARIANT_BASELINE,
     REPLAY_VARIANT_PROGRESSION,
+    REPLAY_VARIANT_V3_MATCHED,
     REPLAY_VARIANT_V3_SHADOW,
     ReplayEvidenceTier,
     aggregate_hourly_candles,
@@ -144,9 +145,9 @@ def test_replay_cache_round_trip_is_restricted_to_tmp(tmp_path):
     assert load_dataset(tmp_path, 7, timestamp) is not None
     assert load_dataset(tmp_path, 30, timestamp) is not None
     assert load_dataset(tmp_path, 31, timestamp) is None
-    assert load_dataset(
-        tmp_path, 30, timestamp + datetime.timedelta(minutes=10)
-    ) is None
+    assert (
+        load_dataset(tmp_path, 30, timestamp + datetime.timedelta(minutes=10)) is None
+    )
     assert loaded[0] == candles
     assert loaded[1] == candles
     assert _tmp_path(tmp_path) == tmp_path.resolve()
@@ -154,9 +155,7 @@ def test_replay_cache_round_trip_is_restricted_to_tmp(tmp_path):
         _tmp_path(Path("/var/tmp/not-tmp-output"))
 
     incomplete = {**loaded[2], "complete": False}
-    (tmp_path / "manifest.json").write_text(
-        json.dumps(incomplete), encoding="utf-8"
-    )
+    (tmp_path / "manifest.json").write_text(json.dumps(incomplete), encoding="utf-8")
     assert load_dataset(tmp_path, 30) is None
 
 
@@ -209,9 +208,9 @@ def test_point_in_time_replay_runs_every_operational_scan_without_dropping_timef
     assert report.scheduled_digest_scans == 48
     assert report.nonempty_digest_scans == 0
     assert any("orderbook snapshots" in warning for warning in report.warnings)
-    assert report.evaluation_end == ten_minute["KRW-BTC"][-13].timestamp + datetime.timedelta(
-        minutes=10
-    )
+    assert report.evaluation_end == ten_minute["KRW-BTC"][
+        -13
+    ].timestamp + datetime.timedelta(minutes=10)
     assert len(observations) == 144
     assert observations[0]["decision_at"] > observations[0]["signal_candle_start"]
     assert observations[0]["signal_model_version"] == config.SIGNAL_MODEL_VERSION
@@ -219,6 +218,7 @@ def test_point_in_time_replay_runs_every_operational_scan_without_dropping_timef
     assert REPLAY_VARIANT_BASELINE in observations[0]["variants"]
     assert REPLAY_VARIANT_PROGRESSION in observations[0]["variants"]
     assert REPLAY_VARIANT_V3_SHADOW in observations[0]["variants"]
+    assert REPLAY_VARIANT_V3_MATCHED in observations[0]["variants"]
     assert "Precision@K" in report.to_markdown()
     assert "Evidence: `smoke`" in report.to_markdown()
     assert "Timeframes: 10m, 60m, 1d" in report.to_markdown()
@@ -285,9 +285,7 @@ def test_replay_can_use_a_longer_same_end_cache_for_a_shorter_window():
     assert any("Reused a 2-day cache" in warning for warning in report.warnings)
 
 
-def test_replay_run_reuses_superset_cache_and_separates_outputs(
-    tmp_path, monkeypatch
-):
+def test_replay_run_reuses_superset_cache_and_separates_outputs(tmp_path, monkeypatch):
     source_days = 2
     count = replay_10m_bar_count(source_days)
     start = datetime.datetime(2026, 6, 1, tzinfo=UTC)
@@ -357,9 +355,11 @@ def test_replay_run_reuses_superset_cache_and_separates_outputs(
     assert payload["requested_evaluation_days"] == 1
     assert payload["source_evaluation_days"] == source_days
     assert payload["analysis_timeframes"] == list(REPLAY_ANALYSIS_TIMEFRAMES)
+    assert "visible_precision_lift_vs_v3" in payload
+    assert payload["v4_precision_lift_vs_v3"] is None
 
 
-def test_point_in_time_replay_measures_nonempty_attention_progression():
+def test_point_in_time_replay_measures_nonempty_attention_progression(monkeypatch):
     count = replay_10m_bar_count(1)
     warmup = replay_warmup_10m_bars()
     start = datetime.datetime(2026, 6, 1, tzinfo=UTC)
@@ -393,17 +393,23 @@ def test_point_in_time_replay_measures_nonempty_attention_progression():
                 100.0,
             )
             for index in range(replay_daily_bar_count(1))
-        ]
+        ],
     }
+    eth_candles = [
+        candle.model_copy(update={"market": "KRW-ETH"}) for candle in candles
+    ]
+    daily["KRW-ETH"] = [
+        candle.model_copy(update={"market": "KRW-ETH"}) for candle in daily["KRW-BTC"]
+    ]
 
     observations = []
     report = run_point_in_time_replay(
-        {"KRW-BTC": candles},
+        {"KRW-BTC": candles, "KRW-ETH": eth_candles},
         daily,
         {},
         {},
         evaluation_days=1,
-        top_k=1,
+        top_k=2,
         observation_sink=observations.append,
     )
 
@@ -415,17 +421,40 @@ def test_point_in_time_replay_measures_nonempty_attention_progression():
     assert report.attention_yield is not None
     assert report.eligible_context_coverage_ratio > 0
     assert report.variants[REPLAY_VARIANT_V3_SHADOW].selected_observations > 0
+    assert all(
+        len(observation["variants"][REPLAY_VARIANT_ATTENTION])
+        == len(observation["variants"][REPLAY_VARIANT_V3_MATCHED])
+        for observation in observations
+    )
+    assert any(
+        len(observation["variants"][REPLAY_VARIANT_V3_SHADOW])
+        > len(observation["variants"][REPLAY_VARIANT_V3_MATCHED])
+        for observation in observations
+    )
+    assert report.visible_precision_lift_vs_v3 is not None
+    assert report.v4_precision_lift_vs_v3 is None
     assert report.progression_context_precision_lift is not None
     assert "building" in report.attention_stage_metrics
     assert "confirmed" in report.attention_stage_metrics
     survivor_observation = next(
-        observation
-        for observation in observations
-        if observation["attention_queue"]
+        observation for observation in observations if observation["attention_queue"]
     )
     assert survivor_observation["visible_attention_markets"]
     assert all(
         candidate["v3_shadow_rank"] is not None
+        for candidate in survivor_observation["attention_queue"]
+    )
+    assert all(
+        candidate["v4_shadow_rank"] is not None
+        for candidate in survivor_observation["attention_queue"]
+    )
+    assert any(
+        candidate["ridge_rank"] is not None
+        for candidate in survivor_observation["attention_queue"]
+    )
+    assert all(
+        "ridge_base_quality_score" in candidate
+        and "ridge_base_exposures_60m" in candidate
         for candidate in survivor_observation["attention_queue"]
     )
     briefing_observation = next(
@@ -434,9 +463,30 @@ def test_point_in_time_replay_measures_nonempty_attention_progression():
         if observation["briefing_attention_markets"]
     )
     assert any(
-        candidate["displayed"]
-        for candidate in briefing_observation["attention_queue"]
+        candidate["displayed"] for candidate in briefing_observation["attention_queue"]
     )
+    markdown = report.to_markdown()
+    assert config.ATTENTION_RIDGE_MODEL_VERSION in markdown
+    assert "v4 precision lift vs v3 shadow" not in markdown
+
+    monkeypatch.setattr(
+        config, "ATTENTION_VISIBLE_MODEL", config.ATTENTION_V4_MODEL_VERSION
+    )
+    monkeypatch.setattr(
+        config, "SIGNAL_MODEL_VERSION", config.ATTENTION_V4_MODEL_VERSION
+    )
+    v4_report = run_point_in_time_replay(
+        {"KRW-BTC": candles, "KRW-ETH": eth_candles},
+        daily,
+        {},
+        {},
+        evaluation_days=1,
+        top_k=2,
+    )
+
+    assert v4_report.v4_precision_lift_vs_v3 == (v4_report.visible_precision_lift_vs_v3)
+    assert v4_report.v4_recall_lift_vs_v3 == v4_report.visible_recall_lift_vs_v3
+    assert config.ATTENTION_V4_MODEL_VERSION in v4_report.to_markdown()
 
 
 def test_replay_report_preserves_requested_market_coverage():
@@ -492,9 +542,7 @@ def test_collection_retries_missing_ten_minute_markets_once(monkeypatch):
     async def fake_tickers(_session):
         return tickers
 
-    async def fake_candles(
-        _session, requested, time_unit, **_kwargs
-    ):
+    async def fake_candles(_session, requested, time_unit, **_kwargs):
         if time_unit.value == "days":
             return {}
         minute_calls.append(list(requested))

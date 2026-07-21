@@ -46,9 +46,7 @@ def _header_for(signal_type: SignalType, price_change: float = -2.5) -> str:
 
 
 def test_formatter_labels_bearish_acceleration_alert():
-    assert "하락 모멘텀 가속" in _header_for(
-        SignalType.DOWNTREND_ACCELERATION
-    )
+    assert "하락 모멘텀 가속" in _header_for(SignalType.DOWNTREND_ACCELERATION)
 
 
 def test_formatter_labels_an_uncalibrated_signal_score_without_a_percentage():
@@ -223,3 +221,93 @@ def test_v3_rollback_formatter_preserves_visible_order_for_data_limited_cards(
 
     assert "v3 rollback" in rendered
     assert rendered.index("**A**") < rendered.index("**B**")
+
+
+def test_ridge_formatter_renders_selected_data_limited_card(monkeypatch):
+    monkeypatch.setattr(
+        config, "ATTENTION_VISIBLE_MODEL", config.ATTENTION_RIDGE_MODEL_VERSION
+    )
+    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.timezone.utc)
+    candle = CandleData(
+        market="KRW-A",
+        timestamp=observed_at,
+        open_price=100.0,
+        high_price=101.0,
+        low_price=99.0,
+        close_price=100.0,
+        volume=100.0,
+    )
+    ticker = TickerData(
+        market=candle.market,
+        candle_history=[candle],
+        price_change_10m=0.5,
+        relative_volume=5.0,
+        conditional_log_rvol_z_score=5.0,
+        price_surprise=3.0,
+        rolling_turnover=100_000_000,
+    )
+    result = build_attention_result(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: 1},
+        {},
+        [],
+        [],
+    )
+    selected = result.all_candidates[0].model_copy(
+        update={
+            "primary_selected": True,
+            "displayed": True,
+            "display_rank": 1,
+        }
+    )
+
+    rendered = NotificationFormatter()._format_attention_queue([selected], {})
+
+    assert "v5 ridge" in rendered
+    assert "**A**" in rendered
+
+
+def test_v4_rollback_formatter_keeps_lane_sections(monkeypatch):
+    monkeypatch.setattr(
+        config, "ATTENTION_VISIBLE_MODEL", config.ATTENTION_V4_MODEL_VERSION
+    )
+    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.timezone.utc)
+    candle = CandleData(
+        market="KRW-A",
+        timestamp=observed_at,
+        open_price=100.0,
+        high_price=101.0,
+        low_price=99.0,
+        close_price=100.0,
+        volume=100.0,
+    )
+    ticker = TickerData(
+        market=candle.market,
+        candle_history=[candle],
+        price_change_10m=0.5,
+        relative_volume=5.0,
+        conditional_log_rvol_z_score=5.0,
+        price_surprise=3.0,
+        rolling_turnover=100_000_000,
+        hourly_candles=[candle] * 24,
+        daily_candles=[candle] * 200,
+    )
+    result = build_attention_result(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: 1},
+        {},
+        [],
+        [],
+    )
+
+    rendered = NotificationFormatter()._format_attention_queue(
+        result.all_candidates, {}
+    )
+
+    assert "v5 ridge" not in rendered
+    assert "Early Watch" in rendered
+    assert "**A**" in rendered

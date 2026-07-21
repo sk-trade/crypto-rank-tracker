@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 import config
+from common.attention_policy import CANDIDATE_POOL_LIMIT, score_frozen_candidate
 from common.execution import ExecutionDecision
 from common.models import (
     Alert,
@@ -159,6 +160,7 @@ def build_attention_result(
             )
 
         recent_exposures = _recent_exposure_times(previous, observed_at)
+        ridge_base_exposures = _recent_ridge_base_exposure_times(previous, observed_at)
         lane = _attention_lane(
             stage=stage,
             consecutive_observations=consecutive,
@@ -191,6 +193,7 @@ def build_attention_result(
             focus_observations=focus_observations,
             confirmed_transition_seen=confirmed_transition_seen,
             primary_exposure_times=recent_exposures,
+            ridge_base_exposure_times=ridge_base_exposures,
             last_lane=lane,
             material_change=material_change,
             change_reasons=change_reasons,
@@ -210,7 +213,11 @@ def build_attention_result(
         )
 
     for market, previous in previous_state.entries.items():
-        if market in eligible_markets or market not in tickers or not tickers[market].candle_history:
+        if (
+            market in eligible_markets
+            or market not in tickers
+            or not tickers[market].candle_history
+        ):
             continue
         if previous.last_seen_at == observed_at and previous.stage in {
             AttentionStage.COOLING,
@@ -223,7 +230,9 @@ def build_attention_result(
         ):
             ticker = tickers[market]
             structure = _classify_structure(ticker, previous, None)
-            stage = AttentionStage.FAILED if structure.failed else AttentionStage.COOLING
+            stage = (
+                AttentionStage.FAILED if structure.failed else AttentionStage.COOLING
+            )
             entry = previous.model_copy(
                 update={
                     "last_seen_at": observed_at,
@@ -237,6 +246,9 @@ def build_attention_result(
                     or previous.structure_direction,
                     "cooling_observations": previous.cooling_observations + 1,
                     "primary_exposure_times": _recent_exposure_times(
+                        previous, observed_at
+                    ),
+                    "ridge_base_exposure_times": _recent_ridge_base_exposure_times(
                         previous, observed_at
                     ),
                     "last_lane": AttentionLane.COOLING_FAILED,
@@ -268,29 +280,112 @@ def build_attention_result(
         candidate.market: candidate.attention_rank for candidate in v3_ranked
     }
     with_shadow = [
-        candidate.model_copy(
-            update={"v3_shadow_rank": v3_positions[candidate.market]}
-        )
+        candidate.model_copy(update={"v3_shadow_rank": v3_positions[candidate.market]})
         for candidate in candidates
     ]
     v4_ranked = rank_attention_candidates_v4(with_shadow)
-    by_market = {candidate.market: candidate for candidate in v4_ranked}
+    v4_positions = {
+        candidate.market: candidate.attention_rank for candidate in v4_ranked
+    }
+    v4_by_market = {
+        candidate.market: candidate.model_copy(
+            update={"v4_shadow_rank": v4_positions[candidate.market]}
+        )
+        for candidate in v4_ranked
+    }
 
-    if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION:
-        ordered = v4_ranked
-        visible_markets = _guarded_visible_markets(v4_ranked)
+    ridge_base_input = [
+        v4_by_market[candidate.market].model_copy(
+            update={
+                "quality_score": v4_by_market[
+                    candidate.market
+                ].ridge_base_quality_score,
+                "ranking_score": v4_by_market[
+                    candidate.market
+                ].ridge_base_quality_score,
+                "primary_exposures_60m": v4_by_market[
+                    candidate.market
+                ].ridge_base_exposures_60m,
+            }
+        )
+        for candidate in v3_ranked
+    ]
+    ridge_base_ranked = rank_attention_candidates_v4(ridge_base_input)
+    ridge_base_by_market = {
+        candidate.market: candidate for candidate in ridge_base_ranked
+    }
+    ridge_pool = [
+        ridge_base_by_market[candidate.market]
+        for candidate in v3_ranked[:CANDIDATE_POOL_LIMIT]
+    ]
+    ridge_scored = [
+        (
+            candidate,
+            score_frozen_candidate(
+                candidate,
+                candidate.v3_shadow_rank or CANDIDATE_POOL_LIMIT + 1,
+            ),
+        )
+        for candidate in ridge_pool
+    ]
+    ridge_scored.sort(
+        key=lambda item: (
+            -item[1].adjusted,
+            item[0].v3_shadow_rank or CANDIDATE_POOL_LIMIT + 1,
+        )
+    )
+    ridge_positions = {
+        candidate.market: index
+        for index, (candidate, _score) in enumerate(ridge_scored, 1)
+    }
+    ridge_scores = {
+        candidate.market: score.adjusted for candidate, score in ridge_scored
+    }
+    enriched_by_market = {
+        market: candidate.model_copy(
+            update={
+                "ridge_base_rank": ridge_base_by_market[market].attention_rank,
+                "ridge_base_ranking_score": ridge_base_by_market[market].ranking_score,
+                "ridge_rank": ridge_positions.get(market),
+                "ridge_score": ridge_scores.get(market),
+            }
+        )
+        for market, candidate in v4_by_market.items()
+    }
+    v4_ordered = [enriched_by_market[candidate.market] for candidate in v4_ranked]
+    v3_ordered = [enriched_by_market[candidate.market] for candidate in v3_ranked]
+    ridge_ordered = [
+        enriched_by_market[candidate.market] for candidate, _score in ridge_scored
+    ] + v3_ordered[CANDIDATE_POOL_LIMIT:]
+    v4_visible_markets = _guarded_visible_markets(v4_ordered)
+    ridge_base_visible_markets = _guarded_visible_markets(ridge_base_ranked)
+    if limit is not None:
+        v4_visible_markets = v4_visible_markets[:limit]
+        ridge_base_visible_markets = ridge_base_visible_markets[:limit]
+
+    if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_RIDGE_MODEL_VERSION:
+        ordered = ridge_ordered
+        visible_markets = [
+            candidate.market for candidate in ridge_ordered[: len(v4_visible_markets)]
+        ]
+        active_score_version = config.ATTENTION_RIDGE_MODEL_VERSION
+    elif config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION:
+        ordered = v4_ordered
+        visible_markets = v4_visible_markets
+        active_score_version = config.ATTENTION_V4_MODEL_VERSION
     elif config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V3_MODEL_VERSION:
-        ordered = [by_market[candidate.market] for candidate in v3_ranked]
+        ordered = v3_ordered
         visible_markets = [
             candidate.market for candidate in ordered[: config.ATTENTION_QUEUE_LIMIT]
         ]
+        if limit is not None:
+            visible_markets = visible_markets[:limit]
+        active_score_version = config.ATTENTION_V4_MODEL_VERSION
     else:
         raise ValueError(
-            "ATTENTION_VISIBLE_MODEL must be attention-v4-c-guarded or attention-v3"
+            "ATTENTION_VISIBLE_MODEL must be attention-v5-ridge-early-0p3, "
+            "attention-v4-c-guarded, or attention-v3"
         )
-
-    if limit is not None:
-        visible_markets = visible_markets[:limit]
     visible_set = set(visible_markets)
     should_record_exposures = (
         attention_briefing_due(observed_at)
@@ -313,6 +408,18 @@ def build_attention_result(
                     if should_record_exposures
                     else None
                 ),
+                "ranking_score": (
+                    candidate.ridge_score
+                    if active_score_version == config.ATTENTION_RIDGE_MODEL_VERSION
+                    and candidate.ridge_score is not None
+                    else candidate.ranking_score
+                ),
+                "score_version": (
+                    active_score_version
+                    if active_score_version != config.ATTENTION_RIDGE_MODEL_VERSION
+                    or candidate.ridge_score is not None
+                    else config.ATTENTION_V4_MODEL_VERSION
+                ),
             }
         )
         for index, candidate in enumerate(ordered, 1)
@@ -322,6 +429,11 @@ def build_attention_result(
     state = AttentionState(updated_at=observed_at, entries=updated_entries)
     if should_record_exposures:
         state = _record_primary_exposures(state, visible, observed_at)
+        state = _record_ridge_base_exposures(
+            state,
+            [enriched_by_market[market] for market in ridge_base_visible_markets],
+            observed_at,
+        )
     return AttentionQueueResult(
         visible=visible,
         all_candidates=ranked,
@@ -363,9 +475,7 @@ def rank_attention_candidates(
 
     ordered = sorted(candidates, key=sort_key)
     return [
-        candidate.model_copy(
-            update={"attention_rank": index, "v3_shadow_rank": index}
-        )
+        candidate.model_copy(update={"attention_rank": index, "v3_shadow_rank": index})
         for index, candidate in enumerate(ordered, 1)
     ]
 
@@ -381,9 +491,7 @@ def rank_attention_candidates_v4(
     ranked_by_lane = {
         AttentionLane.FOCUS: _rank_focus_candidates(by_lane[AttentionLane.FOCUS]),
         AttentionLane.EARLY: _rank_by_quality(by_lane[AttentionLane.EARLY]),
-        AttentionLane.ONGOING: _rank_ongoing_candidates(
-            by_lane[AttentionLane.ONGOING]
-        ),
+        AttentionLane.ONGOING: _rank_ongoing_candidates(by_lane[AttentionLane.ONGOING]),
         AttentionLane.COOLING_FAILED: _rank_by_quality(
             by_lane[AttentionLane.COOLING_FAILED]
         ),
@@ -412,7 +520,9 @@ def rank_attention_candidates_v4(
 def _rank_by_quality(
     candidates: Sequence[AttentionCandidate],
 ) -> List[AttentionCandidate]:
-    return sorted(candidates, key=lambda candidate: candidate.quality_score, reverse=True)
+    return sorted(
+        candidates, key=lambda candidate: candidate.quality_score, reverse=True
+    )
 
 
 def _rank_focus_candidates(
@@ -548,9 +658,7 @@ def rank_structure_candidates(
     candidates: Sequence[AttentionCandidate], filter_order: Sequence[str]
 ) -> List[AttentionCandidate]:
     """Add only observed structure state while preserving the broad-filter order."""
-    filter_positions = {
-        market: index for index, market in enumerate(filter_order)
-    }
+    filter_positions = {market: index for index, market in enumerate(filter_order)}
     stage_priority = {
         AttentionStage.CONFIRMED: 2,
         AttentionStage.BUILDING: 1,
@@ -599,6 +707,8 @@ def _candidate_from_entry(
     )
     evidence = _build_evidence(ticker, execution, market_regime, structure)
     quality_score = _quality_score(ticker, evidence)
+    ridge_base_quality_score = _quality_score(ticker, evidence, include_execution=False)
+    ridge_base_exposure_times = entry.ridge_base_exposure_times or []
     return AttentionCandidate(
         market=entry.market,
         attention_rank=1,
@@ -608,6 +718,8 @@ def _candidate_from_entry(
         quality_score=quality_score,
         ranking_score=quality_score,
         primary_exposures_60m=len(entry.primary_exposure_times),
+        ridge_base_quality_score=ridge_base_quality_score,
+        ridge_base_exposures_60m=len(ridge_base_exposure_times),
         market_rank=market_rank,
         market_rank_delta=rank_delta,
         stage=entry.stage,
@@ -688,6 +800,21 @@ def _recent_exposure_times(
     ]
 
 
+def _recent_ridge_base_exposure_times(
+    previous: AttentionStateEntry | None,
+    observed_at: datetime.datetime,
+) -> List[datetime.datetime]:
+    if previous is None:
+        return []
+    # Legacy primary history may have come from v3 or execution-aware v4. Reset the
+    # bounded shadow feature instead of attributing unknown exposures to ridge-base.
+    prior = previous.ridge_base_exposure_times or []
+    cutoff = observed_at - datetime.timedelta(
+        minutes=config.ATTENTION_PRIMARY_EXPOSURE_WINDOW_MINUTES
+    )
+    return [exposure for exposure in prior if cutoff <= exposure < observed_at]
+
+
 def _record_primary_exposures(
     state: AttentionState,
     visible: Sequence[AttentionCandidate],
@@ -699,8 +826,24 @@ def _record_primary_exposures(
         exposures = list(entry.primary_exposure_times)
         if market in visible_markets and observed_at not in exposures:
             exposures.append(observed_at)
+        entries[market] = entry.model_copy(update={"primary_exposure_times": exposures})
+    return state.model_copy(update={"entries": entries})
+
+
+def _record_ridge_base_exposures(
+    state: AttentionState,
+    visible: Sequence[AttentionCandidate],
+    observed_at: datetime.datetime,
+) -> AttentionState:
+    visible_markets = {candidate.market for candidate in visible}
+    entries = {}
+    for market, entry in state.entries.items():
+        prior = entry.ridge_base_exposure_times or []
+        exposures = list(prior)
+        if market in visible_markets and observed_at not in exposures:
+            exposures.append(observed_at)
         entries[market] = entry.model_copy(
-            update={"primary_exposure_times": exposures}
+            update={"ridge_base_exposure_times": exposures}
         )
     return state.model_copy(update={"entries": entries})
 
@@ -708,6 +851,8 @@ def _record_primary_exposures(
 def _quality_score(
     ticker: TickerData,
     evidence: Sequence[AttentionEvidence],
+    *,
+    include_execution: bool = True,
 ) -> float:
     activity_strength = _saturated_strength(
         ticker.conditional_log_rvol_z_score,
@@ -722,9 +867,13 @@ def _quality_score(
         by_family[EvidenceFamily.CONTEXT].verdict,
         config.ATTENTION_V4_CONTEXT_ADJUSTMENT,
     )
-    execution_adjustment = _verdict_adjustment(
-        by_family[EvidenceFamily.EXECUTION].verdict,
-        config.ATTENTION_V4_EXECUTION_ADJUSTMENT,
+    execution_adjustment = (
+        _verdict_adjustment(
+            by_family[EvidenceFamily.EXECUTION].verdict,
+            config.ATTENTION_V4_EXECUTION_ADJUSTMENT,
+        )
+        if include_execution
+        else 0.0
     )
     score = (
         config.ATTENTION_V4_ACTIVITY_WEIGHT * activity_strength
@@ -782,11 +931,7 @@ def _similarity_features(
         return 0.5
 
     context = next(
-        (
-            item
-            for item in candidate.evidence
-            if item.family is EvidenceFamily.CONTEXT
-        ),
+        (item for item in candidate.evidence if item.family is EvidenceFamily.CONTEXT),
         None,
     )
     trend = context.metrics.get("trend_1h") if context else None
@@ -817,7 +962,9 @@ def _build_evidence(
     ) or (relative_volume or 0.0) >= 2.0
     activity = AttentionEvidence(
         family=EvidenceFamily.ACTIVITY,
-        verdict=EvidenceVerdict.SUPPORTING if activity_support else EvidenceVerdict.MIXED,
+        verdict=EvidenceVerdict.SUPPORTING
+        if activity_support
+        else EvidenceVerdict.MIXED,
         summary=(
             f"RVOL {_fmt(relative_volume, 'x')} · 동일시간 Z {_fmt(z_score)} · "
             f"직전24h 10분봉 중간 거래대금 {_fmt_krw(ticker.rolling_turnover)}"
@@ -832,20 +979,15 @@ def _build_evidence(
 
     price_support = structure.confirmed or (
         ticker.price_surprise is not None
-        and ticker.price_surprise >= config.price_surprise_minimum(ticker.liquidity_tier)
+        and ticker.price_surprise
+        >= config.price_surprise_minimum(ticker.liquidity_tier)
     )
     structure_text = "구조 n/a"
     if structure.level is not None and structure.distance_pct is not None:
         level_name = (
-            "저항"
-            if structure.direction is StructureDirection.BULLISH
-            else "지지"
+            "저항" if structure.direction is StructureDirection.BULLISH else "지지"
         )
-        label = (
-            f"{level_name} 확인"
-            if structure.confirmed
-            else f"{level_name}까지"
-        )
+        label = f"{level_name} 확인" if structure.confirmed else f"{level_name}까지"
         if structure.failed:
             label = f"{level_name} 실패"
         structure_text = f"{label} {structure.distance_pct:+.2f}%"
@@ -893,7 +1035,9 @@ def _build_evidence(
         else ticker.is_above_ma50_daily is True
     )
     context_available = bool(ticker.hourly_candles and ticker.daily_candles)
-    context_support = trend_aligned or daily_aligned or abs(ticker.residual_momentum_score or 0) >= 2
+    context_support = (
+        trend_aligned or daily_aligned or abs(ticker.residual_momentum_score or 0) >= 2
+    )
     regime = market_regime.regime.value if market_regime else "UNKNOWN"
     context = AttentionEvidence(
         family=EvidenceFamily.CONTEXT,
@@ -1079,9 +1223,7 @@ def _material_changes(
         if ratio >= config.ATTENTION_RVOL_RATIO_CHANGE_MINIMUM:
             reasons.append(f"rvol:{relative_volume:.2f}x")
     if signal_type is not previous.last_signal_type:
-        reasons.append(
-            f"signal:{signal_type.value if signal_type else 'none'}"
-        )
+        reasons.append(f"signal:{signal_type.value if signal_type else 'none'}")
     return bool(reasons), reasons
 
 

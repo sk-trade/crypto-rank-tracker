@@ -74,17 +74,15 @@ def validate_storage_config() -> StorageMethod:
     """Fail early when the selected state backend is missing required settings."""
     method = storage_method()
     if method is StorageMethod.GCS and not GCS_BUCKET_NAME:
-        raise StorageConfigError(
-            ConfigErrorCode.GCS_BUCKET_REQUIRED, "GCS_BUCKET_NAME"
-        )
+        raise StorageConfigError(ConfigErrorCode.GCS_BUCKET_REQUIRED, "GCS_BUCKET_NAME")
     return method
 
 
 # -- ANALYSIS & ALERTING POLICY --
 
 # [통계 보정 설정]
-MAX_Z_SCORE_CAP = 10.0          # Z-Score 상한선 (통계 왜곡 방지)
-MIN_MAD_FLOOR = 0.001           # Z-Score 분모 0 방지
+MAX_Z_SCORE_CAP = 10.0  # Z-Score 상한선 (통계 왜곡 방지)
+MIN_MAD_FLOOR = 0.001  # Z-Score 분모 0 방지
 CONDITIONAL_VOLUME_MIN_SAMPLES = 3
 # Recent indicators need 154 contiguous clock bars; conditional volume uses
 # separate same-slot observations so the broad scan stays within runtime limits.
@@ -95,7 +93,7 @@ RESIDUAL_MOMENTUM_MIN_OBSERVATIONS = 30
 
 # [Wash Trading 필터]
 # 거래량 제한
-WASH_TRADING_MIN_PRICE_CHANGE = 0.5 
+WASH_TRADING_MIN_PRICE_CHANGE = 0.5
 
 # [Pre-fitted candidate policy]
 # These parameters are fixed for validation; revisions require the validation workflow.
@@ -119,9 +117,7 @@ RVOL_Z_SCORE_MINIMUMS = {
 def price_surprise_minimum(liquidity_tier: LiquidityTier) -> float:
     """Return the fixed policy threshold for a pre-decision liquidity tier."""
     tier = (
-        LiquidityTier.LOW
-        if liquidity_tier is LiquidityTier.UNKNOWN
-        else liquidity_tier
+        LiquidityTier.LOW if liquidity_tier is LiquidityTier.UNKNOWN else liquidity_tier
     )
     return PRICE_SURPRISE_MINIMUMS[tier]
 
@@ -129,16 +125,15 @@ def price_surprise_minimum(liquidity_tier: LiquidityTier) -> float:
 def rvol_z_score_minimum(liquidity_tier: LiquidityTier) -> float:
     """Return the fixed policy threshold for a pre-decision liquidity tier."""
     tier = (
-        LiquidityTier.LOW
-        if liquidity_tier is LiquidityTier.UNKNOWN
-        else liquidity_tier
+        LiquidityTier.LOW if liquidity_tier is LiquidityTier.UNKNOWN else liquidity_tier
     )
     return RVOL_Z_SCORE_MINIMUMS[tier]
 
+
 # [1차 필터링 공통]
 SIGNAL_SCORE_CANDIDATE_MINIMUM = 0.5
-ROBUST_Z_SCORE_THRESHOLD = 3.0  
-DECOUPLING_MIN_DEVIATION_PCT = 3.0 
+ROBUST_Z_SCORE_THRESHOLD = 3.0
+DECOUPLING_MIN_DEVIATION_PCT = 3.0
 
 # [2차 알림 게이트키퍼]
 ALERT_MIN_PRICE_CHANGE_10M = 0.8  # 최소 변동폭 (스캘핑 마지노선)
@@ -156,8 +151,9 @@ EXECUTION_MAX_SPREAD_BPS = 30.0
 EXECUTION_MAX_SLIPPAGE_BPS = 30.0
 ATTENTION_V3_MODEL_VERSION = "attention-v3"
 ATTENTION_V4_MODEL_VERSION = "attention-v4-c-guarded"
+ATTENTION_RIDGE_MODEL_VERSION = "attention-v5-ridge-early-0p3"
 ATTENTION_VISIBLE_MODEL = os.environ.get(
-    "ATTENTION_VISIBLE_MODEL", ATTENTION_V4_MODEL_VERSION
+    "ATTENTION_VISIBLE_MODEL", ATTENTION_RIDGE_MODEL_VERSION
 ).strip()
 SIGNAL_MODEL_VERSION = ATTENTION_VISIBLE_MODEL
 BREAKOUT_STRUCTURE_LOOKBACK_BARS = 20
@@ -200,5 +196,5 @@ REGIME_ATR_SHORT_PERIOD = 6
 IDEMPOTENCY_KEY_HISTORY_LIMIT = 1_440
 
 # [쿨다운]
-ALERT_COOLDOWN_MINUTES = 60       
+ALERT_COOLDOWN_MINUTES = 60
 SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT = 1.0

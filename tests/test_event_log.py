@@ -34,7 +34,9 @@ from common.storage_client import (
 UTC = datetime.timezone.utc
 
 
-def _candle(timestamp: datetime.datetime, open_price: float, high: float, low: float) -> CandleData:
+def _candle(
+    timestamp: datetime.datetime, open_price: float, high: float, low: float
+) -> CandleData:
     return CandleData(
         market="KRW-BTC",
         timestamp=timestamp,
@@ -176,11 +178,17 @@ def test_scan_event_records_attention_queue_position_before_final_alert():
     assert event.attention_primary_selected is False
     assert event.attention_displayed is False
     assert event.attention_v3_shadow_rank == 1
-    assert event.attention_score_version == config.ATTENTION_V4_MODEL_VERSION
+    assert event.attention_v4_shadow_rank == 1
+    assert event.attention_ridge_rank == 1
+    assert event.attention_ridge_score is not None
+    assert event.attention_ridge_base_rank == 1
+    assert event.attention_ridge_base_ranking_score is not None
+    assert event.attention_score_version == config.ATTENTION_RIDGE_MODEL_VERSION
     assert event.feature_snapshot["attention"]["lane"] == "data_limited"
-    assert event.feature_snapshot["attention_coverage"][
-        "raw_market_coverage_ratio"
-    ] == 1.0
+    assert event.feature_snapshot["attention"]["ridge_rank"] == 1
+    assert (
+        event.feature_snapshot["attention_coverage"]["raw_market_coverage_ratio"] == 1.0
+    )
     assert event.rejection_reasons == [
         RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE
     ]
@@ -322,8 +330,13 @@ def test_outcome_resolution_waits_for_complete_entry_path_and_uses_fixed_target(
         direction=Direction.LONG,
         signal_candle_start=signal_start,
     )
-    timestamps = [signal_start + datetime.timedelta(minutes=10 * step) for step in range(1, 8)]
-    candles = [_candle(timestamp, 100 + index, 102 + index, 98 + index) for index, timestamp in enumerate(timestamps)]
+    timestamps = [
+        signal_start + datetime.timedelta(minutes=10 * step) for step in range(1, 8)
+    ]
+    candles = [
+        _candle(timestamp, 100 + index, 102 + index, 98 + index)
+        for index, timestamp in enumerate(timestamps)
+    ]
 
     outcomes, pending = resolve_scan_outcomes([event], {"KRW-BTC": candles})
 
@@ -375,15 +388,15 @@ def test_outcome_resolution_retires_events_older_than_the_recoverable_candle_win
         signal_start + datetime.timedelta(days=3), 100.0, 101.0, 99.0
     )
 
-    outcomes, pending = resolve_scan_outcomes(
-        [event], {"KRW-BTC": [latest_benchmark]}
-    )
+    outcomes, pending = resolve_scan_outcomes([event], {"KRW-BTC": [latest_benchmark]})
 
     assert outcomes == []
     assert pending == []
 
 
-def test_event_and_pending_records_are_persisted_without_mutating_prior_records(monkeypatch):
+def test_event_and_pending_records_are_persisted_without_mutating_prior_records(
+    monkeypatch,
+):
     store = {}
 
     async def load_json(filename, _gcs_client, **_kwargs):
@@ -414,7 +427,9 @@ def test_event_and_pending_records_are_persisted_without_mutating_prior_records(
 
     assert len(pending) == 1
     assert pending[0] == event
-    event_logs = next(value for name, value in store.items() if name.startswith("scan_events_"))
+    event_logs = next(
+        value for name, value in store.items() if name.startswith("scan_events_")
+    )
     assert event_logs[0]["rejection_reasons"] == ["price_surprise_below_threshold"]
 
 
@@ -439,9 +454,7 @@ def test_conflicting_scan_event_retry_preserves_the_first_immutable_record(monke
         final_decision=ScanDecision.REJECTED_LIGHTWEIGHT,
         model_version="heuristic-v1",
     )
-    conflicting = original.model_copy(
-        update={"feature_snapshot": {"spread_bps": 99.0}}
-    )
+    conflicting = original.model_copy(update={"feature_snapshot": {"spread_bps": 99.0}})
     new_market = original.model_copy(
         update={"event_id": "event-2", "market": "KRW-ETH"}
     )
@@ -451,7 +464,9 @@ def test_conflicting_scan_event_retry_preserves_the_first_immutable_record(monke
         return await state_manager.append_scan_events([conflicting, new_market])
 
     conflicts = asyncio.run(persist_conflict())
-    event_logs = next(value for name, value in store.items() if name.startswith("scan_events_"))
+    event_logs = next(
+        value for name, value in store.items() if name.startswith("scan_events_")
+    )
 
     assert conflicts == ["event-1"]
     assert event_logs == [original.model_dump(mode="json")]

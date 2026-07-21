@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.6.0] - 2026-07-22
+
+### Added
+
+- Added the sealed `ridge_early_bonus_0p3` artifact and exact 38-feature scorer.
+  The policy reranks only the v3 top five, uses the native v4 visible-card count,
+  applies the strict `+0.30` early bonus, and retains the lower v3 rank as its
+  deterministic tie-break.
+- Added frozen ridge score/rank, v4 shadow rank, execution-neutral base quality,
+  and separate ridge-base exposure evidence to attention events and replay rows.
+- Added golden-score, pool-boundary, budget, tie-break, rollback, formatter, and
+  shadow-exposure regression coverage for the promoted policy.
+
+### Changed
+
+- Made `attention-v5-ridge-early-0p3` the default visible ranking after seven
+  distinct 90-day windows (90,720 scans) improved meaningful precision from
+  66.97% to 70.27% and early episode precision from 52.27% to 56.99% at the
+  same 228,174-card budget.
+- Kept `attention-v4-c-guarded` and `attention-v3` as immediate runtime rollback
+  options while preserving the multi-timeframe collection and complete survivor
+  queue.
+- Added active-model replay lift fields and labels; legacy v4-specific fields
+  remain compatible but are null unless v4 is actually the visible model.
+
+### Fixed
+
+- Rendered ridge-selected `Cooling / Failed` and `Data-limited` candidates in
+  display-rank order instead of dropping them from the lane-only formatter.
+- Isolated active ridge exposure history from the hypothetical execution-neutral
+  v4 base history used by the frozen feature contract, preventing deployment
+  feedback from silently changing the validated policy.
+- Added a budget-matched v3 replay baseline for valid active-model lift while
+  retaining the full v3 shadow pool for later counterfactual evaluation, and
+  reset provenance-unknown legacy exposure history instead of attributing it to
+  the execution-neutral ridge base.
+
 ## [0.5.0] - 2026-07-20
 
 ### Added

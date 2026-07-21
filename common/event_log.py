@@ -87,7 +87,8 @@ def build_scan_events(
         decision = candidate_decisions.get(market)
         feature_snapshot = (
             ticker.model_dump(
-                mode="json", exclude={"candle_history", "hourly_candles", "daily_candles"}
+                mode="json",
+                exclude={"candle_history", "hourly_candles", "daily_candles"},
             )
             if ticker
             else {}
@@ -151,6 +152,13 @@ def build_scan_events(
                 "quality_score": attention.quality_score,
                 "ranking_score": attention.ranking_score,
                 "v3_shadow_rank": attention.v3_shadow_rank,
+                "v4_shadow_rank": attention.v4_shadow_rank,
+                "ridge_rank": attention.ridge_rank,
+                "ridge_score": attention.ridge_score,
+                "ridge_base_rank": attention.ridge_base_rank,
+                "ridge_base_ranking_score": attention.ridge_base_ranking_score,
+                "ridge_base_quality_score": attention.ridge_base_quality_score,
+                "ridge_base_exposures_60m": attention.ridge_base_exposures_60m,
                 "primary_exposures_60m": attention.primary_exposures_60m,
                 "score_version": attention.score_version,
                 "context_available": attention.context_available,
@@ -176,9 +184,7 @@ def build_scan_events(
                     attention.primary_selected if attention else None
                 ),
                 attention_displayed=attention.displayed if attention else None,
-                attention_display_rank=(
-                    attention.display_rank if attention else None
-                ),
+                attention_display_rank=(attention.display_rank if attention else None),
                 attention_quality_score=(
                     attention.quality_score if attention else None
                 ),
@@ -187,6 +193,23 @@ def build_scan_events(
                 ),
                 attention_v3_shadow_rank=(
                     attention.v3_shadow_rank if attention else None
+                ),
+                attention_v4_shadow_rank=(
+                    attention.v4_shadow_rank if attention else None
+                ),
+                attention_ridge_rank=(attention.ridge_rank if attention else None),
+                attention_ridge_score=(attention.ridge_score if attention else None),
+                attention_ridge_base_rank=(
+                    attention.ridge_base_rank if attention else None
+                ),
+                attention_ridge_base_ranking_score=(
+                    attention.ridge_base_ranking_score if attention else None
+                ),
+                attention_ridge_base_quality_score=(
+                    attention.ridge_base_quality_score if attention else None
+                ),
+                attention_ridge_base_exposures_60m=(
+                    attention.ridge_base_exposures_60m if attention else None
                 ),
                 attention_primary_exposures_60m=(
                     attention.primary_exposures_60m if attention else None
@@ -209,8 +232,12 @@ def resolve_scan_outcomes(
     """Resolve available outcomes and retire events outside the recovery window."""
     outcomes = []
     pending = []
-    interval = datetime.timedelta(minutes=PRIMARY_PERFORMANCE_TARGET.execution_timeframe_minutes)
-    holding = datetime.timedelta(minutes=PRIMARY_PERFORMANCE_TARGET.holding_period_minutes)
+    interval = datetime.timedelta(
+        minutes=PRIMARY_PERFORMANCE_TARGET.execution_timeframe_minutes
+    )
+    holding = datetime.timedelta(
+        minutes=PRIMARY_PERFORMANCE_TARGET.holding_period_minutes
+    )
     latest_completed = max(
         (
             candle.timestamp
@@ -220,8 +247,7 @@ def resolve_scan_outcomes(
         default=None,
     )
     recovery_start = (
-        latest_completed
-        - interval * (config.RECENT_SCAN_HISTORY_BARS - 1)
+        latest_completed - interval * (config.RECENT_SCAN_HISTORY_BARS - 1)
         if latest_completed is not None
         else None
     )
@@ -232,7 +258,10 @@ def resolve_scan_outcomes(
             continue
         entry_start = event.signal_candle_start + interval
         exit_start = entry_start + holding
-        candles = {candle.timestamp: candle for candle in candles_by_market.get(event.market, [])}
+        candles = {
+            candle.timestamp: candle
+            for candle in candles_by_market.get(event.market, [])
+        }
         entry = candles.get(entry_start)
         exit_candle = candles.get(exit_start)
         path = [

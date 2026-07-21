@@ -39,6 +39,7 @@ REPLAY_VARIANT_STRUCTURE = "filter_plus_structure"
 REPLAY_VARIANT_PROGRESSION = "filter_plus_structure_progression_context"
 REPLAY_VARIANT_ATTENTION = "attention_full"
 REPLAY_VARIANT_V3_SHADOW = "attention_v3_shadow"
+REPLAY_VARIANT_V3_MATCHED = "attention_v3_matched"
 REPLAY_ANALYSIS_TIMEFRAMES = ("10m", "60m", "1d")
 
 
@@ -107,9 +108,12 @@ class ReplayReport(BaseModel):
     progression_context_recall_lift: float | None
     retention_precision_lift: float | None
     retention_recall_lift: float | None
-    v4_precision_lift_vs_v3: float | None
-    v4_recall_lift_vs_v3: float | None
-    v4_median_time_to_2pct_delta_vs_v3_minutes: float | None
+    visible_precision_lift_vs_v3: float | None
+    visible_recall_lift_vs_v3: float | None
+    visible_median_time_to_2pct_delta_vs_v3_minutes: float | None
+    v4_precision_lift_vs_v3: float | None = None
+    v4_recall_lift_vs_v3: float | None = None
+    v4_median_time_to_2pct_delta_vs_v3_minutes: float | None = None
     attention_episode_count: int
     attention_meaningful_episode_count: int
     attention_episode_precision: float | None
@@ -204,11 +208,17 @@ class ReplayReport(BaseModel):
                     "- Cooling/failed retention recall effect: "
                     f"{_fmt_points(self.retention_recall_lift)}"
                 ),
-                f"- v4 precision lift vs v3 shadow: {_fmt_points(self.v4_precision_lift_vs_v3)}",
-                f"- v4 pre-event recall lift vs v3 shadow: {_fmt_points(self.v4_recall_lift_vs_v3)}",
                 (
-                    "- v4 median time-to-2% delta vs v3 shadow: "
-                    f"{_fmt_minutes(self.v4_median_time_to_2pct_delta_vs_v3_minutes)}"
+                    f"- {self.signal_model_version} precision lift vs v3 shadow: "
+                    f"{_fmt_points(self.visible_precision_lift_vs_v3)}"
+                ),
+                (
+                    f"- {self.signal_model_version} pre-event recall lift vs v3 shadow: "
+                    f"{_fmt_points(self.visible_recall_lift_vs_v3)}"
+                ),
+                (
+                    f"- {self.signal_model_version} median time-to-2% delta vs v3 shadow: "
+                    f"{_fmt_minutes(self.visible_median_time_to_2pct_delta_vs_v3_minutes)}"
                 ),
                 "",
                 "## First-Visible Episode Quality",
@@ -344,7 +354,9 @@ class _VariantAccumulator:
         observed_at: datetime.datetime,
     ) -> None:
         selected_set = set(selected)
-        meaningful = {market for market, outcome in outcomes.items() if outcome.meaningful}
+        meaningful = {
+            market for market, outcome in outcomes.items() if outcome.meaningful
+        }
         true_positives = selected_set & meaningful
         self.scans += 1
         self.selected_observations += len(selected_set)
@@ -450,7 +462,9 @@ def aggregate_hourly_candles(
         hourly = []
         for hour, group in sorted(groups.items()):
             ordered = sorted(group, key=lambda candle: candle.timestamp)
-            expected = [hour + datetime.timedelta(minutes=10 * index) for index in range(6)]
+            expected = [
+                hour + datetime.timedelta(minutes=10 * index) for index in range(6)
+            ]
             if [candle.timestamp for candle in ordered] != expected:
                 continue
             hourly.append(
@@ -491,13 +505,13 @@ def run_point_in_time_replay(
     """Replay production feature functions at each completed 10-minute decision point."""
     _validate_evaluation_days(evaluation_days)
     source_days = (
-        evaluation_days
-        if source_evaluation_days is None
-        else source_evaluation_days
+        evaluation_days if source_evaluation_days is None else source_evaluation_days
     )
     _validate_evaluation_days(source_days)
     if source_days < evaluation_days:
-        raise ValueError("source_evaluation_days cannot be shorter than evaluation_days")
+        raise ValueError(
+            "source_evaluation_days cannot be shorter than evaluation_days"
+        )
     if top_k < 1:
         raise ValueError("top_k must be positive")
     if "KRW-BTC" not in candles_10m:
@@ -511,8 +525,7 @@ def run_point_in_time_replay(
     if "KRW-BTC" not in source_aligned:
         raise ValueError("KRW-BTC history is incomplete or misaligned")
     aligned = {
-        market: candles[-required_count:]
-        for market, candles in source_aligned.items()
+        market: candles[-required_count:] for market, candles in source_aligned.items()
     }
     reference = aligned["KRW-BTC"]
     hourly = aggregate_hourly_candles(aligned)
@@ -521,8 +534,8 @@ def run_point_in_time_replay(
         // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
     )
     warmup = replay_warmup_10m_bars()
-    evaluation_bars = evaluation_days * 24 * (
-        60 // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
+    evaluation_bars = (
+        evaluation_days * 24 * (60 // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES)
     )
     last_index = len(reference) - outcome_bars - 1
     first_index = last_index - evaluation_bars + 1
@@ -538,6 +551,7 @@ def run_point_in_time_replay(
             REPLAY_VARIANT_PROGRESSION,
             REPLAY_VARIANT_ATTENTION,
             REPLAY_VARIANT_V3_SHADOW,
+            REPLAY_VARIANT_V3_MATCHED,
         ]
     }
     previous_rankings: Dict[str, int] = {}
@@ -575,7 +589,9 @@ def run_point_in_time_replay(
     expected_market_count = requested_market_count or len(candles_10m)
     if expected_market_count < len(candles_10m):
         raise ValueError("requested_market_count cannot be below collected coverage")
-    market_coverage = len(aligned) / expected_market_count if expected_market_count else 0.0
+    market_coverage = (
+        len(aligned) / expected_market_count if expected_market_count else 0.0
+    )
     if len(aligned) != expected_market_count:
         warnings.append(
             f"Excluded {expected_market_count - len(aligned)} market(s) with incomplete or misaligned histories."
@@ -605,9 +621,7 @@ def run_point_in_time_replay(
             for market, candles in aligned.items()
         }
         tickers = process_lightweight_indicators(histories)
-        assign_residual_momentum(
-            tickers, dict(sectors), dict(reverse_sector_map)
-        )
+        assign_residual_momentum(tickers, dict(sectors), dict(reverse_sector_map))
         decisions = evaluate_candidate_eligibility(tickers)
         candidate_markets = [
             market for market, decision in decisions.items() if decision.eligible
@@ -633,7 +647,11 @@ def run_point_in_time_replay(
         enriched = tickers.copy()
         enriched.update(
             enrich_deep_dive_tickers(
-                {market: tickers[market] for market in markets_to_enrich if market in tickers},
+                {
+                    market: tickers[market]
+                    for market in markets_to_enrich
+                    if market in tickers
+                },
                 hourly_slice,
                 daily_slice,
                 tickers,
@@ -678,9 +696,9 @@ def run_point_in_time_replay(
         ]
         structured = [
             candidate.market
-            for candidate in rank_structure_candidates(
-                active_attention, filter_order
-            )[:top_k]
+            for candidate in rank_structure_candidates(active_attention, filter_order)[
+                :top_k
+            ]
         ]
         progressed_candidates = rank_attention_candidates(active_attention)[:top_k]
         progressed = [candidate.market for candidate in progressed_candidates]
@@ -693,6 +711,7 @@ def run_point_in_time_replay(
             key=lambda candidate: candidate.v3_shadow_rank or 1_000_000,
         )[:top_k]
         v3_shadow = [candidate.market for candidate in v3_shadow_candidates]
+        v3_matched = v3_shadow[: len(full_candidates)]
         outcomes = {
             market: _future_outcome(candles, index)
             for market, candles in aligned.items()
@@ -710,11 +729,10 @@ def run_point_in_time_replay(
             REPLAY_VARIANT_PROGRESSION: progressed,
             REPLAY_VARIANT_ATTENTION: full,
             REPLAY_VARIANT_V3_SHADOW: v3_shadow,
+            REPLAY_VARIANT_V3_MATCHED: v3_matched,
         }
         for name, selected in selections.items():
-            accumulators[name].add(
-                selected, outcomes, len(aligned), observed_at
-            )
+            accumulators[name].add(selected, outcomes, len(aligned), observed_at)
 
         if observation_sink:
             selected_markets = set().union(*map(set, selections.values()))
@@ -737,8 +755,7 @@ def run_point_in_time_replay(
                     ),
                     "variants": selections,
                     "attention_queue": [
-                        candidate.model_dump(mode="json")
-                        for candidate in all_attention
+                        candidate.model_dump(mode="json") for candidate in all_attention
                     ],
                     "visible_attention_markets": full,
                     "briefing_attention_markets": [
@@ -771,13 +788,15 @@ def run_point_in_time_replay(
         if progress:
             progress(scan_number, total_scans, observed_at)
 
-    variants = {name: accumulator.metrics() for name, accumulator in accumulators.items()}
+    variants = {
+        name: accumulator.metrics() for name, accumulator in accumulators.items()
+    }
     baseline_metrics = variants[REPLAY_VARIANT_BASELINE]
     filter_metrics = variants[REPLAY_VARIANT_FILTER]
     structure_metrics = variants[REPLAY_VARIANT_STRUCTURE]
     progression_metrics = variants[REPLAY_VARIANT_PROGRESSION]
     attention_metrics = variants[REPLAY_VARIANT_ATTENTION]
-    v3_metrics = variants[REPLAY_VARIANT_V3_SHADOW]
+    v3_metrics = variants[REPLAY_VARIANT_V3_MATCHED]
     unchanged_repeats = max(visible_observations - material_changes, 0)
     episode_values = list(episode_outcomes.values())
     episode_count = len(episode_values)
@@ -847,15 +866,39 @@ def run_point_in_time_replay(
         retention_recall_lift=_difference(
             attention_metrics.recall_at_k, progression_metrics.recall_at_k
         ),
-        v4_precision_lift_vs_v3=_difference(
+        visible_precision_lift_vs_v3=_difference(
             attention_metrics.precision_at_k, v3_metrics.precision_at_k
         ),
-        v4_recall_lift_vs_v3=_difference(
+        visible_recall_lift_vs_v3=_difference(
             attention_metrics.recall_at_k, v3_metrics.recall_at_k
         ),
-        v4_median_time_to_2pct_delta_vs_v3_minutes=_difference(
+        visible_median_time_to_2pct_delta_vs_v3_minutes=_difference(
             attention_metrics.median_time_to_2pct_minutes,
             v3_metrics.median_time_to_2pct_minutes,
+        ),
+        v4_precision_lift_vs_v3=(
+            _difference(
+                attention_metrics.precision_at_k,
+                v3_metrics.precision_at_k,
+            )
+            if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION
+            else None
+        ),
+        v4_recall_lift_vs_v3=(
+            _difference(
+                attention_metrics.recall_at_k,
+                v3_metrics.recall_at_k,
+            )
+            if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION
+            else None
+        ),
+        v4_median_time_to_2pct_delta_vs_v3_minutes=(
+            _difference(
+                attention_metrics.median_time_to_2pct_minutes,
+                v3_metrics.median_time_to_2pct_minutes,
+            )
+            if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION
+            else None
         ),
         attention_episode_count=episode_count,
         attention_meaningful_episode_count=meaningful_episode_count,
