@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Tuple
 import config
 from common.models import (
     Alert,
+    AttentionCandidate,
     CandidateDecision,
     CandleData,
     DataQualityIssue,
@@ -62,6 +63,9 @@ def build_scan_events(
     deep_dive_candidates: Iterable[str],
     alerts: Iterable[Alert],
     candidates: Iterable[SignalCandidate] = (),
+    attention_candidates: Iterable[AttentionCandidate] = (),
+    attention_coverage: Dict[str, float | int] | None = None,
+    execution_rejections_by_market: Dict[str, List[RejectionCode]] | None = None,
     data_quality_issues: Iterable[DataQualityIssue] = (),
     raw_tickers_by_market: Dict[str, MarketTicker] | None = None,
 ) -> List[ScanEvent]:
@@ -69,8 +73,13 @@ def build_scan_events(
     deep_dive_markets = set(deep_dive_candidates)
     alerts_by_market = {alert.candidate.market: alert for alert in alerts}
     candidates_by_market = {candidate.market: candidate for candidate in candidates}
+    attention_by_market = {
+        candidate.market: candidate for candidate in attention_candidates
+    }
     quality_issues = list(data_quality_issues)
+    execution_rejections_by_market = execution_rejections_by_market or {}
     raw_tickers_by_market = raw_tickers_by_market or {}
+    attention_coverage = attention_coverage or {}
     events = []
 
     for market in sorted(markets):
@@ -78,35 +87,49 @@ def build_scan_events(
         decision = candidate_decisions.get(market)
         feature_snapshot = (
             ticker.model_dump(
-                mode="json", exclude={"candle_history", "hourly_candles", "daily_candles"}
+                mode="json",
+                exclude={"candle_history", "hourly_candles", "daily_candles"},
             )
             if ticker
             else {}
         )
         if raw_ticker := raw_tickers_by_market.get(market):
             feature_snapshot["raw_ticker"] = raw_ticker.model_dump(mode="json")
+        if execution_rejections := execution_rejections_by_market.get(market):
+            feature_snapshot["execution_rejection_reasons"] = [
+                reason.value for reason in execution_rejections
+            ]
         if quality_issues:
             feature_snapshot["data_quality_issues"] = [
                 issue.model_dump(mode="json") for issue in quality_issues
             ]
+        if attention_coverage:
+            feature_snapshot["attention_coverage"] = dict(attention_coverage)
         eligible = decision.eligible if decision else False
         reasons = (
             list(decision.rejection_reasons)
             if decision
             else [RejectionCode.COMPLETE_CANDLE_HISTORY_UNAVAILABLE]
         )
+        if (
+            ticker
+            and market not in deep_dive_markets
+            and (eligible or market in attention_by_market)
+        ):
+            reasons.append(RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE)
         if quality_issues:
             final_decision = ScanDecision.DATA_QUALITY_BLOCKED
             reasons.extend(issue.code for issue in quality_issues)
         elif not ticker:
             final_decision = ScanDecision.DATA_QUALITY_BLOCKED
+        elif market in alerts_by_market:
+            final_decision = ScanDecision.ALERT_SELECTED
+        elif market in attention_by_market:
+            final_decision = ScanDecision.ATTENTION_QUEUED
         elif not eligible:
             final_decision = _final_decision_for_rejected_candidate(reasons)
         elif market not in deep_dive_markets:
             final_decision = ScanDecision.DEEP_DIVE_DATA_BLOCKED
-            reasons.append(RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE)
-        elif market in alerts_by_market:
-            final_decision = ScanDecision.ALERT_SELECTED
         else:
             final_decision = ScanDecision.CANDIDATE_NOT_ALERTED
 
@@ -118,6 +141,28 @@ def build_scan_events(
             )
             signal_candle_start = ticker.candle_history[-1].timestamp
         candidate = candidates_by_market.get(market)
+        attention = attention_by_market.get(market)
+        if attention:
+            feature_snapshot["attention"] = {
+                "lane": attention.lane.value,
+                "lane_rank": attention.lane_rank,
+                "primary_selected": attention.primary_selected,
+                "displayed": attention.displayed,
+                "display_rank": attention.display_rank,
+                "quality_score": attention.quality_score,
+                "ranking_score": attention.ranking_score,
+                "v3_shadow_rank": attention.v3_shadow_rank,
+                "v4_shadow_rank": attention.v4_shadow_rank,
+                "ridge_rank": attention.ridge_rank,
+                "ridge_score": attention.ridge_score,
+                "ridge_base_rank": attention.ridge_base_rank,
+                "ridge_base_ranking_score": attention.ridge_base_ranking_score,
+                "ridge_base_quality_score": attention.ridge_base_quality_score,
+                "ridge_base_exposures_60m": attention.ridge_base_exposures_60m,
+                "primary_exposures_60m": attention.primary_exposures_60m,
+                "score_version": attention.score_version,
+                "context_available": attention.context_available,
+            }
         events.append(
             ScanEvent(
                 event_id=f"{observed_at.isoformat()}:{market}",
@@ -131,6 +176,51 @@ def build_scan_events(
                 direction=direction,
                 signal_score=candidate.signal_score if candidate else None,
                 signal_candle_start=signal_candle_start,
+                attention_stage=attention.stage if attention else None,
+                attention_lane=attention.lane if attention else None,
+                attention_rank=attention.attention_rank if attention else None,
+                attention_lane_rank=attention.lane_rank if attention else None,
+                attention_primary_selected=(
+                    attention.primary_selected if attention else None
+                ),
+                attention_displayed=attention.displayed if attention else None,
+                attention_display_rank=(attention.display_rank if attention else None),
+                attention_quality_score=(
+                    attention.quality_score if attention else None
+                ),
+                attention_ranking_score=(
+                    attention.ranking_score if attention else None
+                ),
+                attention_v3_shadow_rank=(
+                    attention.v3_shadow_rank if attention else None
+                ),
+                attention_v4_shadow_rank=(
+                    attention.v4_shadow_rank if attention else None
+                ),
+                attention_ridge_rank=(attention.ridge_rank if attention else None),
+                attention_ridge_score=(attention.ridge_score if attention else None),
+                attention_ridge_base_rank=(
+                    attention.ridge_base_rank if attention else None
+                ),
+                attention_ridge_base_ranking_score=(
+                    attention.ridge_base_ranking_score if attention else None
+                ),
+                attention_ridge_base_quality_score=(
+                    attention.ridge_base_quality_score if attention else None
+                ),
+                attention_ridge_base_exposures_60m=(
+                    attention.ridge_base_exposures_60m if attention else None
+                ),
+                attention_primary_exposures_60m=(
+                    attention.primary_exposures_60m if attention else None
+                ),
+                attention_score_version=(
+                    attention.score_version if attention else None
+                ),
+                attention_first_seen_at=(
+                    attention.first_seen_at if attention else None
+                ),
+                attention_episode_id=attention.episode_id if attention else None,
             )
         )
     return events
@@ -142,8 +232,12 @@ def resolve_scan_outcomes(
     """Resolve available outcomes and retire events outside the recovery window."""
     outcomes = []
     pending = []
-    interval = datetime.timedelta(minutes=PRIMARY_PERFORMANCE_TARGET.execution_timeframe_minutes)
-    holding = datetime.timedelta(minutes=PRIMARY_PERFORMANCE_TARGET.holding_period_minutes)
+    interval = datetime.timedelta(
+        minutes=PRIMARY_PERFORMANCE_TARGET.execution_timeframe_minutes
+    )
+    holding = datetime.timedelta(
+        minutes=PRIMARY_PERFORMANCE_TARGET.holding_period_minutes
+    )
     latest_completed = max(
         (
             candle.timestamp
@@ -153,8 +247,7 @@ def resolve_scan_outcomes(
         default=None,
     )
     recovery_start = (
-        latest_completed
-        - interval * (config.RECENT_SCAN_HISTORY_BARS - 1)
+        latest_completed - interval * (config.RECENT_SCAN_HISTORY_BARS - 1)
         if latest_completed is not None
         else None
     )
@@ -165,7 +258,10 @@ def resolve_scan_outcomes(
             continue
         entry_start = event.signal_candle_start + interval
         exit_start = entry_start + holding
-        candles = {candle.timestamp: candle for candle in candles_by_market.get(event.market, [])}
+        candles = {
+            candle.timestamp: candle
+            for candle in candles_by_market.get(event.market, [])
+        }
         entry = candles.get(entry_start)
         exit_candle = candles.get(exit_start)
         path = [

@@ -329,6 +329,21 @@ def _notification_record(
     )
 
 
+def test_unchanged_attention_scan_skips_repeated_briefing(monkeypatch):
+    dispatch = AsyncMock()
+    monkeypatch.setattr(notification, "_queue_and_dispatch_notification", dispatch)
+    args = _briefing_args()
+    args["final_alerts"] = []
+    args["attention_queue"] = []
+    args["suppress_unchanged_briefing"] = True
+
+    result = asyncio.run(notification.create_and_dispatch_notification(**args))
+
+    assert result.outcome is DispatchOutcome.SKIPPED
+    assert result.detail == "no_material_attention_change"
+    dispatch.assert_not_awaited()
+
+
 def test_configured_webhook_failure_is_queued_and_retried(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))

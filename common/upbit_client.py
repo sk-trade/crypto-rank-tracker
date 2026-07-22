@@ -28,6 +28,7 @@ UPBIT_API_BASE_URL = "https://api.upbit.com/v1"
 
 GLOBAL_RATE_LIMIT_PER_SECOND = 8
 _LOOP_LIMITERS = WeakKeyDictionary()
+_LOOP_COOLDOWN_UNTIL = WeakKeyDictionary()
 MAX_CANDLES_PER_REQUEST = 200
 MAX_RETRY_DELAY_SECONDS = 60.0
 
@@ -72,9 +73,36 @@ def _global_limiter() -> AsyncLimiter:
     loop = asyncio.get_running_loop()
     limiter = _LOOP_LIMITERS.get(loop)
     if limiter is None:
-        limiter = AsyncLimiter(GLOBAL_RATE_LIMIT_PER_SECOND, 1)
+        # Smooth requests instead of spending the whole per-second allowance in a burst.
+        limiter = AsyncLimiter(1, 1 / GLOBAL_RATE_LIMIT_PER_SECOND)
         _LOOP_LIMITERS[loop] = limiter
     return limiter
+
+
+async def _wait_for_global_cooldown() -> None:
+    """Pause all candle requests in this process after any peer receives a 429."""
+    loop = asyncio.get_running_loop()
+    deadline = _LOOP_COOLDOWN_UNTIL.get(loop, 0.0)
+    delay = deadline - loop.time()
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
+async def _acquire_request_slot() -> None:
+    """Acquire rate capacity only after the shared cooldown has actually expired."""
+    loop = asyncio.get_running_loop()
+    while True:
+        await _wait_for_global_cooldown()
+        await _global_limiter().acquire()
+        if _LOOP_COOLDOWN_UNTIL.get(loop, 0.0) <= loop.time():
+            return
+
+
+def _extend_global_cooldown(delay: float) -> None:
+    loop = asyncio.get_running_loop()
+    _LOOP_COOLDOWN_UNTIL[loop] = max(
+        _LOOP_COOLDOWN_UNTIL.get(loop, 0.0), loop.time() + delay
+    )
 
 
 def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
@@ -207,6 +235,7 @@ def normalize_sparse_completed_candles(
                 low_price=previous_close,
                 close_price=previous_close,
                 volume=0.0,
+                trade_value=0.0,
             )
         )
     return normalized
@@ -239,36 +268,40 @@ async def _request_candle_page(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with _global_limiter():
-                async with session.get(url, params=params, timeout=10) as response:
-                    if response.status == 429:
-                        retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
-                        logger.warning(
-                            "%s: 429 Rate Limit. %.1f초 대기 (시도 %d/%d)",
-                            market,
-                            retry_after,
-                            attempt + 1,
-                            max_retries,
-                        )
-                        await asyncio.sleep(retry_after)
-                        continue
-                    if 500 <= response.status < 600:
-                        wait_time = 2**attempt
-                        logger.warning(
-                            "%s: %d 서버 에러. %d초 대기 (시도 %d/%d)",
-                            market,
-                            response.status,
-                            wait_time,
-                            attempt + 1,
-                            max_retries,
-                        )
-                        await asyncio.sleep(wait_time)
-                        continue
-                    response.raise_for_status()
-                    page = await response.json()
-                    if not isinstance(page, list):
-                        raise ValueError("candle response must be a list")
-                    return page
+            await _acquire_request_slot()
+            async with session.get(url, params=params, timeout=10) as response:
+                if response.status == 429:
+                    retry_after = max(
+                        _retry_after_seconds(response.headers.get("Retry-After")),
+                        float(2**attempt),
+                    )
+                    _extend_global_cooldown(retry_after)
+                    logger.warning(
+                        "%s: 429 Rate Limit. %.1f초 대기 (시도 %d/%d)",
+                        market,
+                        retry_after,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                if 500 <= response.status < 600:
+                    wait_time = 2**attempt
+                    logger.warning(
+                        "%s: %d 서버 에러. %d초 대기 (시도 %d/%d)",
+                        market,
+                        response.status,
+                        wait_time,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                response.raise_for_status()
+                page = await response.json()
+                if not isinstance(page, list):
+                    raise ValueError("candle response must be a list")
+                return page
         except aiohttp.ClientError as error:
             logger.warning(
                 "%s: 네트워크 오류 (시도 %d/%d): %s",
@@ -308,6 +341,7 @@ def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleDa
                     "low_price": item["low_price"],
                     "close_price": item["trade_price"],
                     "volume": item["candle_acc_trade_volume"],
+                    "trade_value": item.get("candle_acc_trade_price"),
                 }
             )
         )
@@ -344,6 +378,7 @@ def _same_slot_candle(
         low_price=candle.close_price,
         close_price=candle.close_price,
         volume=0.0,
+        trade_value=0.0,
     )
 
 # --- API 호출 함수 ---
@@ -538,7 +573,6 @@ async def get_candles(
     if synthesize_no_trade_intervals and (
         time_unit is not CandleTimeUnit.MINUTES
         or not minutes_unit
-        or count >= MAX_CANDLES_PER_REQUEST
     ):
         raise UpbitAPIError(
             UpbitErrorCode.INVALID_CANDLE_REQUEST,
@@ -561,21 +595,41 @@ async def get_candles(
             url = f"{UPBIT_API_BASE_URL}/candles/{time_unit.value}"
         if synthesize_no_trade_intervals:
             try:
-                recent_page = await _request_candle_page(
-                    session,
-                    url,
-                    {
-                        "market": market,
-                        "count": MAX_CANDLES_PER_REQUEST,
-                        "to": request_cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    },
-                    market,
-                )
-                recent_source = _parse_candle_page(recent_page, market)
+                first_expected = _expected_candle_starts(
+                    time_unit, count, minutes_unit, request_as_of
+                )[0]
+                recent_source = []
+                to = request_cutoff
+                oldest_seen = None
+                max_pages = (count + MAX_CANDLES_PER_REQUEST - 1) // MAX_CANDLES_PER_REQUEST + 2
+                for _ in range(max_pages):
+                    recent_page = await _request_candle_page(
+                        session,
+                        url,
+                        {
+                            "market": market,
+                            "count": MAX_CANDLES_PER_REQUEST,
+                            "to": to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        },
+                        market,
+                    )
+                    if not recent_page:
+                        break
+                    page_candles = _parse_candle_page(recent_page, market)
+                    recent_source.extend(page_candles)
+                    oldest = min(candle.timestamp for candle in page_candles)
+                    if oldest_seen is not None and oldest >= oldest_seen:
+                        raise ValueError(f"{market}: candle pagination did not advance")
+                    oldest_seen = oldest
+                    if oldest <= first_expected:
+                        break
+                    if len(recent_page) < MAX_CANDLES_PER_REQUEST:
+                        break
+                    to = oldest
                 recent_candles = normalize_sparse_completed_candles(
                     recent_source, count, minutes_unit, request_as_of
                 )
-                del recent_page, recent_source
+                del recent_source
                 if len(recent_candles) != count:
                     logger.warning(
                         "%s: rejected sparse candle history without a valid seed or grid.", market

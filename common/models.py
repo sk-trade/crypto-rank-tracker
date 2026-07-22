@@ -1,4 +1,4 @@
-#common/models
+# common/models
 
 import datetime
 import math
@@ -124,7 +124,9 @@ class RejectionCode(StrEnum):
     SUSPECTED_WASH_TRADING = "suspected_wash_trading"
     VOLUME_ANOMALY_BELOW_THRESHOLD = "volume_anomaly_below_threshold"
     PRICE_SURPRISE_BELOW_THRESHOLD = "price_surprise_below_threshold"
-    VOLUME_AND_PRICE_SURPRISE_BELOW_THRESHOLD = "volume_and_price_surprise_below_threshold"
+    VOLUME_AND_PRICE_SURPRISE_BELOW_THRESHOLD = (
+        "volume_and_price_surprise_below_threshold"
+    )
     MARKET_WARNING = "market_warning"
     DAILY_TURNOVER_BELOW_MINIMUM = "daily_turnover_below_minimum"
     ORDERBOOK_UNAVAILABLE = "orderbook_unavailable"
@@ -135,7 +137,9 @@ class RejectionCode(StrEnum):
     MOVE_DOES_NOT_COVER_ESTIMATED_COSTS = "move_does_not_cover_estimated_costs"
     MARKET_REGIME_UNKNOWN = "market_regime_unknown"
     COMPLETE_CANDLE_HISTORY_UNAVAILABLE = "complete_candle_history_unavailable"
-    HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE = "higher_timeframe_candle_history_unavailable"
+    HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE = (
+        "higher_timeframe_candle_history_unavailable"
+    )
     MARKET_UNIVERSE_EMPTY = "market_universe_empty"
     CANDLE_COVERAGE_BELOW_MINIMUM = "candle_coverage_below_minimum"
     BTC_CANDLE_HISTORY_UNAVAILABLE = "btc_candle_history_unavailable"
@@ -149,7 +153,38 @@ class ScanDecision(StrEnum):
     DATA_QUALITY_BLOCKED = "data_quality_blocked"
     DEEP_DIVE_DATA_BLOCKED = "deep_dive_data_blocked"
     CANDIDATE_NOT_ALERTED = "candidate_not_alerted"
+    ATTENTION_QUEUED = "attention_queued"
     ALERT_SELECTED = "alert_selected"
+
+
+class AttentionStage(StrEnum):
+    DISCOVERED = "discovered"
+    BUILDING = "building"
+    CONFIRMED = "confirmed"
+    COOLING = "cooling"
+    FAILED = "failed"
+
+
+class AttentionLane(StrEnum):
+    FOCUS = "focus_now"
+    EARLY = "early_watch"
+    ONGOING = "ongoing"
+    COOLING_FAILED = "cooling_failed"
+    DATA_LIMITED = "data_limited"
+
+
+class EvidenceFamily(StrEnum):
+    ACTIVITY = "activity"
+    PRICE_STRUCTURE = "price_structure"
+    CONTEXT = "context"
+    EXECUTION = "execution"
+
+
+class EvidenceVerdict(StrEnum):
+    SUPPORTING = "supporting"
+    MIXED = "mixed"
+    RISK = "risk"
+    UNAVAILABLE = "unavailable"
 
 
 class Direction(StrEnum):
@@ -222,13 +257,17 @@ class NotificationErrorCode(StrEnum):
     OUTBOX_WRITE_NOT_PERSISTED = "outbox_write_not_persisted"
     PREPARED_ADVANCE_FAILED = "prepared_advance_failed"
     DELIVERY_FINALIZATION_FAILED = "delivery_finalization_failed"
-    UNCERTAIN_DELIVERY_SCAN_COMPLETION_FAILED = "uncertain_delivery_scan_completion_failed"
+    UNCERTAIN_DELIVERY_SCAN_COMPLETION_FAILED = (
+        "uncertain_delivery_scan_completion_failed"
+    )
     DELIVERY_OUTCOME_UNCERTAIN = "delivery_outcome_uncertain"
     RETRY_STATE_RESTORE_FAILED = "retry_state_restore_failed"
     DELIVERY_FAILED = "delivery_failed"
     PENDING_SCAN_HANDOFF_FAILED = "pending_scan_handoff_failed"
     PENDING_CANCELLATION_FAILED = "pending_cancellation_failed"
-    AMBIGUOUS_ATTEMPT_REQUIRES_RECONCILIATION = "ambiguous_attempt_requires_reconciliation"
+    AMBIGUOUS_ATTEMPT_REQUIRES_RECONCILIATION = (
+        "ambiguous_attempt_requires_reconciliation"
+    )
     CONFIRMED_DELIVERY_FINALIZATION_FAILED = "confirmed_delivery_finalization_failed"
     PENDING_ADVANCE_FAILED = "pending_advance_failed"
 
@@ -261,7 +300,9 @@ class CandidateDecision(BaseModel):
         if self.eligible and self.rejection_reasons:
             raise ValueError("eligible candidates cannot have rejection reasons")
         if not self.eligible and not self.rejection_reasons:
-            raise ValueError("rejected candidates require at least one rejection reason")
+            raise ValueError(
+                "rejected candidates require at least one rejection reason"
+            )
         return self
 
 
@@ -328,10 +369,7 @@ class SectorMap(RootModel[Dict[KrwMarket, List[str]]]):
         if not self.root:
             raise ValueError("sector map must not be empty")
         for categories in self.root.values():
-            if (
-                not categories
-                or any(not category.strip() for category in categories)
-            ):
+            if not categories or any(not category.strip() for category in categories):
                 raise ValueError("sector map contains an invalid assignment")
         return self
 
@@ -359,9 +397,7 @@ def _nonnegative_finite_float(value: Any) -> float:
 
 
 PositiveFiniteFloat = Annotated[float, BeforeValidator(_positive_finite_float)]
-NonNegativeFiniteFloat = Annotated[
-    float, BeforeValidator(_nonnegative_finite_float)
-]
+NonNegativeFiniteFloat = Annotated[float, BeforeValidator(_nonnegative_finite_float)]
 
 
 class MarketEvent(BaseModel):
@@ -383,6 +419,7 @@ class MarketListing(BaseModel):
     market: KrwMarket
     english_name: Optional[str] = None
     market_event: Optional[MarketEvent] = None
+
 
 class MarketTicker(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
@@ -421,6 +458,7 @@ class CandleData(BaseModel):
     low_price: PositiveFiniteFloat
     close_price: PositiveFiniteFloat
     volume: NonNegativeFiniteFloat
+    trade_value: Optional[NonNegativeFiniteFloat] = None
 
     @model_validator(mode="after")
     def validate_ohlc(self) -> "CandleData":
@@ -438,7 +476,7 @@ class TickerData(BaseModel):
 
     market: KrwMarket
     candle_history: List[CandleData] = Field(default_factory=list)
-    
+
     # --- 기본 분석용 ---
     price_change_10m: Optional[float] = None
     relative_volume: Optional[float] = None
@@ -452,17 +490,17 @@ class TickerData(BaseModel):
     liquidity_tier: LiquidityTier = LiquidityTier.UNKNOWN
     execution_spread_bps: Optional[float] = None
     expected_slippage_bps: Optional[float] = None
-    
 
     # --- 심층 분석용 필드  ---
     decoupling_score: Optional[float] = None
     residual_momentum_score: Optional[float] = None
     hourly_candles: List[CandleData] = Field(default_factory=list)
     daily_candles: List[CandleData] = Field(default_factory=list)
-    
+
     trend_1h_stable: TrendState = TrendState.NEUTRAL
     is_above_ma50_daily: Optional[bool] = None
     is_above_ma200_daily: Optional[bool] = None
+
 
 class SignalCandidate(BaseModel):
     """1차 분석을 통해 생성된 잠재적 시그널 후보입니다."""
@@ -475,6 +513,105 @@ class SignalCandidate(BaseModel):
     rvol: float
     rvol_z_score: float
     current_price: float
+
+
+class AttentionEvidence(BaseModel):
+    """One non-overlapping evidence family shown for an attention candidate."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    family: EvidenceFamily
+    verdict: EvidenceVerdict
+    summary: str
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AttentionStateEntry(BaseModel):
+    """Durable progression state for one market attention episode."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: KrwMarket
+    episode_id: str = Field(min_length=1)
+    first_seen_at: AwareDatetime
+    last_seen_at: AwareDatetime
+    consecutive_observations: int = Field(ge=1)
+    stage: AttentionStage
+    last_rank: Optional[int] = Field(default=None, ge=1)
+    last_price: PositiveFiniteFloat
+    last_relative_volume: Optional[NonNegativeFiniteFloat] = None
+    last_signal_score: Optional[float] = None
+    last_signal_type: Optional[SignalType] = None
+    structure_level: Optional[PositiveFiniteFloat] = None
+    structure_direction: Optional[StructureDirection] = None
+    cooling_observations: int = Field(default=0, ge=0)
+    focus_observations: int = Field(default=0, ge=0)
+    confirmed_transition_seen: bool = False
+    primary_exposure_times: List[AwareDatetime] = Field(default_factory=list)
+    # None marks legacy state whose prior visible-model provenance is unknown.
+    ridge_base_exposure_times: Optional[List[AwareDatetime]] = None
+    last_lane: Optional[AttentionLane] = None
+    material_change: bool = False
+    change_reasons: List[str] = Field(default_factory=list)
+
+
+class AttentionState(BaseModel):
+    """Latest bounded attention state, independent from webhook delivery state."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    updated_at: Optional[AwareDatetime] = None
+    entries: Dict[KrwMarket, AttentionStateEntry] = Field(default_factory=dict)
+
+
+class AttentionCandidate(BaseModel):
+    """Ranked item that tells a human which chart deserves attention and why."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: KrwMarket
+    attention_rank: int = Field(ge=1)
+    lane: AttentionLane
+    lane_rank: Optional[int] = Field(default=None, ge=1)
+    primary_selected: bool = False
+    displayed: bool = False
+    display_rank: Optional[int] = Field(default=None, ge=1)
+    quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    ranking_score: float = 0.0
+    max_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    primary_exposures_60m: int = Field(default=0, ge=0)
+    ridge_base_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    ridge_base_exposures_60m: int = Field(default=0, ge=0)
+    ridge_base_rank: Optional[int] = Field(default=None, ge=1)
+    ridge_base_ranking_score: Optional[float] = None
+    v3_shadow_rank: Optional[int] = Field(default=None, ge=1)
+    v4_shadow_rank: Optional[int] = Field(default=None, ge=1)
+    ridge_rank: Optional[int] = Field(default=None, ge=1)
+    ridge_score: Optional[float] = None
+    score_version: str = Field(min_length=1)
+    context_available: bool = False
+    market_rank: Optional[int] = Field(default=None, ge=1)
+    market_rank_delta: Optional[int] = None
+    stage: AttentionStage
+    episode_id: str = Field(min_length=1)
+    first_seen_at: AwareDatetime
+    observed_at: AwareDatetime
+    consecutive_observations: int = Field(ge=1)
+    current_price: PositiveFiniteFloat
+    price_change_10m: Optional[float] = None
+    price_change_1h: Optional[float] = None
+    price_change_4h: Optional[float] = None
+    relative_volume: Optional[NonNegativeFiniteFloat] = None
+    conditional_volume_z: Optional[float] = None
+    price_surprise: Optional[float] = None
+    residual_momentum: Optional[float] = None
+    signal_score: Optional[float] = None
+    signal_type: Optional[SignalType] = None
+    structure_level: Optional[PositiveFiniteFloat] = None
+    structure_direction: Optional[StructureDirection] = None
+    material_change: bool
+    change_reasons: List[str] = Field(default_factory=list)
+    evidence: List[AttentionEvidence] = Field(default_factory=list)
 
 
 class Alert(BaseModel):
@@ -524,6 +661,29 @@ class ScanEvent(BaseModel):
     direction: Optional[Direction] = None
     signal_score: Optional[float] = None
     signal_candle_start: Optional[datetime.datetime] = None
+    attention_stage: Optional[AttentionStage] = None
+    attention_lane: Optional[AttentionLane] = None
+    attention_rank: Optional[int] = Field(default=None, ge=1)
+    attention_lane_rank: Optional[int] = Field(default=None, ge=1)
+    attention_primary_selected: Optional[bool] = None
+    attention_displayed: Optional[bool] = None
+    attention_display_rank: Optional[int] = Field(default=None, ge=1)
+    attention_quality_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    attention_ranking_score: Optional[float] = None
+    attention_v3_shadow_rank: Optional[int] = Field(default=None, ge=1)
+    attention_v4_shadow_rank: Optional[int] = Field(default=None, ge=1)
+    attention_ridge_rank: Optional[int] = Field(default=None, ge=1)
+    attention_ridge_score: Optional[float] = None
+    attention_ridge_base_rank: Optional[int] = Field(default=None, ge=1)
+    attention_ridge_base_ranking_score: Optional[float] = None
+    attention_ridge_base_quality_score: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    attention_ridge_base_exposures_60m: Optional[int] = Field(default=None, ge=0)
+    attention_primary_exposures_60m: Optional[int] = Field(default=None, ge=0)
+    attention_score_version: Optional[str] = None
+    attention_first_seen_at: Optional[AwareDatetime] = None
+    attention_episode_id: Optional[str] = None
 
 
 class ScanOutcome(BaseModel):
@@ -575,16 +735,16 @@ class NotificationOutbox(BaseModel):
     @classmethod
     def unique_alert_markets(cls, markets: List[str]) -> List[str]:
         if any(not market for market in markets) or len(markets) != len(set(markets)):
-            raise ValueError("alert_markets must contain unique non-empty market identifiers")
+            raise ValueError(
+                "alert_markets must contain unique non-empty market identifiers"
+            )
         return markets
 
 
 class NotificationBacklog(RootModel[List[NotificationOutbox]]):
     @model_validator(mode="after")
     def validate_deferred_records(self) -> "NotificationBacklog":
-        if any(
-            item.status is not NotificationStatus.PREPARED for item in self.root
-        ):
+        if any(item.status is not NotificationStatus.PREPARED for item in self.root):
             raise ValueError("notification backlog records must be prepared")
         delivery_ids = [item.delivery_id for item in self.root]
         if len(delivery_ids) != len(set(delivery_ids)):
@@ -608,7 +768,9 @@ class ScanClaim(BaseModel):
     def validate_lifecycle(self) -> "ScanClaim":
         if self.status is ScanClaimStatus.IN_PROGRESS:
             if self.claimed_at is None or self.completed_at is not None:
-                raise ValueError("in-progress claims require claimed_at and forbid completed_at")
+                raise ValueError(
+                    "in-progress claims require claimed_at and forbid completed_at"
+                )
         return self
 
 

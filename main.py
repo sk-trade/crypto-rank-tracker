@@ -6,6 +6,10 @@ import logging
 from enum import StrEnum
 
 import aiohttp
+from common.attention import (
+    attention_briefing_due,
+    build_attention_result,
+)
 from common.notification.engine import AlertEngine
 from common.signals.detector import detect_anomalies, filter_market_wide_events
 import functions_framework
@@ -23,7 +27,6 @@ from common.analysis.deep_dive import (
     get_market_regime,
 )
 from common.models import (
-    CandidateDecision,
     DataQualityIssue,
     MarketRegime,
     MarketRegimeSnapshot,
@@ -51,9 +54,11 @@ from common.state_manager import (
     complete_scan_key,
     release_scan_key,
     load_alert_history,
+    load_attention_state,
     load_pending_scan_events,
     load_rank_state_history,
     save_pending_scan_events,
+    save_attention_state,
     save_rank_state_history,
 )
 from common.upbit_client import (
@@ -88,16 +93,19 @@ def filter_markets_with_complete_deep_dive_data(
     candles_60m: dict,
     candles_daily: dict,
 ) -> list[str]:
-    """Block candidates that lack any required higher-timeframe history."""
+    """Return candidates with complete higher-timeframe supporting evidence."""
     valid_markets = [
         market
         for market in candidate_markets
-        if market in candles_60m and market in candles_daily
+        if len(candles_60m.get(market, []))
+        >= config.ATTENTION_CONTEXT_MIN_HOURLY_BARS
+        and len(candles_daily.get(market, []))
+        >= config.ATTENTION_CONTEXT_MIN_DAILY_BARS
     ]
     blocked_markets = sorted(set(candidate_markets) - set(valid_markets))
     if blocked_markets:
         logger.warning(
-            "Blocking %d candidate(s) because 60-minute or daily candle coverage failed: %s",
+            "%d candidate(s) lack 60-minute or daily supporting evidence: %s",
             len(blocked_markets),
             ", ".join(blocked_markets[:10]),
         )
@@ -148,27 +156,6 @@ def assess_scan_data_quality(
             )
         )
     return issues
-
-
-def record_market_regime_block(
-    candidate_markets: list[str],
-    candidate_decisions: dict[str, CandidateDecision],
-    market_regime: MarketRegimeSnapshot,
-) -> list[str]:
-    """Persist a fail-closed regime gate as a distinct event-log decision."""
-    if market_regime.regime is not MarketRegime.UNKNOWN:
-        return candidate_markets
-    logger.warning("Blocking candidates because BTC market regime is UNKNOWN.")
-    for market in candidate_markets:
-        decision = candidate_decisions[market]
-        candidate_decisions[market] = CandidateDecision(
-            eligible=False,
-            rejection_reasons=[
-                *decision.rejection_reasons,
-                RejectionCode.MARKET_REGIME_UNKNOWN,
-            ],
-        )
-    return []
 
 
 def _scheduled_scan_time(schedule_time: str | None) -> datetime.datetime:
@@ -249,7 +236,39 @@ async def run_check(
             )
             scan_key = f"completed-candle:{scan_close_at.isoformat()}"
             old_rank_states = await load_rank_state_history(gcs_client)
-            previous_rankings = old_rank_states[-1].rankings if old_rank_states else {}
+            previous_attention_state = await load_attention_state(gcs_client)
+            if (
+                previous_attention_state.updated_at is not None
+                and previous_attention_state.updated_at > scan_close_at
+            ):
+                logger.warning(
+                    "Skipping historical retry %s because newer attention state exists at %s; "
+                    "current-only ticker, orderbook, and alert evidence cannot be backfilled safely.",
+                    scan_close_at.isoformat(),
+                    previous_attention_state.updated_at.isoformat(),
+                )
+                if not await claim_scan_key(
+                    scan_key, execution_id=execution_id, gcs_client=gcs_client
+                ):
+                    logger.warning("Skipping duplicate scheduled scan for %s", scan_key)
+                    if pending_delivery_error:
+                        raise pending_delivery_error
+                    return
+                claimed_scan_key = scan_key
+                await complete_scan_key(scan_key, gcs_client)
+                scan_persisted = True
+                claimed_scan_key = None
+                if pending_delivery_error:
+                    raise pending_delivery_error
+                return
+            previous_rankings = next(
+                (
+                    state.rankings
+                    for state in reversed(old_rank_states)
+                    if state.last_updated < scan_close_at
+                ),
+                {},
+            )
             sectors, reverse_sector_map = await load_and_process_sectors(gcs_client)
 
             # PHASE 1: 광역 스캔
@@ -339,22 +358,22 @@ async def run_check(
             candidate_markets = [
                 market for market, decision in candidate_decisions.items() if decision.eligible
             ]
+            execution_decisions = {}
             if candidate_markets:
                 orderbooks = await get_orderbooks(session, candidate_markets)
                 for market in candidate_markets:
                     execution = assess_execution(
                         lightweight_tickers[market], raw_tickers_map.get(market), orderbooks.get(market)
                     )
+                    execution_decisions[market] = execution
                     lightweight_tickers[market].execution_spread_bps = execution.spread_bps
                     lightweight_tickers[market].expected_slippage_bps = execution.expected_slippage_bps
                     if not execution.executable:
-                        candidate_decisions[market] = CandidateDecision(
-                            eligible=False,
-                            rejection_reasons=execution.rejection_reasons,
+                        logger.info(
+                            "%s remains in the attention filter with execution risk: %s",
+                            market,
+                            ", ".join(reason.value for reason in execution.rejection_reasons),
                         )
-                candidate_markets = [
-                    market for market, decision in candidate_decisions.items() if decision.eligible
-                ]
             
             if not candidate_markets:
                 logger.info("심층 분석 대상이 없습니다. Phase 2를 건너뜁니다.")
@@ -364,10 +383,24 @@ async def run_check(
             # PHASE 2: 심층 분석
             enriched_tickers = lightweight_tickers.copy()
             market_regime = MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN)
+            deep_dive_candidate_markets = []
+            deep_dive_evidence_markets = []
+            attention_interval = datetime.timedelta(
+                minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES * 1.5
+            )
+            retained_context_markets = [
+                market
+                for market, entry in previous_attention_state.entries.items()
+                if market in lightweight_tickers
+                and entry.last_seen_at <= scan_close_at
+                and scan_close_at - entry.last_seen_at <= attention_interval
+            ]
 
-            if candidate_markets:
+            if candidate_markets or retained_context_markets:
                 logger.info("Phase 2: 후보군 심층 분석 시작")
-                markets_to_fetch = required_deep_dive_markets(candidate_markets)
+                markets_to_fetch = required_deep_dive_markets(
+                    [*candidate_markets, *retained_context_markets]
+                )
                 
                 tasks = [
                     get_candles(
@@ -388,11 +421,22 @@ async def run_check(
                 ]
                 results = await asyncio.gather(*tasks)
                 candles_60m, candles_daily = results[0], results[1]
-                candidate_markets = filter_markets_with_complete_deep_dive_data(
+                deep_dive_evidence_markets = sorted(
+                    market
+                    for market in markets_to_fetch
+                    if len(candles_60m.get(market, []))
+                    >= config.ATTENTION_CONTEXT_MIN_HOURLY_BARS
+                    and len(candles_daily.get(market, []))
+                    >= config.ATTENTION_CONTEXT_MIN_DAILY_BARS
+                )
+                deep_dive_candidate_markets = filter_markets_with_complete_deep_dive_data(
                     candidate_markets, candles_60m, candles_daily
                 )
-                if not candidate_markets:
-                    logger.warning("No candidates passed higher-timeframe candle integrity checks.")
+                if candidate_markets and not deep_dive_candidate_markets:
+                    logger.warning(
+                        "No candidates have complete higher-timeframe evidence; "
+                        "broad-filter candidates remain recorded in the full queue as Data-limited."
+                    )
 
                 deep_dive_enriched = enrich_deep_dive_tickers(
                     {m: t for m, t in lightweight_tickers.items() if m in markets_to_fetch},
@@ -404,13 +448,15 @@ async def run_check(
 
                 market_regime = get_market_regime(enriched_tickers)
                 logger.info("현재 시장 체제: %s", market_regime.regime.value)
-                candidate_markets = record_market_regime_block(
-                    candidate_markets, candidate_decisions, market_regime
-                )
+                if market_regime.regime is MarketRegime.UNKNOWN:
+                    logger.warning(
+                        "BTC market regime is unknown; retaining candidates with unavailable context evidence."
+                    )
 
             # PHASE 3: 알림 생성
             final_alerts = []
             candidates_list = []
+            alert_history = await load_alert_history(gcs_client)
             if candidate_markets: 
                 candidates_list = detect_anomalies(
                     candidate_markets,
@@ -423,13 +469,76 @@ async def run_check(
 
                 if candidates_list:
                     alert_engine = AlertEngine()
-                    alert_history = await load_alert_history(gcs_client)
                     final_alerts = alert_engine.process_signals(candidates_list, enriched_tickers, alert_history)
                     
                     logger.info(f"최종 알림 생성: {len(final_alerts)}건")
 
+            attention_result = build_attention_result(
+                scan_close_at,
+                candidate_markets,
+                enriched_tickers,
+                current_rankings,
+                previous_rankings,
+                candidates_list,
+                final_alerts,
+                previous_state=previous_attention_state,
+                execution_decisions=execution_decisions,
+                market_regime=market_regime,
+            )
+            attention_queue = attention_result.visible
+            all_attention_candidates = attention_result.all_candidates
+            attention_state = attention_result.state
+            raw_coverage_ratio = (
+                len(candles_10m) / len(all_markets) if all_markets else 0.0
+            )
+            active_candidate_markets = set(candidate_markets)
+            eligible_context_count = sum(
+                candidate.context_available
+                for candidate in all_attention_candidates
+                if candidate.market in active_candidate_markets
+            )
+            eligible_context_coverage_ratio = (
+                eligible_context_count / len(candidate_markets)
+                if candidate_markets
+                else 1.0
+            )
+            attention_coverage = {
+                "raw_market_count": len(candles_10m),
+                "raw_market_total": len(all_markets),
+                "raw_market_coverage_ratio": raw_coverage_ratio,
+                "eligible_candidate_count": len(candidate_markets),
+                "eligible_context_count": eligible_context_count,
+                "eligible_context_coverage_ratio": eligible_context_coverage_ratio,
+            }
+            logger.info(
+                "관심종목 큐 생성: 주요 %d건 / 전체 %d건 (%d건 material change)",
+                len(attention_queue),
+                len(all_attention_candidates),
+                sum(
+                    candidate.material_change
+                    for candidate in all_attention_candidates
+                ),
+            )
+            logger.info(
+                "관심종목 coverage: raw %d/%d (%.1f%%), eligible context %d/%d (%.1f%%)",
+                len(candles_10m),
+                len(all_markets),
+                raw_coverage_ratio * 100,
+                eligible_context_count,
+                len(candidate_markets),
+                eligible_context_coverage_ratio * 100,
+            )
+            attention_digest_due = attention_briefing_due(scan_close_at)
+            notification_attention_queue = (
+                all_attention_candidates if attention_digest_due else []
+            )
+            if all_attention_candidates and not attention_digest_due:
+                logger.info(
+                    "관심종목 상태는 저장하고 다음 %d분 브리핑까지 webhook을 보류합니다.",
+                    config.ATTENTION_BRIEFING_INTERVAL_MINUTES,
+                )
+
             # 알림 발송 및 상태 저장
-            alert_history = await load_alert_history(gcs_client)
             if not await claim_scan_key(
                 scan_key, execution_id=execution_id, gcs_client=gcs_client
             ):
@@ -444,9 +553,16 @@ async def run_check(
                 all_markets,
                 lightweight_tickers,
                 candidate_decisions,
-                candidate_markets,
+                deep_dive_evidence_markets,
                 final_alerts,
                 candidates_list,
+                attention_candidates=all_attention_candidates,
+                attention_coverage=attention_coverage,
+                execution_rejections_by_market={
+                    market: decision.rejection_reasons
+                    for market, decision in execution_decisions.items()
+                    if decision.rejection_reasons
+                },
                 raw_tickers_by_market=raw_tickers_map,
             )
             conflicting_event_ids = await append_scan_events(scan_events, gcs_client)
@@ -489,6 +605,7 @@ async def run_check(
 
             new_rank_state = RankState(last_updated=scan_close_at, rankings=current_rankings)
             await save_rank_state_history(new_rank_state, old_rank_states, gcs_client=gcs_client)
+            await save_attention_state(attention_state, gcs_client=gcs_client)
             scan_persisted = True
 
             try:
@@ -496,6 +613,8 @@ async def run_check(
                     raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
                     previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
                     final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime,
+                    attention_queue=notification_attention_queue,
+                    suppress_unchanged_briefing=True,
                     gcs_client=gcs_client, scan_key=scan_key,
                 )
             except NotificationDeliveryError as error:

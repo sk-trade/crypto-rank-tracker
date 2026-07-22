@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 import config
+from common.attention import build_attention_queue, build_attention_result
 from common.analysis.deep_dive import enrich_deep_dive_tickers
 from common.event_log import build_scan_events, resolve_scan_outcomes
 from common.models import (
@@ -33,7 +34,9 @@ from common.storage_client import (
 UTC = datetime.timezone.utc
 
 
-def _candle(timestamp: datetime.datetime, open_price: float, high: float, low: float) -> CandleData:
+def _candle(
+    timestamp: datetime.datetime, open_price: float, high: float, low: float
+) -> CandleData:
     return CandleData(
         market="KRW-BTC",
         timestamp=timestamp,
@@ -96,6 +99,7 @@ def test_scan_events_include_all_markets_and_rejection_decisions():
 
     by_market = {event.market: event for event in events}
     assert set(by_market) == {"KRW-BTC", "KRW-ETH", "KRW-XRP"}
+    assert {event.model_version for event in events} == {config.SIGNAL_MODEL_VERSION}
     assert by_market["KRW-BTC"].final_decision is ScanDecision.CANDIDATE_NOT_ALERTED
     assert by_market["KRW-ETH"].rejection_reasons == [
         RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD
@@ -134,6 +138,109 @@ def test_scan_events_preserve_execution_and_regime_blocking_stages():
     by_market = {event.market: event for event in events}
     assert by_market["KRW-BTC"].final_decision is ScanDecision.EXECUTION_BLOCKED
     assert by_market["KRW-ETH"].final_decision is ScanDecision.MARKET_REGIME_BLOCKED
+
+
+def test_scan_event_records_attention_queue_position_before_final_alert():
+    observed_at = datetime.datetime(2026, 6, 18, 0, 10, tzinfo=UTC)
+    ticker = TickerData(
+        market="KRW-BTC",
+        candle_history=[_candle(observed_at, 100.0, 101.0, 99.0)],
+        price_change_10m=0.5,
+    )
+    result = build_attention_result(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: 3},
+        {ticker.market: 5},
+        [],
+        [],
+    )
+
+    event = build_scan_events(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: CandidateDecision(eligible=True)},
+        [],
+        [],
+        attention_candidates=result.all_candidates,
+        attention_coverage={
+            "raw_market_coverage_ratio": 1.0,
+            "eligible_context_coverage_ratio": 0.0,
+        },
+    )[0]
+
+    assert event.final_decision is ScanDecision.ATTENTION_QUEUED
+    assert event.attention_rank == 1
+    assert event.attention_stage == result.all_candidates[0].stage
+    assert event.attention_episode_id == result.all_candidates[0].episode_id
+    assert event.attention_primary_selected is False
+    assert event.attention_displayed is False
+    assert event.attention_v3_shadow_rank == 1
+    assert event.attention_v4_shadow_rank == 1
+    assert event.attention_ridge_rank == 1
+    assert event.attention_ridge_score is not None
+    assert event.attention_ridge_base_rank == 1
+    assert event.attention_ridge_base_ranking_score is not None
+    assert event.attention_score_version == config.ATTENTION_RIDGE_MODEL_VERSION
+    assert event.feature_snapshot["attention"]["lane"] == "data_limited"
+    assert event.feature_snapshot["attention"]["ridge_rank"] == 1
+    assert (
+        event.feature_snapshot["attention_coverage"]["raw_market_coverage_ratio"] == 1.0
+    )
+    assert event.rejection_reasons == [
+        RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE
+    ]
+
+
+def test_cooling_attention_item_is_not_logged_as_only_a_filter_rejection():
+    observed_at = datetime.datetime(2026, 6, 18, 0, 10, tzinfo=UTC)
+    ticker = TickerData(
+        market="KRW-BTC",
+        candle_history=[_candle(observed_at, 100.0, 101.0, 99.0)],
+        price_change_10m=0.1,
+    )
+    _, state = build_attention_queue(
+        observed_at,
+        [ticker.market],
+        {ticker.market: ticker},
+        {ticker.market: 3},
+        {},
+        [],
+        [],
+    )
+    cooling_result = build_attention_result(
+        observed_at + datetime.timedelta(minutes=10),
+        [],
+        {ticker.market: ticker},
+        {ticker.market: 5},
+        {ticker.market: 3},
+        [],
+        [],
+        previous_state=state,
+    )
+
+    event = build_scan_events(
+        observed_at + datetime.timedelta(minutes=10),
+        [ticker.market],
+        {ticker.market: ticker},
+        {
+            ticker.market: CandidateDecision(
+                eligible=False,
+                rejection_reasons=[RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD],
+            )
+        },
+        [],
+        [],
+        attention_candidates=cooling_result.all_candidates,
+    )[0]
+
+    assert event.final_decision is ScanDecision.ATTENTION_QUEUED
+    assert event.rejection_reasons == [
+        RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE,
+        RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD,
+    ]
 
 
 def test_scan_event_records_alert_selection_without_claiming_delivery():
@@ -223,8 +330,13 @@ def test_outcome_resolution_waits_for_complete_entry_path_and_uses_fixed_target(
         direction=Direction.LONG,
         signal_candle_start=signal_start,
     )
-    timestamps = [signal_start + datetime.timedelta(minutes=10 * step) for step in range(1, 8)]
-    candles = [_candle(timestamp, 100 + index, 102 + index, 98 + index) for index, timestamp in enumerate(timestamps)]
+    timestamps = [
+        signal_start + datetime.timedelta(minutes=10 * step) for step in range(1, 8)
+    ]
+    candles = [
+        _candle(timestamp, 100 + index, 102 + index, 98 + index)
+        for index, timestamp in enumerate(timestamps)
+    ]
 
     outcomes, pending = resolve_scan_outcomes([event], {"KRW-BTC": candles})
 
@@ -276,15 +388,15 @@ def test_outcome_resolution_retires_events_older_than_the_recoverable_candle_win
         signal_start + datetime.timedelta(days=3), 100.0, 101.0, 99.0
     )
 
-    outcomes, pending = resolve_scan_outcomes(
-        [event], {"KRW-BTC": [latest_benchmark]}
-    )
+    outcomes, pending = resolve_scan_outcomes([event], {"KRW-BTC": [latest_benchmark]})
 
     assert outcomes == []
     assert pending == []
 
 
-def test_event_and_pending_records_are_persisted_without_mutating_prior_records(monkeypatch):
+def test_event_and_pending_records_are_persisted_without_mutating_prior_records(
+    monkeypatch,
+):
     store = {}
 
     async def load_json(filename, _gcs_client, **_kwargs):
@@ -315,7 +427,9 @@ def test_event_and_pending_records_are_persisted_without_mutating_prior_records(
 
     assert len(pending) == 1
     assert pending[0] == event
-    event_logs = next(value for name, value in store.items() if name.startswith("scan_events_"))
+    event_logs = next(
+        value for name, value in store.items() if name.startswith("scan_events_")
+    )
     assert event_logs[0]["rejection_reasons"] == ["price_surprise_below_threshold"]
 
 
@@ -340,9 +454,7 @@ def test_conflicting_scan_event_retry_preserves_the_first_immutable_record(monke
         final_decision=ScanDecision.REJECTED_LIGHTWEIGHT,
         model_version="heuristic-v1",
     )
-    conflicting = original.model_copy(
-        update={"feature_snapshot": {"spread_bps": 99.0}}
-    )
+    conflicting = original.model_copy(update={"feature_snapshot": {"spread_bps": 99.0}})
     new_market = original.model_copy(
         update={"event_id": "event-2", "market": "KRW-ETH"}
     )
@@ -352,7 +464,9 @@ def test_conflicting_scan_event_retry_preserves_the_first_immutable_record(monke
         return await state_manager.append_scan_events([conflicting, new_market])
 
     conflicts = asyncio.run(persist_conflict())
-    event_logs = next(value for name, value in store.items() if name.startswith("scan_events_"))
+    event_logs = next(
+        value for name, value in store.items() if name.startswith("scan_events_")
+    )
 
     assert conflicts == ["event-1"]
     assert event_logs == [original.model_dump(mode="json")]

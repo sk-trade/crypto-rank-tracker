@@ -5,10 +5,14 @@ import pytest
 from unittest.mock import AsyncMock, Mock
 
 import main as app
+from common.attention import build_attention_queue
 from common.models import (
+    AttentionState,
     CandleData,
     CandidateDecision,
     DeliveryState,
+    EvidenceFamily,
+    EvidenceVerdict,
     MarketEvent,
     MarketTicker,
     MarketRegime,
@@ -36,6 +40,9 @@ def _market_ticker(market: str, turnover: float = 1.0) -> MarketTicker:
 def no_pending_notification(monkeypatch):
     monkeypatch.setattr(app, "recover_pending_notification", AsyncMock(return_value=None))
     monkeypatch.setattr(app, "complete_scan_key", AsyncMock())
+    monkeypatch.setattr(
+        app, "load_attention_state", AsyncMock(return_value=AttentionState())
+    )
 
 
 def test_cloud_function_entrypoint_returns_ok_when_run_check_succeeds(monkeypatch):
@@ -54,6 +61,17 @@ def test_cloud_function_entrypoint_returns_500_when_run_check_fails(monkeypatch)
     monkeypatch.setattr(app, "run_check", run_check_failure)
 
     assert app.main(None) == ("Internal Server Error", 500)
+
+
+def test_attention_briefing_uses_deterministic_half_hour_cadence():
+    assert app.attention_briefing_due(
+        datetime.datetime(2026, 7, 19, 1, 30, tzinfo=datetime.timezone.utc)
+    )
+    assert not app.attention_briefing_due(
+        datetime.datetime(2026, 7, 19, 1, 40, tzinfo=datetime.timezone.utc)
+    )
+    with pytest.raises(ValueError):
+        app.attention_briefing_due(datetime.datetime(2026, 7, 19, 1, 30))
 
 
 def test_run_check_dispatches_data_quality_incident_and_skips_market_briefing(monkeypatch):
@@ -187,27 +205,6 @@ def test_run_check_releases_claim_when_persistence_fails_before_notification(mon
     notify.assert_not_awaited()
 
 
-def test_unknown_regime_marks_candidate_decisions_for_event_logging():
-    decisions = {
-        "KRW-BTC": CandidateDecision(eligible=True),
-        "KRW-ETH": CandidateDecision(eligible=True),
-    }
-
-    assert (
-        app.record_market_regime_block(
-            ["KRW-BTC"],
-            decisions,
-            MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN),
-        )
-        == []
-    )
-    assert decisions["KRW-BTC"] == CandidateDecision(
-        eligible=False,
-        rejection_reasons=[RejectionCode.MARKET_REGIME_UNKNOWN],
-    )
-    assert decisions["KRW-ETH"] == CandidateDecision(eligible=True)
-
-
 def test_deep_dive_fetches_candidates_and_the_btc_benchmark_only():
     assert app.required_deep_dive_markets(["KRW-XRP", "KRW-BTC"]) == [
         "KRW-BTC",
@@ -215,9 +212,26 @@ def test_deep_dive_fetches_candidates_and_the_btc_benchmark_only():
     ]
 
 
-def test_run_check_scores_only_candidates_with_the_full_market_context(monkeypatch):
+def test_run_check_keeps_execution_risk_in_the_attention_pipeline(monkeypatch):
+    timestamp = datetime.datetime(2026, 7, 19, 1, 20, tzinfo=datetime.timezone.utc)
     lightweight = {
-        market: TickerData(market=market, price_change_10m=1.0)
+        market: TickerData(
+            market=market,
+            candle_history=[
+                CandleData(
+                    market=market,
+                    timestamp=timestamp,
+                    open_price=100.0,
+                    high_price=101.0,
+                    low_price=99.0,
+                    close_price=100.0,
+                    volume=10.0,
+                )
+            ],
+            price_change_10m=1.0,
+            relative_volume=3.0,
+            rolling_turnover=100_000_000.0,
+        )
         for market in ["KRW-BTC", "KRW-XRP", "KRW-ADA"]
     }
     decisions = {
@@ -232,11 +246,25 @@ def test_run_check_scores_only_candidates_with_the_full_market_context(monkeypat
         ),
     }
     broad_candles = {market: [] for market in lightweight}
-    higher_timeframe = {"KRW-BTC": [], "KRW-XRP": []}
+    hourly_context = {
+        market: lightweight[market].candle_history * 24 for market in lightweight
+    }
+    daily_context = {
+        market: lightweight[market].candle_history * 200 for market in lightweight
+    }
     get_candles = AsyncMock(
-        side_effect=[broad_candles, higher_timeframe, higher_timeframe]
+        side_effect=[broad_candles, hourly_context, daily_context]
     )
     detect = Mock(return_value=[])
+    _, previous_attention = build_attention_queue(
+        timestamp,
+        ["KRW-ADA"],
+        lightweight,
+        {"KRW-ADA": 3},
+        {},
+        [],
+        [],
+    )
     monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         app,
@@ -263,14 +291,27 @@ def test_run_check_scores_only_candidates_with_the_full_market_context(monkeypat
         "assess_execution",
         Mock(
             return_value=SimpleNamespace(
-                executable=True,
-                spread_bps=1.0,
-                expected_slippage_bps=1.0,
-                rejection_reasons=[],
+                executable=False,
+                spread_bps=45.0,
+                expected_slippage_bps=2.0,
+                rejection_reasons=[RejectionCode.SPREAD_ABOVE_MAXIMUM],
             )
         ),
     )
-    monkeypatch.setattr(app, "enrich_deep_dive_tickers", Mock(return_value={}))
+    def enrich_with_context(tickers, hourly, daily, _all_tickers):
+        return {
+            market: ticker.model_copy(
+                update={
+                    "hourly_candles": hourly.get(market, []),
+                    "daily_candles": daily.get(market, []),
+                }
+            )
+            for market, ticker in tickers.items()
+        }
+
+    monkeypatch.setattr(
+        app, "enrich_deep_dive_tickers", Mock(side_effect=enrich_with_context)
+    )
     monkeypatch.setattr(
         app,
         "get_market_regime",
@@ -280,22 +321,103 @@ def test_run_check_scores_only_candidates_with_the_full_market_context(monkeypat
     monkeypatch.setattr(app, "filter_market_wide_events", Mock(return_value=[]))
     monkeypatch.setattr(app, "load_pending_scan_events", AsyncMock(return_value=[]))
     monkeypatch.setattr(app, "load_alert_history", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        app, "load_attention_state", AsyncMock(return_value=previous_attention)
+    )
     monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
-    monkeypatch.setattr(app, "append_scan_events", AsyncMock(return_value=[]))
+    append_events = AsyncMock(return_value=[])
+    monkeypatch.setattr(app, "append_scan_events", append_events)
     monkeypatch.setattr(app, "append_scan_outcomes", AsyncMock())
     monkeypatch.setattr(app, "save_pending_scan_events", AsyncMock())
     monkeypatch.setattr(app, "save_rank_state_history", AsyncMock())
-    monkeypatch.setattr(app, "create_and_dispatch_notification", AsyncMock())
+    save_attention = AsyncMock()
+    monkeypatch.setattr(app, "save_attention_state", save_attention)
+    dispatch = AsyncMock()
+    monkeypatch.setattr(app, "create_and_dispatch_notification", dispatch)
 
     import asyncio
 
-    asyncio.run(app.run_check())
+    asyncio.run(app.run_check(schedule_time="2026-07-19T01:30:00Z"))
 
-    assert get_candles.await_args_list[1].args[1] == ["KRW-BTC", "KRW-XRP"]
-    assert get_candles.await_args_list[2].args[1] == ["KRW-BTC", "KRW-XRP"]
+    assert get_candles.await_args_list[1].args[1] == [
+        "KRW-ADA",
+        "KRW-BTC",
+        "KRW-XRP",
+    ]
+    assert get_candles.await_args_list[2].args[1] == [
+        "KRW-ADA",
+        "KRW-BTC",
+        "KRW-XRP",
+    ]
+    assert get_candles.await_args_list[1].kwargs["time_unit"] is app.CandleTimeUnit.MINUTES
+    assert get_candles.await_args_list[1].kwargs["minutes_unit"] == 60
+    assert get_candles.await_args_list[2].kwargs["time_unit"] is app.CandleTimeUnit.DAYS
     scored_markets, context, _sectors, _reverse = detect.call_args.args
     assert scored_markets == ["KRW-XRP"]
     assert set(context) == {"KRW-BTC", "KRW-XRP", "KRW-ADA"}
+    save_attention.assert_awaited_once()
+    saved_state = save_attention.await_args.args[0]
+    assert set(saved_state.entries) == {"KRW-ADA", "KRW-XRP"}
+    events = {event.market: event for event in append_events.await_args.args[0]}
+    assert events["KRW-XRP"].final_decision is ScanDecision.ATTENTION_QUEUED
+    assert events["KRW-ADA"].final_decision is ScanDecision.ATTENTION_QUEUED
+    assert (
+        RejectionCode.HIGHER_TIMEFRAME_CANDLE_HISTORY_UNAVAILABLE
+        not in events["KRW-ADA"].rejection_reasons
+    )
+    assert events["KRW-XRP"].feature_snapshot["execution_rejection_reasons"] == [
+        RejectionCode.SPREAD_ABOVE_MAXIMUM.value
+    ]
+    assert events["KRW-XRP"].feature_snapshot["attention_coverage"][
+        "eligible_context_coverage_ratio"
+    ] == 1.0
+    attention_queue = dispatch.await_args.kwargs["attention_queue"]
+    assert {candidate.market for candidate in attention_queue} == {
+        "KRW-ADA",
+        "KRW-XRP",
+    }
+    ada = next(candidate for candidate in attention_queue if candidate.market == "KRW-ADA")
+    ada_context = next(
+        item for item in ada.evidence if item.family is EvidenceFamily.CONTEXT
+    )
+    assert ada_context.verdict is not EvidenceVerdict.UNAVAILABLE
+    assert dispatch.await_args.kwargs["suppress_unchanged_briefing"] is True
+
+
+def test_historical_retry_skips_current_only_evidence_and_notifications(monkeypatch):
+    scan_at = datetime.datetime(2026, 7, 19, 1, 30, tzinfo=datetime.timezone.utc)
+    future_state = AttentionState(
+        updated_at=scan_at + datetime.timedelta(minutes=10)
+    )
+    monkeypatch.setattr(app, "load_rank_state_history", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        app, "load_attention_state", AsyncMock(return_value=future_state)
+    )
+    market_fetch = AsyncMock()
+    monkeypatch.setattr(app, "get_all_krw_tickers", market_fetch)
+    monkeypatch.setattr(app, "claim_scan_key", AsyncMock(return_value=True))
+    append_events = AsyncMock()
+    monkeypatch.setattr(app, "append_scan_events", append_events)
+    save_rank = AsyncMock()
+    monkeypatch.setattr(app, "save_rank_state_history", save_rank)
+    save_attention = AsyncMock()
+    monkeypatch.setattr(app, "save_attention_state", save_attention)
+    dispatch = AsyncMock()
+    monkeypatch.setattr(app, "create_and_dispatch_notification", dispatch)
+    build_result = Mock()
+    monkeypatch.setattr(app, "build_attention_result", build_result)
+
+    import asyncio
+
+    asyncio.run(app.run_check(schedule_time=scan_at.isoformat()))
+
+    market_fetch.assert_not_awaited()
+    build_result.assert_not_called()
+    append_events.assert_not_awaited()
+    save_rank.assert_not_awaited()
+    save_attention.assert_not_awaited()
+    dispatch.assert_not_awaited()
+    app.complete_scan_key.assert_awaited_once()
 
 
 def test_run_check_persists_events_for_every_market_after_a_valid_scan(monkeypatch):

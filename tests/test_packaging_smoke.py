@@ -4,6 +4,7 @@ from pathlib import Path
 
 def test_main_imports():
     import_module("main")
+    import_module("replay_upbit")
 
 
 def test_readme_documents_the_uncached_isolated_wheel_import_smoke():
@@ -11,4 +12,7 @@ def test_readme_documents_the_uncached_isolated_wheel_import_smoke():
 
     assert 'WHEEL_PATH="$(realpath dist/*.whl)"' in readme
     assert 'uv run --no-cache --isolated --with "$WHEEL_PATH"' in readme
-    assert "import main, update_sectors, config, common.upbit_client, common.notification.main" in readme
+    assert (
+        "import main, update_sectors, replay_upbit, config, "
+        "common.upbit_client, common.notification.main"
+    ) in readme
