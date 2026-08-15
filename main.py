@@ -333,6 +333,7 @@ async def run_check(
                 try:
                     await dispatch_data_quality_alert(
                         notification_issues,
+                        observed_at=scan_close_at,
                         gcs_client=gcs_client,
                         scan_key=scan_key,
                     )
@@ -582,6 +583,7 @@ async def run_check(
                 try:
                     await dispatch_data_quality_alert(
                         [conflict_issue],
+                        observed_at=scan_close_at,
                         gcs_client=gcs_client,
                         scan_key=scan_key,
                     )
@@ -613,6 +615,7 @@ async def run_check(
                     raw_tickers=raw_tickers, enriched_tickers=enriched_tickers, current_rankings=current_rankings,
                     previous_rankings=previous_rankings, SECTORS=sectors, REVERSE_SECTOR_MAP=reverse_sector_map,
                     final_alerts=final_alerts, alert_history=alert_history, market_regime=market_regime,
+                    observed_at=scan_close_at,
                     attention_queue=notification_attention_queue,
                     suppress_unchanged_briefing=True,
                     gcs_client=gcs_client, scan_key=scan_key,

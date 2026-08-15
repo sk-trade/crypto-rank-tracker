@@ -19,28 +19,68 @@ from common.models import (
     EvidenceVerdict,
     MarketTicker,
     MarketRegimeSnapshot,
+    RejectionCode,
     SignalType,
     TickerData,
 )
 
 
+KST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def _kst_clock(observed_at: datetime.datetime) -> str:
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("observed_at must be timezone-aware")
+    return observed_at.astimezone(KST).strftime("%H:%M")
+
+
 class NotificationFormatter:
     """분석된 데이터와 알림 객체를 기반으로 사용자 메시지를 생성하는 클래스입니다."""
 
-    def format_data_quality_alert(self, issues: List[DataQualityIssue]) -> str:
+    def format_data_quality_alert(
+        self,
+        issues: List[DataQualityIssue],
+        observed_at: datetime.datetime,
+    ) -> str:
         """Format an operational incident without presenting market analysis as valid."""
-        kst = datetime.timezone(datetime.timedelta(hours=9))
-        now_kst = datetime.datetime.now(kst)
-        details = "\n".join(
-            f"- [{issue.code.value}] {issue.message}" for issue in issues
-        )
+        details = "\n".join(self._format_data_quality_issue(issue) for issue in issues)
         return "\n".join(
             [
-                f"🚨 **시장 데이터 품질 장애 ({now_kst.strftime('%H:%M')} KST)**",
-                "이번 스캔의 시장 데이터가 기준에 미달해 시그널과 일반 브리핑을 생성하지 않았습니다.",
+                f"🚨 **시장 데이터 품질 장애 ({_kst_clock(observed_at)} KST 기준)**",
+                "이번 스캔은 시장 데이터가 안전 기준을 충족하지 못해 관심종목과 일반 브리핑을 제공하지 않았습니다.",
                 details,
+                "다음 예약 실행에서 새 시장 데이터를 다시 확인합니다.",
             ]
         )
+
+    def _format_data_quality_issue(self, issue: DataQualityIssue) -> str:
+        if issue.code is RejectionCode.CANDLE_COVERAGE_BELOW_MINIMUM:
+            successful = issue.details.get("successful_markets")
+            total = issue.details.get("total_markets")
+            success_rate = issue.details.get("success_rate")
+            minimum = issue.details.get("minimum_success_rate")
+            if all(
+                isinstance(value, (int, float))
+                for value in (successful, total, success_rate, minimum)
+            ):
+                return (
+                    f"- 10분 캔들 확보: {successful}/{total} ({success_rate:.1%}), "
+                    f"필요한 최소 {minimum:.0%}에 미달"
+                )
+            return "- 충분한 10분 캔들을 확보하지 못했습니다."
+        if issue.code is RejectionCode.BTC_CANDLE_HISTORY_UNAVAILABLE:
+            return "- 시장 기준점인 BTC의 완료된 10분 캔들을 확보하지 못했습니다."
+        if issue.code is RejectionCode.MARKET_UNIVERSE_EMPTY:
+            return "- Upbit KRW 시장 목록을 확보하지 못했습니다."
+        if issue.code is RejectionCode.IMMUTABLE_SCAN_EVENT_CONFLICT:
+            conflict_count = issue.details.get("conflicting_event_count")
+            suffix = (
+                f" ({conflict_count}건)"
+                if isinstance(conflict_count, int) and conflict_count > 0
+                else ""
+            )
+            return f"- 재시도 결과가 최초 저장된 스캔 근거와 달라 최초 기록을 유지했습니다{suffix}."
+        return "- 시장 데이터 검증에 실패했습니다."
 
     def format_daily_briefing(
         self,
@@ -53,21 +93,11 @@ class NotificationFormatter:
         REVERSE_SECTOR_MAP: Dict[str, List[str]],
         alert_history: Dict[str, AlertHistory],
         market_regime: MarketRegimeSnapshot,
+        observed_at: datetime.datetime,
         attention_queue: Optional[List[AttentionCandidate]] = None,
     ) -> str:
         """시장 브리핑 전체 메시지를 조립합니다."""
-        kst = datetime.timezone(datetime.timedelta(hours=9))
-        now_kst = datetime.datetime.now(kst)
-
-        parts = [f"📊 **업비트 마켓 브리핑 ({now_kst.strftime('%H:%M')} KST)**"]
-        parts.append(self._format_market_status(raw_tickers, enriched_tickers))
-
-        if leading_sectors_str := self._format_leading_sectors(
-            enriched_tickers, SECTORS
-        ):
-            parts.extend(
-                ["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str]
-            )
+        parts = [f"📊 **업비트 마켓 브리핑 ({_kst_clock(observed_at)} KST 기준)**"]
 
         if attention_queue:
             parts.extend(
@@ -84,8 +114,16 @@ class NotificationFormatter:
                     self._format_single_alert(alert, REVERSE_SECTOR_MAP, market_regime)
                 )
         elif not attention_queue:
-            parts.append("\n---")
-            parts.append("✅ 현재 관심 필터를 통과한 종목이 없습니다.")
+            parts.extend(["\n---", "✅ 현재 관심 필터를 통과한 종목이 없습니다."])
+
+        parts.extend(["\n---", self._format_market_status(raw_tickers, enriched_tickers)])
+
+        if leading_sectors_str := self._format_leading_sectors(
+            enriched_tickers, SECTORS
+        ):
+            parts.extend(
+                ["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str]
+            )
 
         parts.append(self._format_top_10_ranking(current_rankings, previous_rankings))
 
@@ -114,14 +152,8 @@ class NotificationFormatter:
             config.ATTENTION_RIDGE_MODEL_VERSION,
             config.ATTENTION_V3_MODEL_VERSION,
         }:
-            mode = (
-                "v5 ridge"
-                if config.ATTENTION_VISIBLE_MODEL
-                == config.ATTENTION_RIDGE_MODEL_VERSION
-                else "v3 rollback"
-            )
             lines = [
-                f"🎯 **관심종목 큐 · {mode} (주요 {len(visible)} / 전체 {len(candidates)})**"
+                f"🎯 **관심종목 큐 (주요 {len(visible)} / 전체 {len(candidates)})**"
             ]
             for candidate in sorted(
                 visible, key=lambda item: item.display_rank or 1_000_000
@@ -187,7 +219,6 @@ class NotificationFormatter:
             AttentionStage.COOLING: "약화",
             AttentionStage.FAILED: "구조실패",
         }
-        kst = datetime.timezone(datetime.timedelta(hours=9))
         symbol = candidate.market.removeprefix("KRW-")
         tags = reverse_sector_map.get(candidate.market, [])
         tag = f" · {tags[0]}" if tags else ""
@@ -200,7 +231,7 @@ class NotificationFormatter:
         if candidate.market_rank_delta:
             arrow = "↑" if candidate.market_rank_delta > 0 else "↓"
             market_rank += f" {arrow}{abs(candidate.market_rank_delta)}"
-        first_seen = candidate.first_seen_at.astimezone(kst).strftime("%H:%M")
+        first_seen = candidate.first_seen_at.astimezone(KST).strftime("%H:%M")
         chart_url = f"https://upbit.com/exchange?code=CRIX.UPBIT.{candidate.market}"
         lines = [
             f"{candidate.display_rank or candidate.lane_rank}. {marker} **{symbol}**{tag} "
@@ -474,7 +505,7 @@ class NotificationFormatter:
         icon = "🔥" if (candidate.price_change or 0) > 0 else "🧊"
         header = (
             f"{icon} **{market.removeprefix('KRW-')}{f' ({tag})' if tag else ''}: "
-            f"{signal_title}** (Signal score: {candidate.signal_score:.2f})"
+            f"{signal_title}**"
         )
 
         residual_score = ticker.residual_momentum_score

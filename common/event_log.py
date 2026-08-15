@@ -238,11 +238,15 @@ def resolve_scan_outcomes(
     holding = datetime.timedelta(
         minutes=PRIMARY_PERFORMANCE_TARGET.holding_period_minutes
     )
+    candles_by_market_and_time = {
+        market: {candle.timestamp: candle for candle in candles}
+        for market, candles in candles_by_market.items()
+    }
     latest_completed = max(
         (
-            candle.timestamp
-            for candles in candles_by_market.values()
-            for candle in candles
+            timestamp
+            for candles in candles_by_market_and_time.values()
+            for timestamp in candles
         ),
         default=None,
     )
@@ -258,10 +262,7 @@ def resolve_scan_outcomes(
             continue
         entry_start = event.signal_candle_start + interval
         exit_start = entry_start + holding
-        candles = {
-            candle.timestamp: candle
-            for candle in candles_by_market.get(event.market, [])
-        }
+        candles = candles_by_market_and_time.get(event.market, {})
         entry = candles.get(entry_start)
         exit_candle = candles.get(exit_start)
         path = [
