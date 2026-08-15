@@ -363,6 +363,27 @@ def _acquire_claim(
     return True, state
 
 
+def _complete_claim(state: ScanClaimState, scan_key: str) -> bool:
+    claim = next(
+        (claim for claim in state.claims if claim.scan_key == scan_key), None
+    )
+    if claim is None:
+        return False
+    claim.status = ScanClaimStatus.COMPLETED
+    claim.completed_at = datetime.datetime.now(datetime.timezone.utc)
+    return True
+
+
+def _release_claim(state: ScanClaimState, scan_key: str) -> bool:
+    remaining_claims = [
+        claim for claim in state.claims if claim.scan_key != scan_key
+    ]
+    if len(remaining_claims) == len(state.claims):
+        return False
+    state.claims = remaining_claims
+    return True
+
+
 def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
     os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
     lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
@@ -390,7 +411,9 @@ def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _complete_scan_key_locally(scan_key: str) -> None:
+def _mutate_scan_claim_state_locally(
+    scan_key: str, mutation: Callable[[ScanClaimState, str], bool]
+) -> None:
     os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
     lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
     state_path = os.path.join(config.LOCAL_STATE_DIR, IDEMPOTENCY_STATE_FILE_NAME)
@@ -402,13 +425,8 @@ def _complete_scan_key_locally(scan_key: str) -> None:
                     state = _decode_scan_claim_state(state_file.read())
             except FileNotFoundError:
                 return
-            claim = next(
-                (claim for claim in state.claims if claim.scan_key == scan_key), None
-            )
-            if claim is None:
+            if not mutation(state, scan_key):
                 return
-            claim.status = ScanClaimStatus.COMPLETED
-            claim.completed_at = datetime.datetime.now(datetime.timezone.utc)
             temporary_path = f"{state_path}.tmp"
             with open(temporary_path, "w", encoding="utf-8") as state_file:
                 json.dump(state.model_dump(mode="json"), state_file, ensure_ascii=False)
@@ -417,31 +435,14 @@ def _complete_scan_key_locally(scan_key: str) -> None:
             os.replace(temporary_path, state_path)
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _complete_scan_key_locally(scan_key: str) -> None:
+    _mutate_scan_claim_state_locally(scan_key, _complete_claim)
 
 
 def _release_scan_key_locally(scan_key: str) -> None:
-    os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
-    lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
-    state_path = os.path.join(config.LOCAL_STATE_DIR, IDEMPOTENCY_STATE_FILE_NAME)
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            try:
-                with open(state_path, encoding="utf-8") as state_file:
-                    state = _decode_scan_claim_state(state_file.read())
-            except FileNotFoundError:
-                return
-            state.claims = [
-                claim for claim in state.claims if claim.scan_key != scan_key
-            ]
-            temporary_path = f"{state_path}.tmp"
-            with open(temporary_path, "w", encoding="utf-8") as state_file:
-                json.dump(state.model_dump(mode="json"), state_file, ensure_ascii=False)
-                state_file.flush()
-                os.fsync(state_file.fileno())
-            os.replace(temporary_path, state_path)
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    _mutate_scan_claim_state_locally(scan_key, _release_claim)
 
 
 async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_client) -> bool:
@@ -488,7 +489,11 @@ async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_cl
     )
 
 
-async def _complete_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
+async def _mutate_scan_claim_state_in_gcs(
+    scan_key: str,
+    gcs_client,
+    mutation: Callable[[ScanClaimState, str], bool],
+) -> None:
     try:
         from google.api_core.exceptions import PreconditionFailed
     except ImportError as error:
@@ -509,13 +514,8 @@ async def _complete_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
         except PreconditionFailed:
             continue
         state = _decode_scan_claim_state(raw_state)
-        claim = next(
-            (claim for claim in state.claims if claim.scan_key == scan_key), None
-        )
-        if claim is None:
+        if not mutation(state, scan_key):
             return
-        claim.status = ScanClaimStatus.COMPLETED
-        claim.completed_at = datetime.datetime.now(datetime.timezone.utc)
         try:
             await asyncio.to_thread(
                 blob.upload_from_string,
@@ -529,45 +529,14 @@ async def _complete_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
     raise StateSaveError(
         StateErrorCode.CONCURRENT_UPDATE_EXHAUSTED, IDEMPOTENCY_STATE_FILE_NAME
     )
+
+
+async def _complete_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
+    await _mutate_scan_claim_state_in_gcs(scan_key, gcs_client, _complete_claim)
 
 
 async def _release_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
-    try:
-        from google.api_core.exceptions import PreconditionFailed
-    except ImportError as error:
-        raise StateBackendUnavailable(
-            StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
-        ) from error
-
-    blob = gcs_client.bucket(config.GCS_BUCKET_NAME).blob(IDEMPOTENCY_STATE_FILE_NAME)
-    for _ in range(5):
-        if not await asyncio.to_thread(blob.exists):
-            return
-        await asyncio.to_thread(blob.reload)
-        generation = int(blob.generation)
-        try:
-            raw_state = await asyncio.to_thread(
-                blob.download_as_text, if_generation_match=generation
-            )
-        except PreconditionFailed:
-            continue
-        state = _decode_scan_claim_state(raw_state)
-        state.claims = [
-            claim for claim in state.claims if claim.scan_key != scan_key
-        ]
-        try:
-            await asyncio.to_thread(
-                blob.upload_from_string,
-                json.dumps(state.model_dump(mode="json"), ensure_ascii=False),
-                content_type="application/json",
-                if_generation_match=generation,
-            )
-            return
-        except PreconditionFailed:
-            continue
-    raise StateSaveError(
-        StateErrorCode.CONCURRENT_UPDATE_EXHAUSTED, IDEMPOTENCY_STATE_FILE_NAME
-    )
+    await _mutate_scan_claim_state_in_gcs(scan_key, gcs_client, _release_claim)
 
 
 async def save_analysis_log(state: AnalysisState, gcs_client=None):
