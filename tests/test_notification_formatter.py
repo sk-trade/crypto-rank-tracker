@@ -8,6 +8,8 @@ from common.models import (
     AttentionStage,
     CandleData,
     DataQualityIssue,
+    MarketEvent,
+    MarketTicker,
     MarketRegime,
     MarketRegimeSnapshot,
     RejectionCode,
@@ -49,24 +51,35 @@ def test_formatter_labels_bearish_acceleration_alert():
     assert "하락 모멘텀 가속" in _header_for(SignalType.DOWNTREND_ACCELERATION)
 
 
-def test_formatter_labels_an_uncalibrated_signal_score_without_a_percentage():
+def test_formatter_omits_opaque_signal_score_from_alert_header():
     header = _header_for(SignalType.BREAKOUT_START)
 
-    assert "Signal score: 0.75" in header
+    assert "Signal score" not in header
     assert "신뢰도" not in header
 
 
 def test_data_quality_alert_does_not_claim_the_market_has_no_events():
+    observed_at = datetime.datetime(2026, 8, 14, 18, 30, tzinfo=datetime.timezone.utc)
     message = NotificationFormatter().format_data_quality_alert(
         [
             DataQualityIssue(
                 code=RejectionCode.CANDLE_COVERAGE_BELOW_MINIMUM,
                 message="10-minute candle coverage is below the configured minimum.",
+                details={
+                    "successful_markets": 268,
+                    "total_markets": 283,
+                    "success_rate": 268 / 283,
+                    "minimum_success_rate": 0.95,
+                },
             )
-        ]
+        ],
+        observed_at,
     )
 
     assert "데이터 품질 장애" in message
+    assert "03:30 KST 기준" in message
+    assert "268/283" in message
+    assert RejectionCode.CANDLE_COVERAGE_BELOW_MINIMUM.value not in message
     assert "특이사항 없음" not in message
 
 
@@ -116,12 +129,30 @@ def test_attention_queue_shows_progression_and_concrete_evidence_without_a_score
         [],
     )
 
-    rendered = NotificationFormatter()._format_attention_queue(
-        queue, {ticker.market: ["AI"]}
+    rendered = NotificationFormatter().format_daily_briefing(
+        alerts=[],
+        raw_tickers=[
+            MarketTicker(
+                market=ticker.market,
+                acc_trade_price_24h=100_000_000,
+                market_event=MarketEvent(warning=False, caution={}),
+            )
+        ],
+        enriched_tickers={ticker.market: ticker},
+        current_rankings={ticker.market: 42},
+        previous_rankings={ticker.market: 60},
+        SECTORS={},
+        REVERSE_SECTOR_MAP={ticker.market: ["AI"]},
+        alert_history={},
+        market_regime=MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN),
+        observed_at=observed_at,
+        attention_queue=queue,
     )
 
     assert queue[0].stage is AttentionStage.DISCOVERED
+    assert "09:00 KST 기준" in rendered
     assert "관심종목 큐" in rendered
+    assert rendered.index("관심종목 큐") < rendered.index("시장 현황")
     assert "KAITO" in rendered
     assert "24h #42 ↑18" in rendered
     assert "RVOL 10.80x" in rendered
@@ -219,7 +250,7 @@ def test_v3_rollback_formatter_preserves_visible_order_for_data_limited_cards(
         result.all_candidates, {}
     )
 
-    assert "v3 rollback" in rendered
+    assert "rollback" not in rendered
     assert rendered.index("**A**") < rendered.index("**B**")
 
 
@@ -265,7 +296,7 @@ def test_ridge_formatter_renders_selected_data_limited_card(monkeypatch):
 
     rendered = NotificationFormatter()._format_attention_queue([selected], {})
 
-    assert "v5 ridge" in rendered
+    assert "ridge" not in rendered
     assert "**A**" in rendered
 
 

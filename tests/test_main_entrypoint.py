@@ -382,6 +382,9 @@ def test_run_check_keeps_execution_risk_in_the_attention_pipeline(monkeypatch):
     )
     assert ada_context.verdict is not EvidenceVerdict.UNAVAILABLE
     assert dispatch.await_args.kwargs["suppress_unchanged_briefing"] is True
+    assert dispatch.await_args.kwargs["observed_at"] == datetime.datetime(
+        2026, 7, 19, 1, 30, tzinfo=datetime.timezone.utc
+    )
 
 
 def test_historical_retry_skips_current_only_evidence_and_notifications(monkeypatch):
@@ -722,3 +725,6 @@ def test_scheduler_retry_derives_the_scan_from_the_original_schedule_time(monkey
         gcs_client=None,
     )
     assert candles.await_args.kwargs["as_of"] == expected_time
+    assert app.dispatch_data_quality_alert.await_args.kwargs["observed_at"] == datetime.datetime(
+        2026, 7, 13, 15, 0, tzinfo=datetime.timezone.utc
+    )

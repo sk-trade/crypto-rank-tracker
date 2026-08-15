@@ -70,10 +70,14 @@ MAX_NOTIFICATION_BACKLOG = 144
 
 
 async def dispatch_data_quality_alert(
-    issues: List[DataQualityIssue], gcs_client=None, scan_key: str | None = None
+    issues: List[DataQualityIssue],
+    *,
+    observed_at: datetime.datetime,
+    gcs_client=None,
+    scan_key: str | None = None,
 ) -> DispatchResult:
     """Notify operators that market data is unusable without emitting a market briefing."""
-    message = NotificationFormatter().format_data_quality_alert(issues)
+    message = NotificationFormatter().format_data_quality_alert(issues, observed_at)
     result = await _queue_and_dispatch_notification(
         message,
         gcs_client=gcs_client,
@@ -105,6 +109,7 @@ async def create_and_dispatch_notification(
     REVERSE_SECTOR_MAP: Dict[str, List[str]],
     alert_history: Dict[str, AlertHistory], 
     market_regime: MarketRegimeSnapshot,
+    observed_at: Optional[datetime.datetime] = None,
     final_alerts: Optional[List[Alert]] = None,
     attention_queue: Optional[List[AttentionCandidate]] = None,
     suppress_unchanged_briefing: bool = False,
@@ -133,6 +138,7 @@ async def create_and_dispatch_notification(
         REVERSE_SECTOR_MAP=REVERSE_SECTOR_MAP,
         alert_history=alert_history,
         market_regime=market_regime,
+        observed_at=observed_at or datetime.datetime.now(datetime.timezone.utc),
         attention_queue=attention_queue or [],
     )
     
