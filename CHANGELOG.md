@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.7.0] - 2026-08-15
+
+### Changed
+
+- Moved the ranked attention queue to the top of market briefings so the next chart to inspect is visible before supporting market context.
+- Made notification timestamps reflect the analyzed scan time, including scheduler retries, and replaced internal model/error labels with user-facing status details.
+
+### Fixed
+
+- Reused per-market candle timestamp indexes while resolving outcomes instead of rebuilding the same lookup for every pending event.
+- Consolidated completed/released scan-claim state transitions across local and GCS persistence paths, avoiding duplicate write logic and no-op release writes.
+
 ## [0.6.0] - 2026-07-22
 
 ### Added
