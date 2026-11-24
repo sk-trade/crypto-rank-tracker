@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import config
 import common.notification.main as notification
+import config
 from common import state_manager
 from common.models import (
     Alert,
@@ -73,7 +73,7 @@ def _ticker() -> TickerData:
 def _legacy_alert_history_payload(
     signal_type: str, *, last_price: float = 102.0
 ) -> dict:
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     return {
         "KRW-BTC": {
             "market": "KRW-BTC",
@@ -90,8 +90,8 @@ def _legacy_alert_history_payload(
 def _process_signal_type(
     previous_signal_type: SignalType, current_price: float
 ) -> SignalType:
-    now = datetime.datetime.now(datetime.timezone.utc)
-    alerts = AlertEngine().process_signals(
+    now = datetime.datetime.now(datetime.UTC)
+    alerts = AlertEngine().select_alerts(
         candidates=[_candidate(current_price)],
         enriched_tickers={"KRW-BTC": _ticker()},
         history={
@@ -227,15 +227,13 @@ def test_migrated_sustained_history_remains_usable_by_typed_cooldown(
     history_path = tmp_path / config.ALERT_HISTORY_FILE_NAME
     history_path.write_text(
         json.dumps(
-            _legacy_alert_history_payload(
-                persisted_signal, last_price=last_price
-            )
+            _legacy_alert_history_payload(persisted_signal, last_price=last_price)
         ),
         encoding="utf-8",
     )
 
     history = asyncio.run(load_alert_history())
-    alerts = AlertEngine().process_signals(
+    alerts = AlertEngine().select_alerts(
         candidates=[_candidate(current_price)],
         enriched_tickers={"KRW-BTC": _ticker()},
         history=history,
@@ -279,7 +277,7 @@ def test_alert_history_expires_before_transition_classification(monkeypatch, tmp
     stale = _history(
         SignalType.BREAKOUT_START,
         100.0,
-        datetime.datetime.now(datetime.timezone.utc),
+        datetime.datetime.now(datetime.UTC),
         minutes_ago=25 * 60,
     )
     (tmp_path / config.ALERT_HISTORY_FILE_NAME).write_text(
@@ -305,8 +303,8 @@ def _briefing_args():
         "enriched_tickers": {},
         "current_rankings": {},
         "previous_rankings": {},
-        "SECTORS": {},
-        "REVERSE_SECTOR_MAP": {},
+        "markets_by_sector": {},
+        "sectors_by_market": {},
         "alert_history": {},
         "market_regime": MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN),
         "final_alerts": [_breakout_alert()],
@@ -337,7 +335,7 @@ def test_unchanged_attention_scan_skips_repeated_briefing(monkeypatch):
     args["attention_queue"] = []
     args["suppress_unchanged_briefing"] = True
 
-    result = asyncio.run(notification.create_and_dispatch_notification(**args))
+    result = asyncio.run(notification.format_and_dispatch_notification(**args))
 
     assert result.outcome is DispatchOutcome.SKIPPED
     assert result.detail == "no_material_attention_change"
@@ -351,18 +349,22 @@ def test_configured_webhook_failure_is_queued_and_retried(monkeypatch, tmp_path)
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "briefing",
+        lambda _self, **_kwargs: "briefing",
     )
     send = AsyncMock(
         side_effect=[
-            notification.DispatchResult(outcome=DispatchOutcome.FAILED, code=DispatchCode.HTTP_ERROR, status_code=500),
+            notification.DispatchResult(
+                outcome=DispatchOutcome.FAILED,
+                code=DispatchCode.HTTP_ERROR,
+                status_code=500,
+            ),
             notification.DispatchResult(outcome=DispatchOutcome.SENT),
         ]
     )
-    monkeypatch.setattr(notification, "send_notification", send)
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
-        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+        asyncio.run(notification.format_and_dispatch_notification(**_briefing_args()))
     assert error.value.code is NotificationErrorCode.DELIVERY_FAILED
 
     pending = asyncio.run(state_manager.load_notification_outbox())
@@ -390,7 +392,7 @@ def test_prepared_outbox_keeps_the_scan_handoff_durable_when_history_save_fails(
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "briefing",
+        lambda _self, **_kwargs: "briefing",
     )
     monkeypatch.setattr(
         notification,
@@ -398,11 +400,11 @@ def test_prepared_outbox_keeps_the_scan_handoff_durable_when_history_save_fails(
         AsyncMock(side_effect=RuntimeError("state write failed")),
     )
     send = AsyncMock()
-    monkeypatch.setattr(notification, "send_notification", send)
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
         asyncio.run(
-            notification.create_and_dispatch_notification(
+            notification.format_and_dispatch_notification(
                 **_briefing_args(), scan_key="scan-a"
             )
         )
@@ -432,13 +434,11 @@ def test_committed_initial_outbox_write_error_is_a_durable_handoff(monkeypatch):
     )
     monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
     send = AsyncMock()
-    monkeypatch.setattr(notification, "send_notification", send)
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
         asyncio.run(
-            notification._queue_and_dispatch_notification(
-                "briefing", scan_key="scan-a"
-            )
+            notification._queue_and_dispatch_notification("briefing", scan_key="scan-a")
         )
 
     assert error.value.scan_handoff_state is ScanHandoffState.DURABLE
@@ -463,9 +463,7 @@ def test_unreadable_initial_outbox_write_error_is_an_uncertain_handoff(monkeypat
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
         asyncio.run(
-            notification._queue_and_dispatch_notification(
-                "briefing", scan_key="scan-a"
-            )
+            notification._queue_and_dispatch_notification("briefing", scan_key="scan-a")
         )
 
     assert error.value.scan_handoff_state is not ScanHandoffState.DURABLE
@@ -490,9 +488,7 @@ def test_absent_initial_outbox_after_write_error_is_not_a_durable_handoff(
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
         asyncio.run(
-            notification._queue_and_dispatch_notification(
-                "briefing", scan_key="scan-a"
-            )
+            notification._queue_and_dispatch_notification("briefing", scan_key="scan-a")
         )
 
     assert error.value.scan_handoff_state is not ScanHandoffState.DURABLE
@@ -557,7 +553,7 @@ def test_webhook_request_uses_explicit_delivery_and_mention_metadata(monkeypatch
     monkeypatch.setattr(notification.aiohttp, "ClientSession", Session)
 
     result = asyncio.run(
-        notification.send_notification(
+        notification.send_webhook_notification(
             "@channel\nbriefing",
             delivery_id="delivery-1",
             mention_channel=True,
@@ -570,7 +566,7 @@ def test_webhook_request_uses_explicit_delivery_and_mention_metadata(monkeypatch
 
     request.clear()
     asyncio.run(
-        notification.send_notification(
+        notification.send_webhook_notification(
             "@channel is literal text",
             delivery_id="delivery-2",
         )
@@ -594,7 +590,7 @@ def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "briefing",
+        lambda _self, **_kwargs: "briefing",
     )
     outbox = None
     fail_clear = True
@@ -612,7 +608,9 @@ def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
     async def save_history(_value, _gcs_client=None):
         operation_order.append("history")
 
-    send = AsyncMock(return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT))
+    send = AsyncMock(
+        return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)
+    )
 
     async def ordered_send(_message, **_kwargs):
         operation_order.append("send")
@@ -621,10 +619,10 @@ def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
     monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
     monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
     monkeypatch.setattr(notification, "save_alert_history", save_history)
-    monkeypatch.setattr(notification, "send_notification", ordered_send)
+    monkeypatch.setattr(notification, "send_webhook_notification", ordered_send)
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
-        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+        asyncio.run(notification.format_and_dispatch_notification(**_briefing_args()))
 
     assert error.value.delivery_state is DeliveryState.CONFIRMED
     assert outbox.status is NotificationStatus.DELIVERED
@@ -632,7 +630,7 @@ def test_confirmed_send_with_failed_outbox_clear_is_not_repeated(monkeypatch):
 
     fail_clear = False
     resend = AsyncMock()
-    monkeypatch.setattr(notification, "send_notification", resend)
+    monkeypatch.setattr(notification, "send_webhook_notification", resend)
     result = asyncio.run(notification.recover_pending_notification())
 
     assert result.outcome is DispatchOutcome.SENT
@@ -655,7 +653,7 @@ def test_uncertain_attempt_is_preserved_for_operator_resolution(monkeypatch):
     send = AsyncMock()
     monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
     monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
-    monkeypatch.setattr(notification, "send_notification", send)
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
         asyncio.run(notification.recover_pending_notification())
@@ -675,7 +673,7 @@ def test_ambiguous_network_failure_keeps_attempting_outbox(monkeypatch):
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "briefing",
+        lambda _self, **_kwargs: "briefing",
     )
     outbox = None
 
@@ -687,15 +685,19 @@ def test_ambiguous_network_failure_keeps_attempting_outbox(monkeypatch):
         outbox = value
 
     send = AsyncMock(
-        return_value=notification.DispatchResult(outcome=DispatchOutcome.UNCERTAIN, code=DispatchCode.UNEXPECTED_ERROR, detail="response lost")
+        return_value=notification.DispatchResult(
+            outcome=DispatchOutcome.UNCERTAIN,
+            code=DispatchCode.UNEXPECTED_ERROR,
+            detail="response lost",
+        )
     )
     monkeypatch.setattr(notification, "load_notification_outbox", load_outbox)
     monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
     monkeypatch.setattr(notification, "save_alert_history", AsyncMock())
-    monkeypatch.setattr(notification, "send_notification", send)
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
-        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+        asyncio.run(notification.format_and_dispatch_notification(**_briefing_args()))
 
     assert error.value.code is NotificationErrorCode.DELIVERY_OUTCOME_UNCERTAIN
     assert error.value.delivery_state is DeliveryState.UNCERTAIN
@@ -738,7 +740,7 @@ def test_missing_webhook_preserves_an_ambiguous_attempt_and_cancels_deferred_wor
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(config, "WEBHOOK_URL", None)
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     attempted = _history(SignalType.BREAKOUT_START, 101.0, now, minutes_ago=0)
     deferred_history = attempted.model_copy(
         update={
@@ -747,14 +749,17 @@ def test_missing_webhook_preserves_an_ambiguous_attempt_and_cancels_deferred_wor
         }
     )
     active = _notification_record(
-            "active-delivery", "scan-active", kind=NotificationKind.ALERT, status=NotificationStatus.ATTEMPTING
-        ).model_copy(
-            update={
-                "alert_history": {"KRW-BTC": attempted},
-                "previous_alert_history": {},
-                "alert_markets": ["KRW-BTC"],
-            }
-        )
+        "active-delivery",
+        "scan-active",
+        kind=NotificationKind.ALERT,
+        status=NotificationStatus.ATTEMPTING,
+    ).model_copy(
+        update={
+            "alert_history": {"KRW-BTC": attempted},
+            "previous_alert_history": {},
+            "alert_markets": ["KRW-BTC"],
+        }
+    )
     deferred = _notification_record(
         "deferred-delivery", "scan-deferred", kind=NotificationKind.ALERT
     ).model_copy(
@@ -787,16 +792,22 @@ def test_missing_webhook_rolls_back_prepared_alert_history(monkeypatch, tmp_path
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "briefing",
+        lambda _self, **_kwargs: "briefing",
     )
     monkeypatch.setattr(
         notification,
-        "send_notification",
-        AsyncMock(return_value=notification.DispatchResult(outcome=DispatchOutcome.FAILED, code=DispatchCode.HTTP_ERROR, status_code=500)),
+        "send_webhook_notification",
+        AsyncMock(
+            return_value=notification.DispatchResult(
+                outcome=DispatchOutcome.FAILED,
+                code=DispatchCode.HTTP_ERROR,
+                status_code=500,
+            )
+        ),
     )
 
     with pytest.raises(notification.NotificationDeliveryError) as error:
-        asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+        asyncio.run(notification.format_and_dispatch_notification(**_briefing_args()))
     assert error.value.code is NotificationErrorCode.DELIVERY_FAILED
     assert "KRW-BTC" in asyncio.run(load_alert_history())
 
@@ -814,7 +825,7 @@ def test_new_alert_is_queued_behind_an_unresolved_outbox(monkeypatch, tmp_path):
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "new briefing",
+        lambda _self, **_kwargs: "new briefing",
     )
     active = NotificationOutbox(
         delivery_id="active-delivery",
@@ -825,10 +836,10 @@ def test_new_alert_is_queued_behind_an_unresolved_outbox(monkeypatch, tmp_path):
     )
     asyncio.run(state_manager.save_notification_outbox(active))
     send = AsyncMock()
-    monkeypatch.setattr(notification, "send_notification", send)
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     result = asyncio.run(
-        notification.create_and_dispatch_notification(
+        notification.format_and_dispatch_notification(
             **_briefing_args(), scan_key="scan-new"
         )
     )
@@ -951,7 +962,9 @@ def test_notification_backlog_capacity_failure_is_explicit(monkeypatch, tmp_path
     with pytest.raises(notification.NotificationDeliveryError) as error:
         asyncio.run(
             notification._queue_and_dispatch_notification(
-                "overflow", scan_key="scan-overflow", notification_kind=NotificationKind.DATA_QUALITY
+                "overflow",
+                scan_key="scan-overflow",
+                notification_kind=NotificationKind.DATA_QUALITY,
             )
         )
 
@@ -971,7 +984,9 @@ def test_malformed_notification_backlog_fails_closed(monkeypatch, tmp_path):
     assert error.value.code is StateErrorCode.INVALID_SCHEMA
 
 
-def test_recovery_promotes_deferred_notification_after_active_success(monkeypatch, tmp_path):
+def test_recovery_promotes_deferred_notification_after_active_success(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
@@ -991,8 +1006,10 @@ def test_recovery_promotes_deferred_notification_after_active_success(monkeypatc
     )
     asyncio.run(state_manager.save_notification_outbox(active))
     asyncio.run(state_manager.save_notification_backlog([deferred]))
-    send = AsyncMock(return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT))
-    monkeypatch.setattr(notification, "send_notification", send)
+    send = AsyncMock(
+        return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)
+    )
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     first = asyncio.run(notification.recover_pending_notification())
 
@@ -1014,7 +1031,7 @@ def test_briefing_recovery_reconciles_deferred_alert_history_after_queue_crash(
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     alert_history = _history(SignalType.BREAKOUT_START, 101.0, now, minutes_ago=0)
     active = _notification_record("active-delivery", "scan-active")
     deferred = _notification_record(
@@ -1030,8 +1047,10 @@ def test_briefing_recovery_reconciles_deferred_alert_history_after_queue_crash(
     asyncio.run(state_manager.save_notification_backlog([deferred]))
     monkeypatch.setattr(
         notification,
-        "send_notification",
-        AsyncMock(return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)),
+        "send_webhook_notification",
+        AsyncMock(
+            return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)
+        ),
     )
 
     result = asyncio.run(notification.recover_pending_notification())
@@ -1051,8 +1070,10 @@ def test_recovery_deduplicates_a_promoted_record_left_in_the_backlog(
     deferred = _notification_record("deferred-delivery", "scan-deferred")
     asyncio.run(state_manager.save_notification_outbox(active))
     asyncio.run(state_manager.save_notification_backlog([active, deferred]))
-    send = AsyncMock(return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT))
-    monkeypatch.setattr(notification, "send_notification", send)
+    send = AsyncMock(
+        return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)
+    )
+    monkeypatch.setattr(notification, "send_webhook_notification", send)
 
     result = asyncio.run(notification.recover_pending_notification())
 
@@ -1068,12 +1089,8 @@ def test_earlier_delivery_preserves_and_rebases_a_later_alert_for_the_same_marke
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
-    old_timestamp = datetime.datetime.now(
-        datetime.timezone.utc
-    ) - datetime.timedelta(hours=25)
-    breakout = _history(
-        SignalType.BREAKOUT_START, 101.0, old_timestamp, minutes_ago=0
-    )
+    old_timestamp = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=25)
+    breakout = _history(SignalType.BREAKOUT_START, 101.0, old_timestamp, minutes_ago=0)
     breakout.last_alert_timestamp = old_timestamp
     breakout.initial_timestamp = old_timestamp
     acceleration = breakout.model_copy(
@@ -1107,8 +1124,10 @@ def test_earlier_delivery_preserves_and_rebases_a_later_alert_for_the_same_marke
     asyncio.run(state_manager.save_notification_backlog([deferred]))
     monkeypatch.setattr(
         notification,
-        "send_notification",
-        AsyncMock(return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)),
+        "send_webhook_notification",
+        AsyncMock(
+            return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)
+        ),
     )
 
     result = asyncio.run(notification.recover_pending_notification())
@@ -1129,14 +1148,18 @@ def test_earlier_delivery_preserves_and_rebases_a_later_alert_for_the_same_marke
     assert canceled.outcome is DispatchOutcome.SKIPPED
     rolled_back = asyncio.run(load_alert_history())["KRW-BTC"]
     assert rolled_back.last_signal_type is SignalType.BREAKOUT_START
-    assert rolled_back.last_alert_timestamp == refreshed_predecessor.last_alert_timestamp
+    assert (
+        rolled_back.last_alert_timestamp == refreshed_predecessor.last_alert_timestamp
+    )
 
 
-def test_missing_webhook_rolls_back_active_and_deferred_alert_history(monkeypatch, tmp_path):
+def test_missing_webhook_rolls_back_active_and_deferred_alert_history(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(config, "WEBHOOK_URL", None)
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     btc = _history(SignalType.BREAKOUT_START, 101.0, now, minutes_ago=0)
     eth = btc.model_copy(
         update={"market": "KRW-ETH", "last_price": 202.0, "initial_price": 202.0}
@@ -1175,10 +1198,8 @@ def test_missing_webhook_rolls_back_active_and_deferred_alert_history(monkeypatc
 
 def test_delayed_delivery_refreshes_the_alert_cooldown_timestamp(monkeypatch):
     monkeypatch.setattr(config, "WEBHOOK_URL", "https://example.invalid/webhook")
-    old_timestamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=25)
-    history = _history(
-        SignalType.BREAKOUT_START, 101.0, old_timestamp, minutes_ago=0
-    )
+    old_timestamp = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=25)
+    history = _history(SignalType.BREAKOUT_START, 101.0, old_timestamp, minutes_ago=0)
     history.last_alert_timestamp = old_timestamp
     history.initial_timestamp = old_timestamp
     outbox = NotificationOutbox(
@@ -1202,8 +1223,10 @@ def test_delayed_delivery_refreshes_the_alert_cooldown_timestamp(monkeypatch):
     monkeypatch.setattr(notification, "save_alert_history", save_history)
     monkeypatch.setattr(
         notification,
-        "send_notification",
-        AsyncMock(return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)),
+        "send_webhook_notification",
+        AsyncMock(
+            return_value=notification.DispatchResult(outcome=DispatchOutcome.SENT)
+        ),
     )
 
     asyncio.run(notification.recover_pending_notification())
@@ -1219,14 +1242,16 @@ def test_missing_webhook_skips_without_outbox_or_history_mutation(monkeypatch):
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "briefing",
+        lambda _self, **_kwargs: "briefing",
     )
     save_outbox = AsyncMock()
     save_history = AsyncMock()
     monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
     monkeypatch.setattr(notification, "save_alert_history", save_history)
 
-    result = asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+    result = asyncio.run(
+        notification.format_and_dispatch_notification(**_briefing_args())
+    )
 
     assert result.outcome is DispatchOutcome.SKIPPED
     save_outbox.assert_not_awaited()
@@ -1243,12 +1268,14 @@ def test_missing_webhook_shadow_mode_persists_isolated_cooldown_history(
     monkeypatch.setattr(
         notification.NotificationFormatter,
         "format_daily_briefing",
-        lambda self, **kwargs: "briefing",
+        lambda _self, **_kwargs: "briefing",
     )
     save_outbox = AsyncMock()
     monkeypatch.setattr(notification, "save_notification_outbox", save_outbox)
 
-    result = asyncio.run(notification.create_and_dispatch_notification(**_briefing_args()))
+    result = asyncio.run(
+        notification.format_and_dispatch_notification(**_briefing_args())
+    )
 
     assert result.outcome is DispatchOutcome.SKIPPED
     save_outbox.assert_not_awaited()
@@ -1259,9 +1286,12 @@ def test_missing_webhook_shadow_mode_persists_isolated_cooldown_history(
 
     history = asyncio.run(load_alert_history())
     assert history["KRW-BTC"].last_signal_type is SignalType.BREAKOUT_START
-    assert AlertEngine().process_signals(
-        [_candidate(101.0)], {"KRW-BTC": _ticker()}, history
-    ) == []
+    assert (
+        AlertEngine().select_alerts(
+            [_candidate(101.0)], {"KRW-BTC": _ticker()}, history
+        )
+        == []
+    )
 
 
 def test_process_signals_classifies_downtrend_follow_up_as_acceleration():
@@ -1293,16 +1323,14 @@ def test_process_signals_classifies_followup_bear_failed_as_bear_failed():
 
 
 def test_prior_downtrend_acceleration_with_continued_lower_price_is_acceleration():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     engine = AlertEngine()
 
-    signal_type, _, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._classify_alert_transition(
         candidate=_candidate(98.0),
         ticker=_ticker(),
         history={
-            "KRW-BTC": _history(
-                SignalType.DOWNTREND_ACCELERATION, 100.0, now
-            ),
+            "KRW-BTC": _history(SignalType.DOWNTREND_ACCELERATION, 100.0, now),
         },
     )
 
@@ -1310,16 +1338,14 @@ def test_prior_downtrend_acceleration_with_continued_lower_price_is_acceleration
 
 
 def test_prior_downtrend_acceleration_with_rebound_is_bear_failed():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     engine = AlertEngine()
 
-    signal_type, _, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._classify_alert_transition(
         candidate=_candidate(102.0),
         ticker=_ticker(),
         history={
-            "KRW-BTC": _history(
-                SignalType.DOWNTREND_ACCELERATION, 100.0, now
-            ),
+            "KRW-BTC": _history(SignalType.DOWNTREND_ACCELERATION, 100.0, now),
         },
     )
 
@@ -1327,10 +1353,10 @@ def test_prior_downtrend_acceleration_with_rebound_is_bear_failed():
 
 
 def test_prior_momentum_acceleration_with_continued_upside_is_acceleration():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     engine = AlertEngine()
 
-    signal_type, _, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._classify_alert_transition(
         candidate=_candidate(102.0),
         ticker=_ticker(),
         history={
@@ -1342,10 +1368,10 @@ def test_prior_momentum_acceleration_with_continued_upside_is_acceleration():
 
 
 def test_prior_momentum_acceleration_with_reversal_down_is_bull_failed():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     engine = AlertEngine()
 
-    signal_type, _, _ = engine._get_alert_type_and_priority(
+    signal_type, _, _ = engine._classify_alert_transition(
         candidate=_candidate(97.0),
         ticker=_ticker(),
         history={
@@ -1357,9 +1383,9 @@ def test_prior_momentum_acceleration_with_reversal_down_is_bull_failed():
 
 
 def test_bullish_continuation_below_threshold_is_suppressed_during_cooldown():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
 
-    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+    signal_type, _, _ = AlertEngine()._classify_alert_transition(
         candidate=_candidate(100.99),
         ticker=_ticker(),
         history={"KRW-BTC": _history(SignalType.BREAKOUT_START, 100.0, now)},
@@ -1369,9 +1395,9 @@ def test_bullish_continuation_below_threshold_is_suppressed_during_cooldown():
 
 
 def test_bearish_continuation_at_threshold_is_allowed_during_cooldown():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
 
-    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+    signal_type, _, _ = AlertEngine()._classify_alert_transition(
         candidate=_candidate(99.0),
         ticker=_ticker(),
         history={"KRW-BTC": _history(SignalType.BREAKDOWN_START, 100.0, now)},
@@ -1381,9 +1407,9 @@ def test_bearish_continuation_at_threshold_is_allowed_during_cooldown():
 
 
 def test_small_continuation_is_allowed_after_cooldown_expires():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
 
-    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+    signal_type, _, _ = AlertEngine()._classify_alert_transition(
         candidate=_candidate(100.01),
         ticker=_ticker(),
         history={
@@ -1400,9 +1426,9 @@ def test_small_continuation_is_allowed_after_cooldown_expires():
 
 
 def test_structure_failure_is_allowed_during_cooldown():
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
 
-    signal_type, _, _ = AlertEngine()._get_alert_type_and_priority(
+    signal_type, _, _ = AlertEngine()._classify_alert_transition(
         candidate=_candidate(99.0),
         ticker=_ticker(),
         history={"KRW-BTC": _history(SignalType.BREAKOUT_START, 100.0, now)},

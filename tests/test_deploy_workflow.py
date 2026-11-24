@@ -28,7 +28,10 @@ def test_all_pull_requests_verify_but_only_main_can_deploy():
     assert 'branches: ["main"]' in workflow
     assert "workflow_dispatch:" in workflow
     assert "needs: verify" in workflow
-    assert "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'" in workflow
+    assert (
+        "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'"
+        in workflow
+    )
 
 
 def test_scheduler_update_does_not_delete_the_existing_job():
@@ -36,7 +39,7 @@ def test_scheduler_update_does_not_delete_the_existing_job():
 
     assert "gcloud scheduler jobs update http crypto-rank-tracker-scheduler" in workflow
     assert "gcloud scheduler jobs delete" not in workflow
-    assert "--oidc-token-audience=\"$FUNCTION_URL\"" in workflow
+    assert '--oidc-token-audience="$FUNCTION_URL"' in workflow
 
 
 def test_scheduler_retries_failed_webhook_executions_with_bounded_backoff():
@@ -57,16 +60,14 @@ def test_scheduler_identity_is_authorized_to_invoke_the_gen2_service():
 
 
 def test_sector_updater_uses_the_runtime_storage_identity():
-    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+    workflow = Path(".github/workflows/update-sectors.yaml").read_text(encoding="utf-8")
 
     assert "GCP_RUNTIME_SA_EMAIL" in workflow
     assert "GCP_SA_EMAIL" not in workflow
 
 
 def test_sector_updates_are_serialized_across_schedule_and_manual_runs():
-    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(
-        encoding="utf-8"
-    )
+    workflow = Path(".github/workflows/update-sectors.yaml").read_text(encoding="utf-8")
 
     assert "group: crypto-rank-tracker-sector-update" in workflow
     assert "cancel-in-progress: false" in workflow
@@ -75,42 +76,53 @@ def test_sector_updates_are_serialized_across_schedule_and_manual_runs():
 def test_deploy_verification_compiles_every_shipped_python_entrypoint():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
-    assert "uv run python -m compileall main.py config.py update_sectors.py common tests" in workflow
+    assert (
+        "uv run python -m compileall main.py config.py update_sectors.py replay_upbit.py common tests"
+        in workflow
+    )
 
 
-def test_pull_request_verification_runs_ruff_before_pytest():
+def test_pull_request_verification_runs_lint_and_format_before_pytest():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
     lint_command = "uv run ruff check ."
+    format_command = "uv run ruff format --check ."
     test_command = "uv run python -m pytest"
     assert lint_command in workflow
-    assert workflow.index(lint_command) < workflow.index(test_command)
+    assert format_command in workflow
+    assert workflow.index(lint_command) < workflow.index(format_command)
+    assert workflow.index(format_command) < workflow.index(test_command)
 
 
 def test_deploy_verification_imports_every_required_module_from_the_wheel():
     workflow = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
 
     assert 'WHEEL_PATH="$(realpath dist/*.whl)"' in workflow
-    assert "uv run --no-cache --isolated --with \"$WHEEL_PATH\"" in workflow
-    assert "import main, update_sectors, config, common.upbit_client, common.notification.main" in workflow
+    assert 'uv run --no-cache --isolated --with "$WHEEL_PATH"' in workflow
+    assert (
+        "import main, update_sectors, replay_upbit, config, common.upbit_client, common.notification.main"
+        in workflow
+    )
 
 
 def test_production_workflows_require_shared_gcs_state():
     deploy = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
-    sectors = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+    sectors = Path(".github/workflows/update-sectors.yaml").read_text(encoding="utf-8")
 
     assert "STATE_STORAGE_METHOD=GCS" in deploy
     assert "STATE_STORAGE_METHOD: GCS" in sectors
     assert "vars.STATE_STORAGE_METHOD" not in deploy
     assert "vars.STATE_STORAGE_METHOD" not in sectors
-    expected_error = "GCS_BUCKET_NAME repository variable is required for durable production state."
+    expected_error = (
+        "GCS_BUCKET_NAME repository variable is required for durable production state."
+    )
     assert expected_error in deploy
     assert expected_error in sectors
 
 
 def test_production_workflows_select_the_explicit_gcp_project():
     deploy = Path(".github/workflows/deploy.yaml").read_text(encoding="utf-8")
-    sectors = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+    sectors = Path(".github/workflows/update-sectors.yaml").read_text(encoding="utf-8")
 
     expected_error = "GCP_PROJECT_ID repository secret is required"
     assert expected_error in deploy
@@ -118,17 +130,19 @@ def test_production_workflows_select_the_explicit_gcp_project():
     assert "project_id: ${{ secrets.GCP_PROJECT_ID }}" in deploy
     assert "project_id: ${{ secrets.GCP_PROJECT_ID }}" in sectors
     assert "GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}" in deploy
-    assert "--project=\"${{ secrets.GCP_PROJECT_ID }}\"" in deploy
+    assert '--project="${{ secrets.GCP_PROJECT_ID }}"' in deploy
 
 
 def test_sector_updater_restricts_manual_production_writes_to_main():
-    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+    workflow = Path(".github/workflows/update-sectors.yaml").read_text(encoding="utf-8")
 
-    assert "github.event_name == 'schedule' || github.ref == 'refs/heads/main'" in workflow
+    assert (
+        "github.event_name == 'schedule' || github.ref == 'refs/heads/main'" in workflow
+    )
 
 
 def test_sector_updater_receives_symbol_overrides():
-    workflow = Path(".github/workflows/updaet-sectors.yaml").read_text(encoding="utf-8")
+    workflow = Path(".github/workflows/update-sectors.yaml").read_text(encoding="utf-8")
 
     assert "CG_SYMBOL_OVERRIDES: ${{ vars.CG_SYMBOL_OVERRIDES || '{}' }}" in workflow
 

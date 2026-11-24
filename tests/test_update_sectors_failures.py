@@ -34,13 +34,13 @@ class DummySession:
     def __init__(self, payload):
         self.payload = payload
 
-    def get(self, *args, **kwargs):
+    def get(self, *_args, **_kwargs):
         return DummyResponse(self.payload)
 
 
 def test_upbit_market_collection_returns_typed_listings():
     result = asyncio.run(
-        update_sectors.get_upbit_krw_markets(
+        update_sectors.fetch_upbit_krw_market_listings(
             DummySession(
                 [
                     {
@@ -63,10 +63,12 @@ def test_upbit_market_collection_returns_typed_listings():
 
 def test_main_raises_when_upbit_markets_empty(monkeypatch):
     monkeypatch.setattr(update_sectors.config, "STATE_STORAGE_METHOD", "LOCAL")
-    monkeypatch.setattr(update_sectors, "get_upbit_krw_markets", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        update_sectors, "fetch_upbit_krw_market_listings", AsyncMock(return_value={})
+    )
     monkeypatch.setattr(
         update_sectors,
-        "get_coingecko_coins_list",
+        "fetch_coingecko_coin_ids_by_symbol",
         AsyncMock(return_value={"btc": ["bitcoin"]}),
     )
     monkeypatch.setattr(update_sectors, "save_json", pytest.fail)
@@ -81,7 +83,7 @@ def test_main_raises_when_upbit_markets_empty(monkeypatch):
     monkeypatch.setattr(aiohttp, "ClientSession", DummyClientSession)
 
     with pytest.raises(update_sectors.SectorUpdateError) as error:
-        asyncio.run(update_sectors.main())
+        asyncio.run(update_sectors.run_sector_update())
     assert (
         error.value.code
         is update_sectors.SectorUpdateErrorCode.UPBIT_MARKETS_UNAVAILABLE
@@ -92,10 +94,12 @@ def test_main_raises_when_coingecko_symbols_empty(monkeypatch):
     monkeypatch.setattr(update_sectors.config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(
         update_sectors,
-        "get_upbit_krw_markets",
+        "fetch_upbit_krw_market_listings",
         AsyncMock(return_value={"btc": MarketListing(market="KRW-BTC")}),
     )
-    monkeypatch.setattr(update_sectors, "get_coingecko_coins_list", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        update_sectors, "fetch_coingecko_coin_ids_by_symbol", AsyncMock(return_value={})
+    )
     monkeypatch.setattr(update_sectors, "save_json", pytest.fail)
 
     class DummyClientSession:
@@ -108,7 +112,7 @@ def test_main_raises_when_coingecko_symbols_empty(monkeypatch):
     monkeypatch.setattr(aiohttp, "ClientSession", DummyClientSession)
 
     with pytest.raises(update_sectors.SectorUpdateError) as error:
-        asyncio.run(update_sectors.main())
+        asyncio.run(update_sectors.run_sector_update())
     assert (
         error.value.code
         is update_sectors.SectorUpdateErrorCode.COINGECKO_LIST_UNAVAILABLE
@@ -119,17 +123,17 @@ def test_main_reraises_save_json_failure(monkeypatch):
     monkeypatch.setattr(update_sectors.config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(
         update_sectors,
-        "get_upbit_krw_markets",
+        "fetch_upbit_krw_market_listings",
         AsyncMock(return_value={"btc": MarketListing(market="KRW-BTC")}),
     )
     monkeypatch.setattr(
         update_sectors,
-        "get_coingecko_coins_list",
+        "fetch_coingecko_coin_ids_by_symbol",
         AsyncMock(return_value={"btc": ["bitcoin"]}),
     )
     monkeypatch.setattr(
         update_sectors,
-        "tag_market",
+        "resolve_market_sector_tags",
         AsyncMock(
             return_value=SectorTagResult(
                 market="KRW-BTC",
@@ -140,7 +144,7 @@ def test_main_reraises_save_json_failure(monkeypatch):
     )
     monkeypatch.setattr(update_sectors, "load_json", AsyncMock(return_value=None))
 
-    async def raise_save(*args, **kwargs):
+    async def raise_save(*_args, **_kwargs):
         raise StateSaveError(
             StateErrorCode.WRITE_FAILED, update_sectors.config.SECTOR_MAP_FILE_NAME
         )
@@ -157,5 +161,5 @@ def test_main_reraises_save_json_failure(monkeypatch):
     monkeypatch.setattr(aiohttp, "ClientSession", DummyClientSession)
 
     with pytest.raises(StateSaveError) as error:
-        asyncio.run(update_sectors.main())
+        asyncio.run(update_sectors.run_sector_update())
     assert error.value.code is StateErrorCode.WRITE_FAILED

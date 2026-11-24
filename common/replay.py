@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import datetime
 import statistics
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
+from typing import Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 import config
-from common.analysis.deep_dive import enrich_deep_dive_tickers, get_market_regime
+from common.analysis.deep_dive import (
+    classify_market_regime,
+    enrich_tickers_with_higher_timeframes,
+)
 from common.analysis.scanner import (
+    build_lightweight_tickers,
     evaluate_candidate_eligibility,
-    process_lightweight_indicators,
 )
 from common.attention import (
     attention_briefing_due,
@@ -24,14 +28,14 @@ from common.attention import (
     rank_structure_candidates,
 )
 from common.models import (
+    AttentionCandidate,
     AttentionStage,
     AttentionState,
     CandleData,
     MarketRegimeSnapshot,
 )
 from common.residuals import assign_residual_momentum
-from common.signals.detector import detect_anomalies, filter_market_wide_events
-
+from common.signals.detector import detect_anomalies, filter_market_wide_candidates
 
 REPLAY_VARIANT_BASELINE = "turnover_baseline"
 REPLAY_VARIANT_FILTER = "activity_price_filter"
@@ -99,7 +103,7 @@ class ReplayReport(BaseModel):
     eligible_context_coverage_ratio: float
     warmup_10m_bars: int
     warmup_daily_bars: int
-    variants: Dict[str, ReplayVariantMetrics]
+    variants: dict[str, ReplayVariantMetrics]
     precision_lift_vs_turnover: float | None
     recall_lift_vs_turnover: float | None
     structure_precision_lift: float | None
@@ -121,7 +125,7 @@ class ReplayReport(BaseModel):
     attention_episode_median_time_to_1pct_minutes: float | None
     attention_episode_median_time_to_2pct_minutes: float | None
     attention_yield: float | None
-    attention_stage_metrics: Dict[str, ReplayStageMetrics]
+    attention_stage_metrics: dict[str, ReplayStageMetrics]
     attention_visible_observations: int
     attention_repeated_observations: int
     average_attention_observations_per_episode: float | None
@@ -131,7 +135,7 @@ class ReplayReport(BaseModel):
     unchanged_repeat_observations: int
     scheduled_digest_scans: int
     nonempty_digest_scans: int
-    warnings: List[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
     def to_markdown(self) -> str:
         lines = [
@@ -311,7 +315,7 @@ class _FutureOutcome:
 class _StageAccumulator:
     observations: int = 0
     meaningful_observations: int = 0
-    mfe_120m: List[float] = field(default_factory=list)
+    mfe_120m: list[float] = field(default_factory=list)
 
     def add(self, outcome: _FutureOutcome) -> None:
         self.observations += 1
@@ -338,13 +342,13 @@ class _VariantAccumulator:
     true_positive_observations: int = 0
     meaningful_mover_observations: int = 0
     universe_observations: int = 0
-    selected_counts: List[int] = field(default_factory=list)
-    mfe_30m: List[float] = field(default_factory=list)
-    mfe_60m: List[float] = field(default_factory=list)
-    mfe_120m: List[float] = field(default_factory=list)
-    time_to_1pct: List[int] = field(default_factory=list)
-    time_to_2pct: List[int] = field(default_factory=list)
-    last_selected_at: Dict[str, datetime.datetime] = field(default_factory=dict)
+    selected_counts: list[int] = field(default_factory=list)
+    mfe_30m: list[float] = field(default_factory=list)
+    mfe_60m: list[float] = field(default_factory=list)
+    mfe_120m: list[float] = field(default_factory=list)
+    time_to_1pct: list[int] = field(default_factory=list)
+    time_to_2pct: list[int] = field(default_factory=list)
+    last_selected_at: dict[str, datetime.datetime] = field(default_factory=dict)
 
     def add(
         self,
@@ -435,7 +439,7 @@ def replay_daily_bar_count(evaluation_days: int) -> int:
 
 def replay_feature_history(
     candles: Sequence[CandleData], index: int
-) -> List[CandleData]:
+) -> list[CandleData]:
     """Build the same three weekly samples plus recent bars used by live scans."""
     bars_per_week = 7 * 24 * (60 // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES)
     recent_start = index - config.RECENT_SCAN_HISTORY_BARS + 1
@@ -451,11 +455,11 @@ def replay_feature_history(
 
 def aggregate_hourly_candles(
     candles_by_market: Mapping[str, Sequence[CandleData]],
-) -> Dict[str, List[CandleData]]:
+) -> dict[str, list[CandleData]]:
     """Aggregate synthesized 10-minute histories into fully completed UTC hours."""
-    result: Dict[str, List[CandleData]] = {}
+    result: dict[str, list[CandleData]] = {}
     for market, candles in candles_by_market.items():
-        groups: Dict[datetime.datetime, List[CandleData]] = {}
+        groups: dict[datetime.datetime, list[CandleData]] = {}
         for candle in candles:
             hour = candle.timestamp.replace(minute=0, second=0, microsecond=0)
             groups.setdefault(hour, []).append(candle)
@@ -489,24 +493,80 @@ def aggregate_hourly_candles(
     return result
 
 
-def run_point_in_time_replay(
-    candles_10m: Mapping[str, Sequence[CandleData]],
-    candles_daily: Mapping[str, Sequence[CandleData]],
-    sectors: Mapping[str, List[str]],
-    reverse_sector_map: Mapping[str, List[str]],
-    *,
-    evaluation_days: int = config.REPLAY_DEFAULT_EVALUATION_DAYS,
-    source_evaluation_days: int | None = None,
-    top_k: int = config.REPLAY_DEFAULT_TOP_K,
-    requested_market_count: int | None = None,
-    progress: Callable[[int, int, datetime.datetime], None] | None = None,
-    observation_sink: Callable[[Dict[str, Any]], None] | None = None,
-) -> ReplayReport:
-    """Replay production feature functions at each completed 10-minute decision point."""
-    _validate_evaluation_days(evaluation_days)
-    source_days = (
-        evaluation_days if source_evaluation_days is None else source_evaluation_days
+_REPLAY_VARIANT_NAMES = (
+    REPLAY_VARIANT_BASELINE,
+    REPLAY_VARIANT_FILTER,
+    REPLAY_VARIANT_STRUCTURE,
+    REPLAY_VARIANT_PROGRESSION,
+    REPLAY_VARIANT_ATTENTION,
+    REPLAY_VARIANT_V3_SHADOW,
+    REPLAY_VARIANT_V3_MATCHED,
+)
+
+
+@dataclass(frozen=True)
+class _ReplayWindow:
+    source_days: int
+    aligned: dict[str, list[CandleData]]
+    reference: list[CandleData]
+    hourly: dict[str, list[CandleData]]
+    warmup: int
+    first_index: int
+    last_index: int
+    evidence_tier: ReplayEvidenceTier
+    expected_market_count: int
+    market_coverage: float
+    warnings: list[str]
+
+    @property
+    def total_scans(self) -> int:
+        return self.last_index - self.first_index + 1
+
+
+@dataclass
+class _ReplayRunState:
+    accumulators: dict[str, _VariantAccumulator] = field(
+        default_factory=lambda: {
+            name: _VariantAccumulator() for name in _REPLAY_VARIANT_NAMES
+        }
     )
+    previous_rankings: dict[str, int] = field(default_factory=dict)
+    attention_state: AttentionState = field(default_factory=AttentionState)
+    episode_outcomes: dict[str, _FutureOutcome] = field(default_factory=dict)
+    stage_accumulators: dict[str, _StageAccumulator] = field(default_factory=dict)
+    visible_observations: int = 0
+    material_changes: int = 0
+    material_change_scans: int = 0
+    scheduled_digest_scans: int = 0
+    nonempty_digest_scans: int = 0
+    eligible_candidate_observations: int = 0
+    eligible_context_observations: int = 0
+
+
+@dataclass(frozen=True)
+class _ReplayScanResult:
+    signal_candle_start: datetime.datetime
+    observed_at: datetime.datetime
+    current_rankings: dict[str, int]
+    attention_state: AttentionState
+    candidate_markets: list[str]
+    active_markets: frozenset[str]
+    all_attention: list[AttentionCandidate]
+    displayed_candidates: list[AttentionCandidate]
+    full_candidates: list[AttentionCandidate]
+    selections: dict[str, list[str]]
+    outcomes: dict[str, _FutureOutcome]
+    eligible_context_count: int
+    briefing_due: bool
+
+
+def _validate_replay_request(
+    candles_10m: Mapping[str, Sequence[CandleData]],
+    evaluation_days: int,
+    source_days: int,
+    top_k: int,
+) -> None:
+    _validate_evaluation_days(evaluation_days)
     _validate_evaluation_days(source_days)
     if source_days < evaluation_days:
         raise ValueError(
@@ -516,61 +576,24 @@ def run_point_in_time_replay(
         raise ValueError("top_k must be positive")
     if "KRW-BTC" not in candles_10m:
         raise ValueError("KRW-BTC history is required for replay")
-    source_required_count = replay_10m_bar_count(source_days)
-    if len(candles_10m["KRW-BTC"]) < source_required_count:
+    if len(candles_10m["KRW-BTC"]) < replay_10m_bar_count(source_days):
         raise ValueError("source replay history is shorter than source_evaluation_days")
 
-    required_count = replay_10m_bar_count(evaluation_days)
-    source_aligned = _aligned_histories(candles_10m, source_required_count)
-    if "KRW-BTC" not in source_aligned:
-        raise ValueError("KRW-BTC history is incomplete or misaligned")
-    aligned = {
-        market: candles[-required_count:] for market, candles in source_aligned.items()
-    }
-    reference = aligned["KRW-BTC"]
-    hourly = aggregate_hourly_candles(aligned)
-    outcome_bars = (
-        config.REPLAY_OUTCOME_HORIZON_MINUTES
-        // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
-    )
-    warmup = replay_warmup_10m_bars()
-    evaluation_bars = (
-        evaluation_days * 24 * (60 // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES)
-    )
-    last_index = len(reference) - outcome_bars - 1
-    first_index = last_index - evaluation_bars + 1
-    if first_index < warmup - 1:
-        raise ValueError("replay history does not contain the required warm-up")
 
-    accumulators = {
-        name: _VariantAccumulator()
-        for name in [
-            REPLAY_VARIANT_BASELINE,
-            REPLAY_VARIANT_FILTER,
-            REPLAY_VARIANT_STRUCTURE,
-            REPLAY_VARIANT_PROGRESSION,
-            REPLAY_VARIANT_ATTENTION,
-            REPLAY_VARIANT_V3_SHADOW,
-            REPLAY_VARIANT_V3_MATCHED,
-        ]
-    }
-    previous_rankings: Dict[str, int] = {}
-    attention_state = AttentionState()
-    episode_outcomes: Dict[str, _FutureOutcome] = {}
-    stage_accumulators: Dict[str, _StageAccumulator] = {}
-    visible_observations = 0
-    material_changes = 0
-    material_change_scans = 0
-    scheduled_digest_scans = 0
-    nonempty_digest_scans = 0
-    eligible_candidate_observations = 0
-    eligible_context_observations = 0
-    warnings = []
-    warnings.append(
+def _replay_warnings(
+    *,
+    evaluation_days: int,
+    source_days: int,
+    evidence_tier: ReplayEvidenceTier,
+    aligned: Mapping[str, Sequence[CandleData]],
+    candles_daily: Mapping[str, Sequence[CandleData]],
+    expected_market_count: int,
+    market_coverage: float,
+) -> list[str]:
+    warnings = [
         "Historical orderbook snapshots are unavailable; execution-risk evidence "
         "is excluded from replay lift metrics."
-    )
-    evidence_tier = replay_evidence_tier(evaluation_days)
+    ]
     if evidence_tier is ReplayEvidenceTier.SMOKE:
         warnings.append(
             "A 1-3 day replay is smoke/debug evidence only; it is not operating "
@@ -586,12 +609,6 @@ def run_point_in_time_replay(
             f"Reused a {source_days}-day cache for a {evaluation_days}-day evaluation; "
             "market coverage reflects markets with complete longer-window history."
         )
-    expected_market_count = requested_market_count or len(candles_10m)
-    if expected_market_count < len(candles_10m):
-        raise ValueError("requested_market_count cannot be below collected coverage")
-    market_coverage = (
-        len(aligned) / expected_market_count if expected_market_count else 0.0
-    )
     if len(aligned) != expected_market_count:
         warnings.append(
             f"Excluded {expected_market_count - len(aligned)} market(s) with incomplete or misaligned histories."
@@ -609,200 +626,334 @@ def run_point_in_time_replay(
             f"Daily MA context unavailable for {len(aligned) - daily_context_markets} "
             "replayed market(s); broad-filter observations remain eligible."
         )
+    return warnings
 
-    total_scans = last_index - first_index + 1
-    for scan_number, index in enumerate(range(first_index, last_index + 1), 1):
-        signal_candle_start = reference[index].timestamp
-        observed_at = signal_candle_start + datetime.timedelta(
-            minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
-        )
-        histories = {
-            market: replay_feature_history(candles, index)
-            for market, candles in aligned.items()
-        }
-        tickers = process_lightweight_indicators(histories)
-        assign_residual_momentum(tickers, dict(sectors), dict(reverse_sector_map))
-        decisions = evaluate_candidate_eligibility(tickers)
-        candidate_markets = [
-            market for market, decision in decisions.items() if decision.eligible
-        ]
-        current_rankings = _historical_turnover_rankings(histories)
 
-        as_of = observed_at
-        markets_to_enrich = sorted(
-            set(candidate_markets) | set(attention_state.entries) | {"KRW-BTC"}
-        )
-        hourly_slice = {
-            market: _completed_before(
-                hourly.get(market, []), as_of, 200, datetime.timedelta(hours=1)
-            )
-            for market in markets_to_enrich
-        }
-        daily_slice = {
-            market: _completed_before(
-                candles_daily.get(market, []), as_of, 200, datetime.timedelta(days=1)
-            )
-            for market in markets_to_enrich
-        }
-        enriched = tickers.copy()
-        enriched.update(
-            enrich_deep_dive_tickers(
-                {
-                    market: tickers[market]
-                    for market in markets_to_enrich
-                    if market in tickers
-                },
-                hourly_slice,
-                daily_slice,
-                tickers,
-            )
-        )
-        market_regime: MarketRegimeSnapshot = get_market_regime(enriched)
-        signals = detect_anomalies(
-            candidate_markets,
-            enriched,
-            dict(sectors),
-            dict(reverse_sector_map),
-        )
-        signals = filter_market_wide_events(signals, enriched)
-        attention_result = build_attention_result(
+def _prepare_replay_window(
+    candles_10m: Mapping[str, Sequence[CandleData]],
+    candles_daily: Mapping[str, Sequence[CandleData]],
+    *,
+    evaluation_days: int,
+    source_days: int,
+    top_k: int,
+    requested_market_count: int | None,
+) -> _ReplayWindow:
+    _validate_replay_request(candles_10m, evaluation_days, source_days, top_k)
+    source_aligned = _aligned_histories(
+        candles_10m,
+        replay_10m_bar_count(source_days),
+    )
+    if "KRW-BTC" not in source_aligned:
+        raise ValueError("KRW-BTC history is incomplete or misaligned")
+
+    required_count = replay_10m_bar_count(evaluation_days)
+    aligned = {
+        market: candles[-required_count:] for market, candles in source_aligned.items()
+    }
+    reference = aligned["KRW-BTC"]
+    outcome_bars = (
+        config.REPLAY_OUTCOME_HORIZON_MINUTES
+        // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
+    )
+    warmup = replay_warmup_10m_bars()
+    evaluation_bars = (
+        evaluation_days * 24 * (60 // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES)
+    )
+    last_index = len(reference) - outcome_bars - 1
+    first_index = last_index - evaluation_bars + 1
+    if first_index < warmup - 1:
+        raise ValueError("replay history does not contain the required warm-up")
+
+    expected_market_count = requested_market_count or len(candles_10m)
+    if expected_market_count < len(candles_10m):
+        raise ValueError("requested_market_count cannot be below collected coverage")
+    market_coverage = (
+        len(aligned) / expected_market_count if expected_market_count else 0.0
+    )
+    evidence_tier = replay_evidence_tier(evaluation_days)
+    return _ReplayWindow(
+        source_days=source_days,
+        aligned=aligned,
+        reference=reference,
+        hourly=aggregate_hourly_candles(aligned),
+        warmup=warmup,
+        first_index=first_index,
+        last_index=last_index,
+        evidence_tier=evidence_tier,
+        expected_market_count=expected_market_count,
+        market_coverage=market_coverage,
+        warnings=_replay_warnings(
+            evaluation_days=evaluation_days,
+            source_days=source_days,
+            evidence_tier=evidence_tier,
+            aligned=aligned,
+            candles_daily=candles_daily,
+            expected_market_count=expected_market_count,
+            market_coverage=market_coverage,
+        ),
+    )
+
+
+def _enrich_replay_tickers(
+    tickers: dict,
+    candidate_markets: list[str],
+    attention_state: AttentionState,
+    observed_at: datetime.datetime,
+    window: _ReplayWindow,
+    candles_daily: Mapping[str, Sequence[CandleData]],
+) -> tuple[dict, MarketRegimeSnapshot]:
+    markets_to_enrich = sorted(
+        set(candidate_markets) | set(attention_state.entries) | {"KRW-BTC"}
+    )
+    hourly_slice = {
+        market: _completed_before(
+            window.hourly.get(market, []),
             observed_at,
-            candidate_markets,
-            enriched,
-            current_rankings,
-            previous_rankings,
-            signals,
-            [],
-            previous_state=attention_state,
-            market_regime=market_regime,
-            limit=top_k,
+            200,
+            datetime.timedelta(hours=1),
         )
-        all_attention = attention_result.all_candidates
-        attention_state = attention_result.state
+        for market in markets_to_enrich
+    }
+    daily_slice = {
+        market: _completed_before(
+            candles_daily.get(market, []),
+            observed_at,
+            200,
+            datetime.timedelta(days=1),
+        )
+        for market in markets_to_enrich
+    }
+    enriched = tickers.copy()
+    enriched.update(
+        enrich_tickers_with_higher_timeframes(
+            {
+                market: tickers[market]
+                for market in markets_to_enrich
+                if market in tickers
+            },
+            hourly_slice,
+            daily_slice,
+        )
+    )
+    return enriched, classify_market_regime(enriched)
 
-        baseline = [
-            market
-            for market, _rank in sorted(
-                current_rankings.items(), key=lambda item: item[1]
-            )[:top_k]
+
+def _replay_selections(
+    *,
+    current_rankings: Mapping[str, int],
+    candidate_markets: list[str],
+    enriched: Mapping[str, Any],
+    all_attention: list[AttentionCandidate],
+    full_candidates: list[AttentionCandidate],
+    top_k: int,
+) -> dict[str, list[str]]:
+    baseline = [
+        market
+        for market, _rank in sorted(current_rankings.items(), key=lambda item: item[1])[
+            :top_k
         ]
-        filter_order = rank_filter_candidates(candidate_markets, enriched)
-        filtered = filter_order[:top_k]
-        active_markets = set(candidate_markets)
-        active_attention = [
-            candidate
-            for candidate in all_attention
-            if candidate.market in active_markets
+    ]
+    filter_order = rank_filter_candidates(candidate_markets, enriched)
+    active_markets = set(candidate_markets)
+    active_attention = [
+        candidate for candidate in all_attention if candidate.market in active_markets
+    ]
+    structured = [
+        candidate.market
+        for candidate in rank_structure_candidates(active_attention, filter_order)[
+            :top_k
         ]
-        structured = [
-            candidate.market
-            for candidate in rank_structure_candidates(active_attention, filter_order)[
-                :top_k
-            ]
-        ]
-        progressed_candidates = rank_attention_candidates(active_attention)[:top_k]
-        progressed = [candidate.market for candidate in progressed_candidates]
-        full_candidates = attention_result.visible
-        full = [candidate.market for candidate in full_candidates]
-        briefing_due = attention_briefing_due(observed_at)
-        displayed_candidates = full_candidates if briefing_due else []
-        v3_shadow_candidates = sorted(
+    ]
+    progressed = [
+        candidate.market
+        for candidate in rank_attention_candidates(active_attention)[:top_k]
+    ]
+    v3_shadow = [
+        candidate.market
+        for candidate in sorted(
             all_attention,
             key=lambda candidate: candidate.v3_shadow_rank or 1_000_000,
         )[:top_k]
-        v3_shadow = [candidate.market for candidate in v3_shadow_candidates]
-        v3_matched = v3_shadow[: len(full_candidates)]
-        outcomes = {
-            market: _future_outcome(candles, index)
-            for market, candles in aligned.items()
-        }
-        for candidate in displayed_candidates:
-            outcome = outcomes[candidate.market]
-            stage_accumulators.setdefault(
-                candidate.stage.value, _StageAccumulator()
-            ).add(outcome)
-            episode_outcomes.setdefault(candidate.episode_id, outcome)
-        selections = {
-            REPLAY_VARIANT_BASELINE: baseline,
-            REPLAY_VARIANT_FILTER: filtered,
-            REPLAY_VARIANT_STRUCTURE: structured,
-            REPLAY_VARIANT_PROGRESSION: progressed,
-            REPLAY_VARIANT_ATTENTION: full,
-            REPLAY_VARIANT_V3_SHADOW: v3_shadow,
-            REPLAY_VARIANT_V3_MATCHED: v3_matched,
-        }
-        for name, selected in selections.items():
-            accumulators[name].add(selected, outcomes, len(aligned), observed_at)
+    ]
+    full = [candidate.market for candidate in full_candidates]
+    return {
+        REPLAY_VARIANT_BASELINE: baseline,
+        REPLAY_VARIANT_FILTER: filter_order[:top_k],
+        REPLAY_VARIANT_STRUCTURE: structured,
+        REPLAY_VARIANT_PROGRESSION: progressed,
+        REPLAY_VARIANT_ATTENTION: full,
+        REPLAY_VARIANT_V3_SHADOW: v3_shadow,
+        REPLAY_VARIANT_V3_MATCHED: v3_shadow[: len(full_candidates)],
+    }
 
-        if observation_sink:
-            selected_markets = set().union(*map(set, selections.values()))
-            meaningful_markets = {
-                market for market, outcome in outcomes.items() if outcome.meaningful
-            }
-            included_outcomes = selected_markets | meaningful_markets
-            observation_sink(
-                {
-                    "signal_model_version": config.SIGNAL_MODEL_VERSION,
-                    "decision_at": observed_at.isoformat(),
-                    "signal_candle_start": signal_candle_start.isoformat(),
-                    "universe_size": len(aligned),
-                    "raw_market_coverage_ratio": market_coverage,
-                    "filter_candidate_count": len(candidate_markets),
-                    "eligible_context_count": sum(
-                        candidate.context_available
-                        for candidate in all_attention
-                        if candidate.market in active_markets
-                    ),
-                    "variants": selections,
-                    "attention_queue": [
-                        candidate.model_dump(mode="json") for candidate in all_attention
-                    ],
-                    "visible_attention_markets": full,
-                    "briefing_attention_markets": [
-                        candidate.market for candidate in displayed_candidates
-                    ],
-                    "meaningful_movers": sorted(meaningful_markets),
-                    "outcomes": {
-                        market: asdict(outcomes[market])
-                        for market in sorted(included_outcomes)
-                    },
-                }
-            )
 
-        visible_observations += len(displayed_candidates)
-        eligible_candidate_observations += len(candidate_markets)
-        eligible_context_observations += sum(
+def _run_replay_scan(
+    index: int,
+    window: _ReplayWindow,
+    candles_daily: Mapping[str, Sequence[CandleData]],
+    markets_by_sector: Mapping[str, list[str]],
+    sectors_by_market: Mapping[str, list[str]],
+    top_k: int,
+    state: _ReplayRunState,
+) -> _ReplayScanResult:
+    signal_candle_start = window.reference[index].timestamp
+    observed_at = signal_candle_start + datetime.timedelta(
+        minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES
+    )
+    histories = {
+        market: replay_feature_history(candles, index)
+        for market, candles in window.aligned.items()
+    }
+    tickers = build_lightweight_tickers(histories)
+    assign_residual_momentum(tickers, dict(markets_by_sector), dict(sectors_by_market))
+    decisions = evaluate_candidate_eligibility(tickers)
+    candidate_markets = [
+        market for market, decision in decisions.items() if decision.eligible
+    ]
+    current_rankings = _historical_turnover_rankings(histories)
+    enriched, market_regime = _enrich_replay_tickers(
+        tickers,
+        candidate_markets,
+        state.attention_state,
+        observed_at,
+        window,
+        candles_daily,
+    )
+    signals = filter_market_wide_candidates(
+        detect_anomalies(
+            candidate_markets,
+            enriched,
+            dict(markets_by_sector),
+            dict(sectors_by_market),
+        ),
+        enriched,
+    )
+    attention_result = build_attention_result(
+        observed_at,
+        candidate_markets,
+        enriched,
+        current_rankings,
+        state.previous_rankings,
+        signals,
+        [],
+        previous_state=state.attention_state,
+        market_regime=market_regime,
+        limit=top_k,
+    )
+    all_attention = attention_result.all_candidates
+    full_candidates = attention_result.visible
+    briefing_due = attention_briefing_due(observed_at)
+    active_markets = frozenset(candidate_markets)
+    outcomes = {
+        market: _future_outcome(candles, index)
+        for market, candles in window.aligned.items()
+    }
+    return _ReplayScanResult(
+        signal_candle_start=signal_candle_start,
+        observed_at=observed_at,
+        current_rankings=current_rankings,
+        attention_state=attention_result.state,
+        candidate_markets=candidate_markets,
+        active_markets=active_markets,
+        all_attention=all_attention,
+        displayed_candidates=full_candidates if briefing_due else [],
+        full_candidates=full_candidates,
+        selections=_replay_selections(
+            current_rankings=current_rankings,
+            candidate_markets=candidate_markets,
+            enriched=enriched,
+            all_attention=all_attention,
+            full_candidates=full_candidates,
+            top_k=top_k,
+        ),
+        outcomes=outcomes,
+        eligible_context_count=sum(
             candidate.context_available
             for candidate in all_attention
             if candidate.market in active_markets
-        )
-        scan_material_changes = sum(
-            candidate.material_change for candidate in displayed_candidates
-        )
-        material_changes += scan_material_changes
-        material_change_scans += int(scan_material_changes > 0)
-        if briefing_due:
-            scheduled_digest_scans += 1
-            nonempty_digest_scans += int(bool(full_candidates))
-        previous_rankings = current_rankings
-        if progress:
-            progress(scan_number, total_scans, observed_at)
+        ),
+        briefing_due=briefing_due,
+    )
 
-    variants = {
-        name: accumulator.metrics() for name, accumulator in accumulators.items()
+
+def _emit_replay_observation(
+    result: _ReplayScanResult,
+    window: _ReplayWindow,
+    observation_sink: Callable[[dict[str, Any]], None],
+) -> None:
+    selected_markets = set().union(*map(set, result.selections.values()))
+    meaningful_markets = {
+        market for market, outcome in result.outcomes.items() if outcome.meaningful
     }
-    baseline_metrics = variants[REPLAY_VARIANT_BASELINE]
-    filter_metrics = variants[REPLAY_VARIANT_FILTER]
-    structure_metrics = variants[REPLAY_VARIANT_STRUCTURE]
-    progression_metrics = variants[REPLAY_VARIANT_PROGRESSION]
-    attention_metrics = variants[REPLAY_VARIANT_ATTENTION]
-    v3_metrics = variants[REPLAY_VARIANT_V3_MATCHED]
-    unchanged_repeats = max(visible_observations - material_changes, 0)
-    episode_values = list(episode_outcomes.values())
-    episode_count = len(episode_values)
-    meaningful_episode_count = sum(outcome.meaningful for outcome in episode_values)
-    repeated_observations = max(visible_observations - episode_count, 0)
-    stage_metrics = {
+    included_outcomes = selected_markets | meaningful_markets
+    observation_sink(
+        {
+            "signal_model_version": config.SIGNAL_MODEL_VERSION,
+            "decision_at": result.observed_at.isoformat(),
+            "signal_candle_start": result.signal_candle_start.isoformat(),
+            "universe_size": len(window.aligned),
+            "raw_market_coverage_ratio": window.market_coverage,
+            "filter_candidate_count": len(result.candidate_markets),
+            "eligible_context_count": result.eligible_context_count,
+            "variants": result.selections,
+            "attention_queue": [
+                candidate.model_dump(mode="json") for candidate in result.all_attention
+            ],
+            "visible_attention_markets": [
+                candidate.market for candidate in result.full_candidates
+            ],
+            "briefing_attention_markets": [
+                candidate.market for candidate in result.displayed_candidates
+            ],
+            "meaningful_movers": sorted(meaningful_markets),
+            "outcomes": {
+                market: asdict(result.outcomes[market])
+                for market in sorted(included_outcomes)
+            },
+        }
+    )
+
+
+def _record_replay_scan(
+    state: _ReplayRunState,
+    result: _ReplayScanResult,
+    universe_size: int,
+) -> None:
+    for candidate in result.displayed_candidates:
+        outcome = result.outcomes[candidate.market]
+        state.stage_accumulators.setdefault(
+            candidate.stage.value,
+            _StageAccumulator(),
+        ).add(outcome)
+        state.episode_outcomes.setdefault(candidate.episode_id, outcome)
+    for name, selected in result.selections.items():
+        state.accumulators[name].add(
+            selected,
+            result.outcomes,
+            universe_size,
+            result.observed_at,
+        )
+
+    displayed_count = len(result.displayed_candidates)
+    state.visible_observations += displayed_count
+    state.eligible_candidate_observations += len(result.candidate_markets)
+    state.eligible_context_observations += result.eligible_context_count
+    scan_material_changes = sum(
+        candidate.material_change for candidate in result.displayed_candidates
+    )
+    state.material_changes += scan_material_changes
+    state.material_change_scans += int(scan_material_changes > 0)
+    if result.briefing_due:
+        state.scheduled_digest_scans += 1
+        state.nonempty_digest_scans += int(bool(result.full_candidates))
+    state.previous_rankings = result.current_rankings
+    state.attention_state = result.attention_state
+
+
+def _stage_replay_metrics(
+    stage_accumulators: Mapping[str, _StageAccumulator],
+) -> dict[str, ReplayStageMetrics]:
+    return {
         stage.value: stage_accumulators[stage.value].metrics()
         for stage in [
             AttentionStage.BUILDING,
@@ -813,64 +964,112 @@ def run_point_in_time_replay(
         ]
         if stage.value in stage_accumulators
     }
+
+
+def _build_replay_report(
+    state: _ReplayRunState,
+    window: _ReplayWindow,
+    *,
+    evaluation_days: int,
+    top_k: int,
+) -> ReplayReport:
+    variants = {
+        name: accumulator.metrics() for name, accumulator in state.accumulators.items()
+    }
+    baseline_metrics = variants[REPLAY_VARIANT_BASELINE]
+    filter_metrics = variants[REPLAY_VARIANT_FILTER]
+    structure_metrics = variants[REPLAY_VARIANT_STRUCTURE]
+    progression_metrics = variants[REPLAY_VARIANT_PROGRESSION]
+    attention_metrics = variants[REPLAY_VARIANT_ATTENTION]
+    v3_metrics = variants[REPLAY_VARIANT_V3_MATCHED]
+    episode_values = list(state.episode_outcomes.values())
+    episode_count = len(episode_values)
+    meaningful_episode_count = sum(outcome.meaningful for outcome in episode_values)
+    repeated_observations = max(state.visible_observations - episode_count, 0)
+    is_v4_visible = config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION
+    context_coverage = (
+        state.eligible_context_observations / state.eligible_candidate_observations
+        if state.eligible_candidate_observations
+        else 1.0
+    )
+    episode_precision = (
+        meaningful_episode_count / episode_count if episode_count else None
+    )
+    attention_yield = (
+        meaningful_episode_count / state.visible_observations
+        if state.visible_observations
+        else None
+    )
+    average_observations = (
+        state.visible_observations / episode_count if episode_count else None
+    )
+    repeated_per_episode = (
+        repeated_observations / episode_count if episode_count else None
+    )
     return ReplayReport(
-        generated_at=datetime.datetime.now(datetime.timezone.utc),
+        generated_at=datetime.datetime.now(datetime.UTC),
         signal_model_version=config.SIGNAL_MODEL_VERSION,
-        evaluation_start=reference[first_index].timestamp
+        evaluation_start=window.reference[window.first_index].timestamp
         + datetime.timedelta(minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES),
-        evaluation_end=reference[last_index].timestamp
+        evaluation_end=window.reference[window.last_index].timestamp
         + datetime.timedelta(minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES),
         requested_evaluation_days=evaluation_days,
-        source_evaluation_days=source_days,
-        evidence_tier=evidence_tier,
+        source_evaluation_days=window.source_days,
+        evidence_tier=window.evidence_tier,
         analysis_timeframes=REPLAY_ANALYSIS_TIMEFRAMES,
         scan_interval_minutes=config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES,
         top_k=top_k,
-        requested_market_count=expected_market_count,
-        market_count=len(aligned),
-        market_coverage_ratio=market_coverage,
+        requested_market_count=window.expected_market_count,
+        market_count=len(window.aligned),
+        market_coverage_ratio=window.market_coverage,
         market_coverage_meets_minimum=(
-            market_coverage >= config.CANDLE_SUCCESS_RATE_MINIMUM
+            window.market_coverage >= config.CANDLE_SUCCESS_RATE_MINIMUM
         ),
-        eligible_candidate_observations=eligible_candidate_observations,
-        eligible_context_observations=eligible_context_observations,
-        eligible_context_coverage_ratio=(
-            eligible_context_observations / eligible_candidate_observations
-            if eligible_candidate_observations
-            else 1.0
-        ),
-        warmup_10m_bars=warmup,
+        eligible_candidate_observations=state.eligible_candidate_observations,
+        eligible_context_observations=state.eligible_context_observations,
+        eligible_context_coverage_ratio=context_coverage,
+        warmup_10m_bars=window.warmup,
         warmup_daily_bars=200,
         variants=variants,
         precision_lift_vs_turnover=_difference(
-            attention_metrics.precision_at_k, baseline_metrics.precision_at_k
+            attention_metrics.precision_at_k,
+            baseline_metrics.precision_at_k,
         ),
         recall_lift_vs_turnover=_difference(
-            attention_metrics.recall_at_k, baseline_metrics.recall_at_k
+            attention_metrics.recall_at_k,
+            baseline_metrics.recall_at_k,
         ),
         structure_precision_lift=_difference(
-            structure_metrics.precision_at_k, filter_metrics.precision_at_k
+            structure_metrics.precision_at_k,
+            filter_metrics.precision_at_k,
         ),
         structure_recall_lift=_difference(
-            structure_metrics.recall_at_k, filter_metrics.recall_at_k
+            structure_metrics.recall_at_k,
+            filter_metrics.recall_at_k,
         ),
         progression_context_precision_lift=_difference(
-            progression_metrics.precision_at_k, structure_metrics.precision_at_k
+            progression_metrics.precision_at_k,
+            structure_metrics.precision_at_k,
         ),
         progression_context_recall_lift=_difference(
-            progression_metrics.recall_at_k, structure_metrics.recall_at_k
+            progression_metrics.recall_at_k,
+            structure_metrics.recall_at_k,
         ),
         retention_precision_lift=_difference(
-            attention_metrics.precision_at_k, progression_metrics.precision_at_k
+            attention_metrics.precision_at_k,
+            progression_metrics.precision_at_k,
         ),
         retention_recall_lift=_difference(
-            attention_metrics.recall_at_k, progression_metrics.recall_at_k
+            attention_metrics.recall_at_k,
+            progression_metrics.recall_at_k,
         ),
         visible_precision_lift_vs_v3=_difference(
-            attention_metrics.precision_at_k, v3_metrics.precision_at_k
+            attention_metrics.precision_at_k,
+            v3_metrics.precision_at_k,
         ),
         visible_recall_lift_vs_v3=_difference(
-            attention_metrics.recall_at_k, v3_metrics.recall_at_k
+            attention_metrics.recall_at_k,
+            v3_metrics.recall_at_k,
         ),
         visible_median_time_to_2pct_delta_vs_v3_minutes=_difference(
             attention_metrics.median_time_to_2pct_minutes,
@@ -881,7 +1080,7 @@ def run_point_in_time_replay(
                 attention_metrics.precision_at_k,
                 v3_metrics.precision_at_k,
             )
-            if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION
+            if is_v4_visible
             else None
         ),
         v4_recall_lift_vs_v3=(
@@ -889,7 +1088,7 @@ def run_point_in_time_replay(
                 attention_metrics.recall_at_k,
                 v3_metrics.recall_at_k,
             )
-            if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION
+            if is_v4_visible
             else None
         ),
         v4_median_time_to_2pct_delta_vs_v3_minutes=(
@@ -897,14 +1096,12 @@ def run_point_in_time_replay(
                 attention_metrics.median_time_to_2pct_minutes,
                 v3_metrics.median_time_to_2pct_minutes,
             )
-            if config.ATTENTION_VISIBLE_MODEL == config.ATTENTION_V4_MODEL_VERSION
+            if is_v4_visible
             else None
         ),
         attention_episode_count=episode_count,
         attention_meaningful_episode_count=meaningful_episode_count,
-        attention_episode_precision=(
-            meaningful_episode_count / episode_count if episode_count else None
-        ),
+        attention_episode_precision=episode_precision,
         attention_episode_average_abs_mfe_120m_pct=_mean(
             outcome.abs_mfe_120m_pct for outcome in episode_values
         ),
@@ -918,32 +1115,79 @@ def run_point_in_time_replay(
             for outcome in episode_values
             if outcome.time_to_2pct_minutes is not None
         ),
-        attention_yield=(
-            meaningful_episode_count / visible_observations
-            if visible_observations
-            else None
-        ),
-        attention_stage_metrics=stage_metrics,
-        attention_visible_observations=visible_observations,
+        attention_yield=attention_yield,
+        attention_stage_metrics=_stage_replay_metrics(state.stage_accumulators),
+        attention_visible_observations=state.visible_observations,
         attention_repeated_observations=repeated_observations,
-        average_attention_observations_per_episode=(
-            visible_observations / episode_count if episode_count else None
+        average_attention_observations_per_episode=average_observations,
+        repeated_observations_per_episode=repeated_per_episode,
+        material_state_changes=state.material_changes,
+        material_change_scans=state.material_change_scans,
+        unchanged_repeat_observations=max(
+            state.visible_observations - state.material_changes,
+            0,
         ),
-        repeated_observations_per_episode=(
-            repeated_observations / episode_count if episode_count else None
-        ),
-        material_state_changes=material_changes,
-        material_change_scans=material_change_scans,
-        unchanged_repeat_observations=unchanged_repeats,
-        scheduled_digest_scans=scheduled_digest_scans,
-        nonempty_digest_scans=nonempty_digest_scans,
-        warnings=warnings,
+        scheduled_digest_scans=state.scheduled_digest_scans,
+        nonempty_digest_scans=state.nonempty_digest_scans,
+        warnings=window.warnings,
+    )
+
+
+def run_point_in_time_replay(
+    candles_10m: Mapping[str, Sequence[CandleData]],
+    candles_daily: Mapping[str, Sequence[CandleData]],
+    markets_by_sector: Mapping[str, list[str]],
+    sectors_by_market: Mapping[str, list[str]],
+    *,
+    evaluation_days: int = config.REPLAY_DEFAULT_EVALUATION_DAYS,
+    source_evaluation_days: int | None = None,
+    top_k: int = config.REPLAY_DEFAULT_TOP_K,
+    requested_market_count: int | None = None,
+    progress: Callable[[int, int, datetime.datetime], None] | None = None,
+    observation_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> ReplayReport:
+    """Replay production feature functions at each completed 10-minute decision point."""
+    source_days = (
+        evaluation_days if source_evaluation_days is None else source_evaluation_days
+    )
+    window = _prepare_replay_window(
+        candles_10m,
+        candles_daily,
+        evaluation_days=evaluation_days,
+        source_days=source_days,
+        top_k=top_k,
+        requested_market_count=requested_market_count,
+    )
+    state = _ReplayRunState()
+    for scan_number, index in enumerate(
+        range(window.first_index, window.last_index + 1),
+        1,
+    ):
+        result = _run_replay_scan(
+            index,
+            window,
+            candles_daily,
+            markets_by_sector,
+            sectors_by_market,
+            top_k,
+            state,
+        )
+        _record_replay_scan(state, result, len(window.aligned))
+        if observation_sink:
+            _emit_replay_observation(result, window, observation_sink)
+        if progress:
+            progress(scan_number, window.total_scans, result.observed_at)
+    return _build_replay_report(
+        state,
+        window,
+        evaluation_days=evaluation_days,
+        top_k=top_k,
     )
 
 
 def _aligned_histories(
     candles_by_market: Mapping[str, Sequence[CandleData]], required_count: int
-) -> Dict[str, List[CandleData]]:
+) -> dict[str, list[CandleData]]:
     if "KRW-BTC" not in candles_by_market:
         return {}
     reference = list(candles_by_market["KRW-BTC"])[-required_count:]
@@ -961,7 +1205,7 @@ def _aligned_histories(
 
 def _historical_turnover_rankings(
     histories: Mapping[str, Sequence[CandleData]],
-) -> Dict[str, int]:
+) -> dict[str, int]:
     bars_per_day = 24 * (60 // config.PRIMARY_EXECUTION_TIMEFRAME_MINUTES)
     turnover = {
         market: sum(
@@ -981,7 +1225,7 @@ def _completed_before(
     as_of: datetime.datetime,
     count: int,
     interval: datetime.timedelta,
-) -> List[CandleData]:
+) -> list[CandleData]:
     if not candles:
         return []
     completed = [candle for candle in candles if candle.timestamp + interval <= as_of]

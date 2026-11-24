@@ -1,9 +1,9 @@
-# common/models
+"""Validated domain models for market evidence and durable state."""
 
 import datetime
 import math
 from enum import StrEnum
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any
 
 from pydantic import (
     AfterValidator,
@@ -46,7 +46,7 @@ LEGACY_SECTOR_PLACEHOLDER_CATEGORIES = frozenset(
 )
 
 
-def canonicalize_sector_categories(categories: List[Any]) -> List[Any]:
+def canonicalize_sector_categories(categories: list[Any]) -> list[Any]:
     canonical = [
         category
         for category in categories
@@ -293,7 +293,7 @@ class CandidateDecision(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     eligible: bool
-    rejection_reasons: List[RejectionCode] = Field(default_factory=list)
+    rejection_reasons: list[RejectionCode] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_decision(self) -> "CandidateDecision":
@@ -311,15 +311,15 @@ class DataQualityIssue(BaseModel):
 
     code: RejectionCode
     message: str
-    details: Dict[str, Any] = Field(default_factory=dict)
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class MarketRegimeSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     regime: MarketRegime
-    rsi: Optional[float] = None
-    atr_ratio: Optional[float] = None
+    rsi: float | None = None
+    atr_ratio: float | None = None
 
 
 class SectorTagResult(BaseModel):
@@ -327,7 +327,7 @@ class SectorTagResult(BaseModel):
 
     market: KrwMarket
     status: SectorTagStatus
-    categories: List[str] = Field(default_factory=list)
+    categories: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_categories(self) -> "SectorTagResult":
@@ -340,7 +340,7 @@ class SectorTagResult(BaseModel):
         return self
 
 
-class SectorTagBatch(RootModel[List[SectorTagResult]]):
+class SectorTagBatch(RootModel[list[SectorTagResult]]):
     @model_validator(mode="after")
     def validate_markets(self) -> "SectorTagBatch":
         if not self.root:
@@ -351,7 +351,7 @@ class SectorTagBatch(RootModel[List[SectorTagResult]]):
         return self
 
 
-class SectorMap(RootModel[Dict[KrwMarket, List[str]]]):
+class SectorMap(RootModel[dict[KrwMarket, list[str]]]):
     @field_validator("root", mode="before")
     @classmethod
     def migrate_legacy_placeholders(cls, assignments: Any) -> Any:
@@ -406,7 +406,7 @@ class MarketEvent(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     warning: StrictBool
-    caution: Dict[str, StrictBool]
+    caution: dict[str, StrictBool]
 
     @property
     def blocks_execution(self) -> bool:
@@ -417,8 +417,8 @@ class MarketListing(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     market: KrwMarket
-    english_name: Optional[str] = None
-    market_event: Optional[MarketEvent] = None
+    english_name: str | None = None
+    market_event: MarketEvent | None = None
 
 
 class MarketTicker(BaseModel):
@@ -426,7 +426,7 @@ class MarketTicker(BaseModel):
 
     market: KrwMarket
     acc_trade_price_24h: NonNegativeFiniteFloat
-    trade_price: Optional[PositiveFiniteFloat] = None
+    trade_price: PositiveFiniteFloat | None = None
     market_event: MarketEvent
 
 
@@ -443,11 +443,11 @@ class OrderBookSnapshot(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     market: KrwMarket
-    orderbook_units: List[OrderBookUnit] = Field(min_length=1)
+    orderbook_units: list[OrderBookUnit] = Field(min_length=1)
 
 
 class CandleData(BaseModel):
-    """단일 캔들(분봉) 데이터를 나타냅니다."""
+    """One completed market candle on a defined time grid."""
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -458,7 +458,7 @@ class CandleData(BaseModel):
     low_price: PositiveFiniteFloat
     close_price: PositiveFiniteFloat
     volume: NonNegativeFiniteFloat
-    trade_value: Optional[NonNegativeFiniteFloat] = None
+    trade_value: NonNegativeFiniteFloat | None = None
 
     @model_validator(mode="after")
     def validate_ohlc(self) -> "CandleData":
@@ -470,40 +470,40 @@ class CandleData(BaseModel):
 
 
 class TickerData(BaseModel):
-    """모든 기술적 분석 지표가 포함된 단일 티커의 종합 데이터입니다."""
+    """Point-in-time features and higher-timeframe context for one market."""
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     market: KrwMarket
-    candle_history: List[CandleData] = Field(default_factory=list)
+    candle_history: list[CandleData] = Field(default_factory=list)
 
-    # --- 기본 분석용 ---
-    price_change_10m: Optional[float] = None
-    relative_volume: Optional[float] = None
-    rvol_z_score: Optional[float] = None
-    conditional_log_rvol_z_score: Optional[float] = None
-    cross_sectional_log_rvol_z_score: Optional[float] = None
-    price_change_1h: Optional[float] = None
-    price_change_4h: Optional[float] = None
-    price_surprise: Optional[float] = None
-    rolling_turnover: Optional[float] = None
+    # Broad-scan features derived from completed 10-minute candles.
+    price_change_10m: float | None = None
+    relative_volume: float | None = None
+    rvol_z_score: float | None = None
+    conditional_log_rvol_z_score: float | None = None
+    cross_sectional_log_rvol_z_score: float | None = None
+    price_change_1h: float | None = None
+    price_change_4h: float | None = None
+    price_surprise: float | None = None
+    rolling_turnover: float | None = None
     liquidity_tier: LiquidityTier = LiquidityTier.UNKNOWN
-    execution_spread_bps: Optional[float] = None
-    expected_slippage_bps: Optional[float] = None
+    execution_spread_bps: float | None = None
+    expected_slippage_bps: float | None = None
 
-    # --- 심층 분석용 필드  ---
-    decoupling_score: Optional[float] = None
-    residual_momentum_score: Optional[float] = None
-    hourly_candles: List[CandleData] = Field(default_factory=list)
-    daily_candles: List[CandleData] = Field(default_factory=list)
+    # Higher-timeframe evidence populated only for selected markets.
+    decoupling_score: float | None = None
+    residual_momentum_score: float | None = None
+    hourly_candles: list[CandleData] = Field(default_factory=list)
+    daily_candles: list[CandleData] = Field(default_factory=list)
 
     trend_1h_stable: TrendState = TrendState.NEUTRAL
-    is_above_ma50_daily: Optional[bool] = None
-    is_above_ma200_daily: Optional[bool] = None
+    is_above_ma50_daily: bool | None = None
+    is_above_ma200_daily: bool | None = None
 
 
 class SignalCandidate(BaseModel):
-    """1차 분석을 통해 생성된 잠재적 시그널 후보입니다."""
+    """A scored signal candidate emitted by deterministic analysis."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -523,7 +523,7 @@ class AttentionEvidence(BaseModel):
     family: EvidenceFamily
     verdict: EvidenceVerdict
     summary: str
-    metrics: Dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class AttentionStateEntry(BaseModel):
@@ -537,22 +537,22 @@ class AttentionStateEntry(BaseModel):
     last_seen_at: AwareDatetime
     consecutive_observations: int = Field(ge=1)
     stage: AttentionStage
-    last_rank: Optional[int] = Field(default=None, ge=1)
+    last_rank: int | None = Field(default=None, ge=1)
     last_price: PositiveFiniteFloat
-    last_relative_volume: Optional[NonNegativeFiniteFloat] = None
-    last_signal_score: Optional[float] = None
-    last_signal_type: Optional[SignalType] = None
-    structure_level: Optional[PositiveFiniteFloat] = None
-    structure_direction: Optional[StructureDirection] = None
+    last_relative_volume: NonNegativeFiniteFloat | None = None
+    last_signal_score: float | None = None
+    last_signal_type: SignalType | None = None
+    structure_level: PositiveFiniteFloat | None = None
+    structure_direction: StructureDirection | None = None
     cooling_observations: int = Field(default=0, ge=0)
     focus_observations: int = Field(default=0, ge=0)
     confirmed_transition_seen: bool = False
-    primary_exposure_times: List[AwareDatetime] = Field(default_factory=list)
+    primary_exposure_times: list[AwareDatetime] = Field(default_factory=list)
     # None marks legacy state whose prior visible-model provenance is unknown.
-    ridge_base_exposure_times: Optional[List[AwareDatetime]] = None
-    last_lane: Optional[AttentionLane] = None
+    ridge_base_exposure_times: list[AwareDatetime] | None = None
+    last_lane: AttentionLane | None = None
     material_change: bool = False
-    change_reasons: List[str] = Field(default_factory=list)
+    change_reasons: list[str] = Field(default_factory=list)
 
 
 class AttentionState(BaseModel):
@@ -560,8 +560,8 @@ class AttentionState(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    updated_at: Optional[AwareDatetime] = None
-    entries: Dict[KrwMarket, AttentionStateEntry] = Field(default_factory=dict)
+    updated_at: AwareDatetime | None = None
+    entries: dict[KrwMarket, AttentionStateEntry] = Field(default_factory=dict)
 
 
 class AttentionCandidate(BaseModel):
@@ -572,77 +572,77 @@ class AttentionCandidate(BaseModel):
     market: KrwMarket
     attention_rank: int = Field(ge=1)
     lane: AttentionLane
-    lane_rank: Optional[int] = Field(default=None, ge=1)
+    lane_rank: int | None = Field(default=None, ge=1)
     primary_selected: bool = False
     displayed: bool = False
-    display_rank: Optional[int] = Field(default=None, ge=1)
+    display_rank: int | None = Field(default=None, ge=1)
     quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
     ranking_score: float = 0.0
     max_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
     primary_exposures_60m: int = Field(default=0, ge=0)
     ridge_base_quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
     ridge_base_exposures_60m: int = Field(default=0, ge=0)
-    ridge_base_rank: Optional[int] = Field(default=None, ge=1)
-    ridge_base_ranking_score: Optional[float] = None
-    v3_shadow_rank: Optional[int] = Field(default=None, ge=1)
-    v4_shadow_rank: Optional[int] = Field(default=None, ge=1)
-    ridge_rank: Optional[int] = Field(default=None, ge=1)
-    ridge_score: Optional[float] = None
+    ridge_base_rank: int | None = Field(default=None, ge=1)
+    ridge_base_ranking_score: float | None = None
+    v3_shadow_rank: int | None = Field(default=None, ge=1)
+    v4_shadow_rank: int | None = Field(default=None, ge=1)
+    ridge_rank: int | None = Field(default=None, ge=1)
+    ridge_score: float | None = None
     score_version: str = Field(min_length=1)
     context_available: bool = False
-    market_rank: Optional[int] = Field(default=None, ge=1)
-    market_rank_delta: Optional[int] = None
+    market_rank: int | None = Field(default=None, ge=1)
+    market_rank_delta: int | None = None
     stage: AttentionStage
     episode_id: str = Field(min_length=1)
     first_seen_at: AwareDatetime
     observed_at: AwareDatetime
     consecutive_observations: int = Field(ge=1)
     current_price: PositiveFiniteFloat
-    price_change_10m: Optional[float] = None
-    price_change_1h: Optional[float] = None
-    price_change_4h: Optional[float] = None
-    relative_volume: Optional[NonNegativeFiniteFloat] = None
-    conditional_volume_z: Optional[float] = None
-    price_surprise: Optional[float] = None
-    residual_momentum: Optional[float] = None
-    signal_score: Optional[float] = None
-    signal_type: Optional[SignalType] = None
-    structure_level: Optional[PositiveFiniteFloat] = None
-    structure_direction: Optional[StructureDirection] = None
+    price_change_10m: float | None = None
+    price_change_1h: float | None = None
+    price_change_4h: float | None = None
+    relative_volume: NonNegativeFiniteFloat | None = None
+    conditional_volume_z: float | None = None
+    price_surprise: float | None = None
+    residual_momentum: float | None = None
+    signal_score: float | None = None
+    signal_type: SignalType | None = None
+    structure_level: PositiveFiniteFloat | None = None
+    structure_direction: StructureDirection | None = None
     material_change: bool
-    change_reasons: List[str] = Field(default_factory=list)
-    evidence: List[AttentionEvidence] = Field(default_factory=list)
+    change_reasons: list[str] = Field(default_factory=list)
+    evidence: list[AttentionEvidence] = Field(default_factory=list)
 
 
 class Alert(BaseModel):
-    """최종 알림 대상으로 확정된 시그널 객체입니다."""
+    """A classified alert transition with its supporting ticker evidence."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     candidate: SignalCandidate
-    ticker_data: TickerData  # 포매팅 시 참고할 상세 데이터
+    ticker_data: TickerData
     signal_type: SignalType
     priority: int
-    structure_level: Optional[float] = None
+    structure_level: float | None = None
 
 
 class RankState(BaseModel):
-    """거래대금 순위 변동을 비교하기 위한 상태 모델입니다."""
+    """One durable turnover-ranking snapshot."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     last_updated: AwareDatetime
-    rankings: Dict[KrwMarket, int] = Field(default_factory=dict)
+    rankings: dict[KrwMarket, int] = Field(default_factory=dict)
 
 
 class AnalysisState(BaseModel):
-    """분석 결과 로그를 저장하기 위한 상태 모델입니다."""
+    """A bounded analysis snapshot for operational audit logs."""
 
     model_config = ConfigDict(extra="forbid")
 
     last_updated: datetime.datetime
-    tickers: Dict[KrwMarket, TickerData]
-    rankings: Dict[KrwMarket, int] = Field(default_factory=dict)
+    tickers: dict[KrwMarket, TickerData]
+    rankings: dict[KrwMarket, int] = Field(default_factory=dict)
 
 
 class ScanEvent(BaseModel):
@@ -653,37 +653,37 @@ class ScanEvent(BaseModel):
     event_id: str
     observed_at: datetime.datetime
     market: KrwMarket
-    feature_snapshot: Dict[str, Any]
+    feature_snapshot: dict[str, Any]
     candidate_eligible: bool
-    rejection_reasons: List[RejectionCode]
+    rejection_reasons: list[RejectionCode]
     final_decision: ScanDecision
     model_version: str
-    direction: Optional[Direction] = None
-    signal_score: Optional[float] = None
-    signal_candle_start: Optional[datetime.datetime] = None
-    attention_stage: Optional[AttentionStage] = None
-    attention_lane: Optional[AttentionLane] = None
-    attention_rank: Optional[int] = Field(default=None, ge=1)
-    attention_lane_rank: Optional[int] = Field(default=None, ge=1)
-    attention_primary_selected: Optional[bool] = None
-    attention_displayed: Optional[bool] = None
-    attention_display_rank: Optional[int] = Field(default=None, ge=1)
-    attention_quality_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    attention_ranking_score: Optional[float] = None
-    attention_v3_shadow_rank: Optional[int] = Field(default=None, ge=1)
-    attention_v4_shadow_rank: Optional[int] = Field(default=None, ge=1)
-    attention_ridge_rank: Optional[int] = Field(default=None, ge=1)
-    attention_ridge_score: Optional[float] = None
-    attention_ridge_base_rank: Optional[int] = Field(default=None, ge=1)
-    attention_ridge_base_ranking_score: Optional[float] = None
-    attention_ridge_base_quality_score: Optional[float] = Field(
+    direction: Direction | None = None
+    signal_score: float | None = None
+    signal_candle_start: datetime.datetime | None = None
+    attention_stage: AttentionStage | None = None
+    attention_lane: AttentionLane | None = None
+    attention_rank: int | None = Field(default=None, ge=1)
+    attention_lane_rank: int | None = Field(default=None, ge=1)
+    attention_primary_selected: bool | None = None
+    attention_displayed: bool | None = None
+    attention_display_rank: int | None = Field(default=None, ge=1)
+    attention_quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    attention_ranking_score: float | None = None
+    attention_v3_shadow_rank: int | None = Field(default=None, ge=1)
+    attention_v4_shadow_rank: int | None = Field(default=None, ge=1)
+    attention_ridge_rank: int | None = Field(default=None, ge=1)
+    attention_ridge_score: float | None = None
+    attention_ridge_base_rank: int | None = Field(default=None, ge=1)
+    attention_ridge_base_ranking_score: float | None = None
+    attention_ridge_base_quality_score: float | None = Field(
         default=None, ge=0.0, le=1.0
     )
-    attention_ridge_base_exposures_60m: Optional[int] = Field(default=None, ge=0)
-    attention_primary_exposures_60m: Optional[int] = Field(default=None, ge=0)
-    attention_score_version: Optional[str] = None
-    attention_first_seen_at: Optional[AwareDatetime] = None
-    attention_episode_id: Optional[str] = None
+    attention_ridge_base_exposures_60m: int | None = Field(default=None, ge=0)
+    attention_primary_exposures_60m: int | None = Field(default=None, ge=0)
+    attention_score_version: str | None = None
+    attention_first_seen_at: AwareDatetime | None = None
+    attention_episode_id: str | None = None
 
 
 class ScanOutcome(BaseModel):
@@ -703,7 +703,7 @@ class ScanOutcome(BaseModel):
 
 
 class AlertHistory(BaseModel):
-    """알림 쿨다운을 관리하기 위한 발송 기록 모델입니다."""
+    """Durable alert structure and cooldown state for one market."""
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -714,8 +714,8 @@ class AlertHistory(BaseModel):
     last_rvol: float
     initial_timestamp: datetime.datetime
     initial_price: float
-    structure_level: Optional[float] = None
-    structure_direction: Optional[StructureDirection] = None
+    structure_level: float | None = None
+    structure_direction: StructureDirection | None = None
 
 
 class NotificationOutbox(BaseModel):
@@ -724,16 +724,16 @@ class NotificationOutbox(BaseModel):
     delivery_id: str = Field(min_length=1)
     status: NotificationStatus
     message: str = Field(min_length=1)
-    alert_history: Optional[Dict[KrwMarket, AlertHistory]] = None
-    previous_alert_history: Optional[Dict[KrwMarket, AlertHistory]] = None
-    alert_markets: List[KrwMarket] = Field(default_factory=list)
-    scan_key: Optional[str] = None
+    alert_history: dict[KrwMarket, AlertHistory] | None = None
+    previous_alert_history: dict[KrwMarket, AlertHistory] | None = None
+    alert_markets: list[KrwMarket] = Field(default_factory=list)
+    scan_key: str | None = None
     kind: NotificationKind = NotificationKind.BRIEFING
     mention_channel: bool = False
 
     @field_validator("alert_markets")
     @classmethod
-    def unique_alert_markets(cls, markets: List[str]) -> List[str]:
+    def unique_alert_markets(cls, markets: list[str]) -> list[str]:
         if any(not market for market in markets) or len(markets) != len(set(markets)):
             raise ValueError(
                 "alert_markets must contain unique non-empty market identifiers"
@@ -741,7 +741,7 @@ class NotificationOutbox(BaseModel):
         return markets
 
 
-class NotificationBacklog(RootModel[List[NotificationOutbox]]):
+class NotificationBacklog(RootModel[list[NotificationOutbox]]):
     @model_validator(mode="after")
     def validate_deferred_records(self) -> "NotificationBacklog":
         if any(item.status is not NotificationStatus.PREPARED for item in self.root):
@@ -759,25 +759,26 @@ class ScanClaim(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     scan_key: str = Field(min_length=1)
-    execution_id: Optional[str] = Field(default=None, min_length=1)
-    claimed_at: Optional[AwareDatetime] = None
+    execution_id: str | None = Field(default=None, min_length=1)
+    claimed_at: AwareDatetime | None = None
     status: ScanClaimStatus
-    completed_at: Optional[AwareDatetime] = None
+    completed_at: AwareDatetime | None = None
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> "ScanClaim":
-        if self.status is ScanClaimStatus.IN_PROGRESS:
-            if self.claimed_at is None or self.completed_at is not None:
-                raise ValueError(
-                    "in-progress claims require claimed_at and forbid completed_at"
-                )
+        if self.status is ScanClaimStatus.IN_PROGRESS and (
+            self.claimed_at is None or self.completed_at is not None
+        ):
+            raise ValueError(
+                "in-progress claims require claimed_at and forbid completed_at"
+            )
         return self
 
 
 class ScanClaimState(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    claims: List[ScanClaim] = Field(default_factory=list)
+    claims: list[ScanClaim] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def unique_scan_keys(self) -> "ScanClaimState":

@@ -1,52 +1,47 @@
-# common/notification/formatter.py
-
-"""분석된 데이터를 기반으로 사용자에게 보여질 최종 알림 메시지를 생성합니다."""
+"""Render validated market evidence as localized operator notifications."""
 
 import datetime
-from typing import Dict, List, Optional
 
 import numpy as np
 
 import config
 from common.models import (
     Alert,
-    AlertHistory,
     AttentionCandidate,
     AttentionLane,
     AttentionStage,
     DataQualityIssue,
     EvidenceFamily,
     EvidenceVerdict,
-    MarketTicker,
     MarketRegimeSnapshot,
+    MarketTicker,
     RejectionCode,
     SignalType,
     TickerData,
 )
 
+KOREA_STANDARD_TIME = datetime.timezone(datetime.timedelta(hours=9))
 
-KST = datetime.timezone(datetime.timedelta(hours=9))
 
-
-def _kst_clock(observed_at: datetime.datetime) -> str:
+def _format_kst_clock(observed_at: datetime.datetime) -> str:
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
-    return observed_at.astimezone(KST).strftime("%H:%M")
+    return observed_at.astimezone(KOREA_STANDARD_TIME).strftime("%H:%M")
 
 
 class NotificationFormatter:
-    """분석된 데이터와 알림 객체를 기반으로 사용자 메시지를 생성하는 클래스입니다."""
+    """Format market evidence without changing its decision semantics."""
 
     def format_data_quality_alert(
         self,
-        issues: List[DataQualityIssue],
+        issues: list[DataQualityIssue],
         observed_at: datetime.datetime,
     ) -> str:
         """Format an operational incident without presenting market analysis as valid."""
         details = "\n".join(self._format_data_quality_issue(issue) for issue in issues)
         return "\n".join(
             [
-                f"🚨 **시장 데이터 품질 장애 ({_kst_clock(observed_at)} KST 기준)**",
+                f"🚨 **시장 데이터 품질 장애 ({_format_kst_clock(observed_at)} KST 기준)**",
                 "이번 스캔은 시장 데이터가 안전 기준을 충족하지 못해 관심종목과 일반 브리핑을 제공하지 않았습니다.",
                 details,
                 "다음 예약 실행에서 새 시장 데이터를 다시 확인합니다.",
@@ -84,55 +79,62 @@ class NotificationFormatter:
 
     def format_daily_briefing(
         self,
-        alerts: List[Alert],
-        raw_tickers: List[MarketTicker],
-        enriched_tickers: Dict[str, TickerData],
-        current_rankings: Dict[str, int],
-        previous_rankings: Dict[str, int],
-        SECTORS: Dict[str, List[str]],
-        REVERSE_SECTOR_MAP: Dict[str, List[str]],
-        alert_history: Dict[str, AlertHistory],
+        alerts: list[Alert],
+        raw_tickers: list[MarketTicker],
+        enriched_tickers: dict[str, TickerData],
+        current_rankings: dict[str, int],
+        previous_rankings: dict[str, int],
+        markets_by_sector: dict[str, list[str]],
+        sectors_by_market: dict[str, list[str]],
         market_regime: MarketRegimeSnapshot,
         observed_at: datetime.datetime,
-        attention_queue: Optional[List[AttentionCandidate]] = None,
+        attention_queue: list[AttentionCandidate] | None = None,
     ) -> str:
-        """시장 브리핑 전체 메시지를 조립합니다."""
-        parts = [f"📊 **업비트 마켓 브리핑 ({_kst_clock(observed_at)} KST 기준)**"]
+        """Assemble one localized market briefing from validated inputs."""
+        parts = [
+            f"📊 **업비트 마켓 브리핑 ({_format_kst_clock(observed_at)} KST 기준)**"
+        ]
 
         if attention_queue:
             parts.extend(
                 [
                     "\n---",
-                    self._format_attention_queue(attention_queue, REVERSE_SECTOR_MAP),
+                    self._format_attention_queue(attention_queue, sectors_by_market),
                 ]
             )
 
         if alerts:
             parts.extend(["\n---", "⚡ **중요 상태 변경**"])
-            for alert in alerts[:10]:
-                parts.append(
-                    self._format_single_alert(alert, REVERSE_SECTOR_MAP, market_regime)
-                )
+            parts.extend(
+                self._format_single_alert(alert, sectors_by_market, market_regime)
+                for alert in alerts[:10]
+            )
         elif not attention_queue:
             parts.extend(["\n---", "✅ 현재 관심 필터를 통과한 종목이 없습니다."])
 
-        parts.extend(["\n---", self._format_market_status(raw_tickers, enriched_tickers)])
+        parts.extend(
+            ["\n---", self._format_market_status(raw_tickers, enriched_tickers)]
+        )
 
-        if leading_sectors_str := self._format_leading_sectors(
-            enriched_tickers, SECTORS
+        if leading_sectors_section := self._format_leading_sectors(
+            enriched_tickers,
+            markets_by_sector,
         ):
-            parts.extend(
-                ["\n---", "🔥 **주도 섹터 (1시간 기준)**", leading_sectors_str]
-            )
+            parts.extend(["\n---", leading_sectors_section])
 
-        parts.append(self._format_top_10_ranking(current_rankings, previous_rankings))
+        parts.extend(
+            [
+                "\n---",
+                self._format_top_10_ranking(current_rankings, previous_rankings),
+            ]
+        )
 
         return "\n".join(parts)
 
     def _format_attention_queue(
         self,
-        candidates: List[AttentionCandidate],
-        reverse_sector_map: Dict[str, List[str]],
+        candidates: list[AttentionCandidate],
+        sectors_by_market: dict[str, list[str]],
     ) -> str:
         """Render guarded lane cards plus every folded broad-filter survivor."""
         lane_labels = {
@@ -159,7 +161,7 @@ class NotificationFormatter:
                 visible, key=lambda item: item.display_rank or 1_000_000
             ):
                 lines.extend(
-                    self._format_attention_candidate(candidate, reverse_sector_map)
+                    self._format_attention_candidate(candidate, sectors_by_market)
                 )
             folded = [candidate for candidate in candidates if not candidate.displayed]
             if folded:
@@ -187,7 +189,7 @@ class NotificationFormatter:
                 continue
             for candidate in lane_visible:
                 lines.extend(
-                    self._format_attention_candidate(candidate, reverse_sector_map)
+                    self._format_attention_candidate(candidate, sectors_by_market)
                 )
 
         folded = [candidate for candidate in candidates if not candidate.displayed]
@@ -209,8 +211,8 @@ class NotificationFormatter:
     def _format_attention_candidate(
         self,
         candidate: AttentionCandidate,
-        reverse_sector_map: Dict[str, List[str]],
-    ) -> List[str]:
+        sectors_by_market: dict[str, list[str]],
+    ) -> list[str]:
         """Format one primary card with observational, non-predictive direction text."""
         stage_labels = {
             AttentionStage.DISCOVERED: "발견",
@@ -220,7 +222,7 @@ class NotificationFormatter:
             AttentionStage.FAILED: "구조실패",
         }
         symbol = candidate.market.removeprefix("KRW-")
-        tags = reverse_sector_map.get(candidate.market, [])
+        tags = sectors_by_market.get(candidate.market, [])
         tag = f" · {tags[0]}" if tags else ""
         marker = "●" if candidate.material_change else "○"
         market_rank = (
@@ -231,7 +233,9 @@ class NotificationFormatter:
         if candidate.market_rank_delta:
             arrow = "↑" if candidate.market_rank_delta > 0 else "↓"
             market_rank += f" {arrow}{abs(candidate.market_rank_delta)}"
-        first_seen = candidate.first_seen_at.astimezone(KST).strftime("%H:%M")
+        first_seen = candidate.first_seen_at.astimezone(KOREA_STANDARD_TIME).strftime(
+            "%H:%M"
+        )
         chart_url = f"https://upbit.com/exchange?code=CRIX.UPBIT.{candidate.market}"
         lines = [
             f"{candidate.display_rank or candidate.lane_rank}. {marker} **{symbol}**{tag} "
@@ -301,7 +305,7 @@ class NotificationFormatter:
         self,
         candidate: AttentionCandidate,
         context,
-    ) -> List[str]:
+    ) -> list[str]:
         direction_up = (candidate.price_change_10m or 0.0) > 0
         direction_down = (candidate.price_change_10m or 0.0) < 0
         trend = context.metrics.get("trend_1h")
@@ -319,19 +323,17 @@ class NotificationFormatter:
 
     def _format_market_status(
         self,
-        raw_tickers: List[MarketTicker],
-        enriched_tickers: Dict[str, TickerData],
+        raw_tickers: list[MarketTicker],
+        enriched_tickers: dict[str, TickerData],
     ) -> str:
-        """시장 현황 요약 문자열을 생성합니다."""
+        """Summarize breadth and 24-hour major-market turnover share."""
         gainers = sum(
-            1
-            for t in enriched_tickers.values()
-            if t.price_change_10m is not None and t.price_change_10m > 0
+            ticker.price_change_10m is not None and ticker.price_change_10m > 0
+            for ticker in enriched_tickers.values()
         )
         losers = sum(
-            1
-            for t in enriched_tickers.values()
-            if t.price_change_10m is not None and t.price_change_10m < 0
+            ticker.price_change_10m is not None and ticker.price_change_10m < 0
+            for ticker in enriched_tickers.values()
         )
         mood = (
             "강세"
@@ -358,138 +360,138 @@ class NotificationFormatter:
         )
 
     def _format_leading_sectors(
-        self, enriched_tickers: Dict[str, TickerData], SECTORS: Dict[str, List[str]]
-    ) -> Optional[str]:
-        """
-        [Advanced] 시장 대비 초과 수익(Alpha)과 다중 시간대(1H, 4H) 검증을 통한 주도 섹터 발굴
-        """
-        # 시장 전체 평균 (Benchmark) 계산
-        all_changes_1h = [
-            t.price_change_1h
-            for t in enriched_tickers.values()
-            if t.price_change_1h is not None
+        self,
+        enriched_tickers: dict[str, TickerData],
+        markets_by_sector: dict[str, list[str]],
+    ) -> str | None:
+        """Render sectors with sustained excess return, breadth, and activity."""
+        market_returns_1h = [
+            ticker.price_change_1h
+            for ticker in enriched_tickers.values()
+            if ticker.price_change_1h is not None
         ]
-        all_changes_4h = [
-            t.price_change_4h
-            for t in enriched_tickers.values()
-            if t.price_change_4h is not None
+        market_returns_4h = [
+            ticker.price_change_4h
+            for ticker in enriched_tickers.values()
+            if ticker.price_change_4h is not None
         ]
-
-        if not all_changes_1h or not all_changes_4h:
+        if not market_returns_1h or not market_returns_4h:
             return None
 
-        market_avg_1h = np.mean(all_changes_1h)
-        market_avg_4h = np.mean(all_changes_4h)
-
-        # 시장 상황(Regime)에 따른 동적 임계값 설정
-        if market_avg_1h > 0:
-            min_alpha_1h = 2.0  # 상승장: 시장보다 2%p 더 강해야 함
-            header_icon = "🚀"
-            header_text = "주도 섹터 (상승장)"
+        market_average_1h = float(np.mean(market_returns_1h))
+        market_average_4h = float(np.mean(market_returns_4h))
+        if market_average_1h > 0:
+            minimum_alpha_1h = config.LEADING_SECTOR_BULL_MIN_ALPHA_1H
+            section_icon = "🚀"
+            section_title = "주도 섹터 (상승장)"
         else:
-            min_alpha_1h = 1.5  # 하락장: 1.5%p만 방어해도 훌륭함
-            header_icon = "🛡️"
-            header_text = "방어 섹터 (하락장)"
+            minimum_alpha_1h = config.LEADING_SECTOR_BEAR_MIN_ALPHA_1H
+            section_icon = "🛡️"
+            section_title = "방어 섹터 (하락장)"
 
-        sector_perf = {}
-
-        for name, coins in SECTORS.items():
-            # 데이터 유효성 체크
-            tickers = [
-                enriched_tickers.get(c) for c in coins if enriched_tickers.get(c)
+        sector_metrics_by_name: dict[str, dict[str, float | str]] = {}
+        for sector_name, sector_markets in markets_by_sector.items():
+            sector_tickers = [
+                ticker
+                for market in sector_markets
+                if (ticker := enriched_tickers.get(market)) is not None
+                and ticker.price_change_1h is not None
+                and ticker.price_change_4h is not None
             ]
-            valid_tickers = [
-                t
-                for t in tickers
-                if t.price_change_1h is not None and t.price_change_4h is not None
-            ]
+            if len(sector_tickers) < config.LEADING_SECTOR_MIN_MARKETS:
+                continue
 
-            if len(valid_tickers) < 4:
-                continue  # 최소 4개 종목 이상인 섹터만 분석
+            average_return_1h = float(
+                np.mean([ticker.price_change_1h for ticker in sector_tickers])
+            )
+            average_return_4h = float(
+                np.mean([ticker.price_change_4h for ticker in sector_tickers])
+            )
+            average_relative_volume = float(
+                np.mean([ticker.relative_volume or 1.0 for ticker in sector_tickers])
+            )
+            alpha_1h = average_return_1h - market_average_1h
+            alpha_4h = average_return_4h - market_average_4h
 
-            # 섹터 지표 계산
-            avg_return_1h = np.mean([t.price_change_1h for t in valid_tickers])
-            avg_return_4h = np.mean([t.price_change_4h for t in valid_tickers])
-            avg_rvol = np.mean([t.relative_volume or 1.0 for t in valid_tickers])
-
-            # Alpha (초과 수익)
-            alpha_1h = avg_return_1h - market_avg_1h
-            alpha_4h = avg_return_4h - market_avg_4h
-
-            # Breadth (너비) - 대장주 착시 방지
+            # Breadth prevents one large constituent from defining the sector.
             beating_market_count = sum(
-                1 for t in valid_tickers if t.price_change_1h > market_avg_1h
+                ticker.price_change_1h > market_average_1h for ticker in sector_tickers
             )
-            breadth_ratio = beating_market_count / len(valid_tickers)
-
-            # 섹터 크기에 따른 Breadth 기준 차등
-            min_breadth = 0.6 if len(valid_tickers) >= 10 else 0.75
-
-            # 필터링
+            breadth_ratio = beating_market_count / len(sector_tickers)
+            minimum_breadth = (
+                config.LEADING_SECTOR_LARGE_MIN_BREADTH
+                if len(sector_tickers) >= config.LEADING_SECTOR_LARGE_MARKET_COUNT
+                else config.LEADING_SECTOR_SMALL_MIN_BREADTH
+            )
             if (
-                alpha_1h > min_alpha_1h
-                and alpha_4h > 0.5
-                and avg_rvol > 1.5
-                and breadth_ratio >= min_breadth
+                alpha_1h <= minimum_alpha_1h
+                or alpha_4h <= config.LEADING_SECTOR_MIN_ALPHA_4H
+                or average_relative_volume <= config.LEADING_SECTOR_MIN_AVERAGE_RVOL
+                or breadth_ratio < minimum_breadth
             ):
-                sector_perf[name] = {
-                    "alpha_1h": alpha_1h,
-                    "alpha_4h": alpha_4h,
-                    "avg_rvol": avg_rvol,
-                    "consistency": f"{beating_market_count}/{len(valid_tickers)}",
-                    "score": alpha_1h * 0.7 + alpha_4h * 0.3,
-                }
+                continue
 
-        if not sector_perf:
+            sector_metrics_by_name[sector_name] = {
+                "alpha_1h": alpha_1h,
+                "average_relative_volume": average_relative_volume,
+                "constituent_breadth": (
+                    f"{beating_market_count}/{len(sector_tickers)}"
+                ),
+                "score": alpha_1h * 0.7 + alpha_4h * 0.3,
+            }
+
+        if not sector_metrics_by_name:
             return None
-
-        # 점수순 정렬
-        sorted_sectors = sorted(
-            sector_perf.items(), key=lambda item: item[1]["score"], reverse=True
+        ranked_sectors = sorted(
+            sector_metrics_by_name.items(),
+            key=lambda item: item[1]["score"],
+            reverse=True,
         )
-
-        lines = []
-        for name, perf in sorted_sectors[:5]:
+        lines = [f"{section_icon} **{section_title}**"]
+        for sector_name, metrics in ranked_sectors[: config.LEADING_SECTOR_MAX_DISPLAY]:
             lines.append(
-                f"- **{name} ({perf['consistency']}):** "
-                f"Alpha `{perf['alpha_1h']:+.1f}%p` (RVOL {perf['avg_rvol']:.1f}x)"
+                f"- **{sector_name} ({metrics['constituent_breadth']}):** "
+                f"Alpha `{metrics['alpha_1h']:+.1f}%p` "
+                f"(RVOL {metrics['average_relative_volume']:.1f}x)"
             )
-
-        return f"\n---\n{header_icon} **{header_text}**\n" + "\n".join(lines)
+        return "\n".join(lines)
 
     def _format_top_10_ranking(
-        self, current_rankings: Dict[str, int], previous_rankings: Dict[str, int]
+        self,
+        current_rankings: dict[str, int],
+        previous_rankings: dict[str, int],
     ) -> str:
-        """24시간 거래대금 TOP 10 문자열을 생성합니다."""
-        top_10 = sorted(
-            [(m, r) for m, r in current_rankings.items() if r <= 10],
+        """Render the current top-ten turnover ranking and rank changes."""
+        top_ten = sorted(
+            [(market, rank) for market, rank in current_rankings.items() if rank <= 10],
             key=lambda item: item[1],
         )
-        rank_strs = []
-        for market, rank in top_10:
-            prev_rank = previous_rankings.get(market)
-            change_str = ""
-            if prev_rank:
-                change = prev_rank - rank
-                if change > 0:
-                    change_str = f" (↑{change})"
-                elif change < 0:
-                    change_str = f" (↓{abs(change)})"
-            rank_strs.append(f"{rank}. {market.removeprefix('KRW-')}{change_str}")
-
-        return "\n---\n🏆 **24h 거래대금 TOP 10:**\n" + " | ".join(rank_strs)
+        ranking_entries = []
+        for market, rank in top_ten:
+            previous_rank = previous_rankings.get(market)
+            change_text = ""
+            if previous_rank is not None:
+                rank_change = previous_rank - rank
+                if rank_change > 0:
+                    change_text = f" (↑{rank_change})"
+                elif rank_change < 0:
+                    change_text = f" (↓{abs(rank_change)})"
+            ranking_entries.append(
+                f"{rank}. {market.removeprefix('KRW-')}{change_text}"
+            )
+        return "🏆 **24h 거래대금 TOP 10:**\n" + " | ".join(ranking_entries)
 
     def _format_single_alert(
         self,
         alert: Alert,
-        reverse_sector_map: Dict[str, List[str]],
+        sectors_by_market: dict[str, list[str]],
         market_regime: MarketRegimeSnapshot,
     ) -> str:
-        """단일 알림을 객관적인 Signal Checklist 포맷으로 생성합니다."""
+        """Render one classified alert as an objective evidence checklist."""
         candidate = alert.candidate
         ticker = alert.ticker_data
         market = candidate.market
-        tags = reverse_sector_map.get(market, [])
+        tags = sectors_by_market.get(market, [])
         tag = tags[0] if tags else ""
 
         signal_map = {
@@ -525,4 +527,4 @@ class NotificationFormatter:
 
         checklist.append("```")
 
-        return "\n".join([header] + checklist)
+        return "\n".join([header, *checklist])

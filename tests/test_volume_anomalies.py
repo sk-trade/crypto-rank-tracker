@@ -1,18 +1,26 @@
 import datetime
 
-from common.analysis.scanner import evaluate_candidate_eligibility, process_lightweight_indicators
+from common.analysis.scanner import (
+    build_lightweight_tickers,
+    evaluate_candidate_eligibility,
+)
 from common.models import CandleData, LiquidityTier, RejectionCode, TickerData
 
 
 def _candle(market: str, timestamp: datetime.datetime, volume: float) -> CandleData:
     return CandleData(
-        market=market, timestamp=timestamp, open_price=100.0, high_price=100.0,
-        low_price=100.0, close_price=100.0, volume=volume,
+        market=market,
+        timestamp=timestamp,
+        open_price=100.0,
+        high_price=100.0,
+        low_price=100.0,
+        close_price=100.0,
+        volume=volume,
     )
 
 
 def test_conditional_and_cross_sectional_volume_anomalies_are_separate():
-    latest = datetime.datetime(2026, 7, 13, 11, 50, tzinfo=datetime.timezone.utc)
+    latest = datetime.datetime(2026, 7, 13, 11, 50, tzinfo=datetime.UTC)
 
     def history(market: str, baseline_volume: float, latest_volume: float):
         same_slot = [
@@ -21,7 +29,11 @@ def test_conditional_and_cross_sectional_volume_anomalies_are_separate():
         ]
         recent_start = latest - datetime.timedelta(minutes=10 * 153)
         recent = [
-            _candle(market, recent_start + datetime.timedelta(minutes=10 * index), baseline_volume)
+            _candle(
+                market,
+                recent_start + datetime.timedelta(minutes=10 * index),
+                baseline_volume,
+            )
             for index in range(154)
         ]
         recent[-1] = _candle(market, latest, latest_volume)
@@ -31,7 +43,7 @@ def test_conditional_and_cross_sectional_volume_anomalies_are_separate():
     second = history("KRW-B", 10.0, 10.0)
     third = history("KRW-C", 20.0, 40.0)
 
-    tickers = process_lightweight_indicators(
+    tickers = build_lightweight_tickers(
         {"KRW-A": first, "KRW-B": second, "KRW-C": third}
     )
 

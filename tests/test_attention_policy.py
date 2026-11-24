@@ -22,8 +22,7 @@ from common.models import (
     StructureDirection,
 )
 
-
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 
 def test_frozen_artifact_matches_sealed_golden_scores():

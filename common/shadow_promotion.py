@@ -1,8 +1,8 @@
 """Promotion policy for a frozen model and threshold shadow run."""
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
-import math
 
 
 @dataclass(frozen=True)
@@ -29,8 +29,13 @@ class ShadowPromotionResult:
 
 
 def promote_shadow_run(
-    run: ShadowRun, *, frozen_model_version: str, frozen_threshold: float,
-    minimum_events: int, minimum_net_expected_return: float, minimum_hit_rate: float,
+    run: ShadowRun,
+    *,
+    frozen_model_version: str,
+    frozen_threshold: float,
+    minimum_events: int,
+    minimum_net_expected_return: float,
+    minimum_hit_rate: float,
 ) -> ShadowPromotionResult:
     finite_metrics = (
         run.threshold,

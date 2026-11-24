@@ -10,7 +10,9 @@ from common.state_manager import load_rank_state_history, save_rank_state_histor
 from common.storage_client import StateLoadError
 
 
-def test_rank_state_persists_across_reload_and_trims_oldest_entries(monkeypatch, tmp_path):
+def test_rank_state_persists_across_reload_and_trims_oldest_entries(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(config, "STATE_HISTORY_COUNT", 2)
@@ -18,7 +20,10 @@ def test_rank_state_persists_across_reload_and_trims_oldest_entries(monkeypatch,
     async def scenario():
         history = []
         for index in range(3):
-            state = RankState(last_updated=datetime.datetime(2026, 1, 1, index, tzinfo=datetime.timezone.utc), rankings={"KRW-BTC": index})
+            state = RankState(
+                last_updated=datetime.datetime(2026, 1, 1, index, tzinfo=datetime.UTC),
+                rankings={"KRW-BTC": index},
+            )
             await save_rank_state_history(state, history)
             history = await load_rank_state_history()
         return await load_rank_state_history()
@@ -34,11 +39,11 @@ def test_delayed_rank_state_keeps_the_latest_market_time_as_the_next_baseline(
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(config, "STATE_HISTORY_COUNT", 2)
     newer = RankState(
-        last_updated=datetime.datetime(2026, 1, 1, 12, 10, tzinfo=datetime.timezone.utc),
+        last_updated=datetime.datetime(2026, 1, 1, 12, 10, tzinfo=datetime.UTC),
         rankings={"KRW-BTC": 1},
     )
     delayed = RankState(
-        last_updated=datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc),
+        last_updated=datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC),
         rankings={"KRW-BTC": 2},
     )
 

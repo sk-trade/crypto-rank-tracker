@@ -6,16 +6,12 @@ from common.models import SectorTagStatus
 
 
 def test_unique_symbol_identity_does_not_depend_on_provider_display_name():
-    coin = update_sectors.CoinGeckoDetail(
-        name="Bitcoin", platforms={"ethereum": "0x1"}
-    )
+    coin = update_sectors.CoinGeckoDetail(name="Bitcoin", platforms={"ethereum": "0x1"})
     assert update_sectors.validate_coin_identity(coin)
 
 
 def test_explicit_override_rejects_name_or_network_mismatch():
-    coin = update_sectors.CoinGeckoDetail(
-        name="Bitcoin", platforms={"ethereum": "0x1"}
-    )
+    coin = update_sectors.CoinGeckoDetail(name="Bitcoin", platforms={"ethereum": "0x1"})
     assert not update_sectors.validate_coin_identity(
         coin,
         update_sectors.CoinGeckoOverride(
@@ -40,10 +36,12 @@ def test_structured_override_requires_matching_name_and_network():
     )
 
 
-def test_tag_market_accepts_unique_symbol_when_provider_names_differ(monkeypatch):
+def test_resolve_market_sector_tags_accepts_unique_symbol_when_provider_names_differ(
+    monkeypatch,
+):
     monkeypatch.setattr(
         update_sectors,
-        "get_coin_detail",
+        "fetch_coingecko_coin_detail",
         AsyncMock(
             return_value=update_sectors.CoinGeckoDetail(
                 name="Different Asset", categories=["Payments"]
@@ -53,7 +51,9 @@ def test_tag_market_accepts_unique_symbol_when_provider_names_differ(monkeypatch
     monkeypatch.setattr(update_sectors, "CG_SYMBOL_OVERRIDES", {})
 
     result = asyncio.run(
-        update_sectors.tag_market(None, "pay", "KRW-PAY", {"pay": ["tenx"]})
+        update_sectors.resolve_market_sector_tags(
+            None, "pay", "KRW-PAY", {"pay": ["tenx"]}
+        )
     )
 
     assert result.market == "KRW-PAY"
@@ -61,10 +61,12 @@ def test_tag_market_accepts_unique_symbol_when_provider_names_differ(monkeypatch
     assert result.categories == ["Payments"]
 
 
-def test_tag_market_rejects_explicit_override_identity_mismatch(monkeypatch):
+def test_resolve_market_sector_tags_rejects_explicit_override_identity_mismatch(
+    monkeypatch,
+):
     monkeypatch.setattr(
         update_sectors,
-        "get_coin_detail",
+        "fetch_coingecko_coin_detail",
         AsyncMock(
             return_value=update_sectors.CoinGeckoDetail(
                 name="Different Asset", categories=["Payments"]
@@ -74,15 +76,11 @@ def test_tag_market_rejects_explicit_override_identity_mismatch(monkeypatch):
     monkeypatch.setattr(
         update_sectors,
         "CG_SYMBOL_OVERRIDES",
-        {
-            "pay": update_sectors.CoinGeckoOverride(
-                id="tenx", name="TenX"
-            )
-        },
+        {"pay": update_sectors.CoinGeckoOverride(id="tenx", name="TenX")},
     )
 
     result = asyncio.run(
-        update_sectors.tag_market(
+        update_sectors.resolve_market_sector_tags(
             None, "pay", "KRW-PAY", {"pay": ["tenx", "tenx-pay"]}
         )
     )

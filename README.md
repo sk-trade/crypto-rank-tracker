@@ -15,9 +15,24 @@ Set these environment variables for runtime behavior:
 - `GCP_PROJECT_ID`: Google Cloud project identifier. Production workflows require it; local GCS use may omit it only when Application Default Credentials can infer the project.
 - `CG_SYMBOL_OVERRIDES`: optional JSON object mapping an ambiguous lower-case symbol to an explicit CoinGecko id, for example `{"pay":"tenx"}`. Values may also provide explicit `name` and `network` constraints. Unique CoinGecko symbols do not depend on provider display-name equality; ambiguous symbols without a valid override are left untagged.
 
+## Architecture
+
+The repository is a modular monolith. Each module owns one operational boundary:
+
+- `main.py` coordinates one completed-candle scan; it does not parse provider payloads or implement persistence.
+- `common/upbit_client.py` owns Upbit request pacing, response validation, candle normalization, and typed provider errors.
+- `common/analysis/`, `common/signals/`, and `common/attention.py` own deterministic feature, signal, episode, and ranking calculations.
+- `common/event_log.py` records immutable decision evidence; `common/outcomes.py` resolves later performance without rewriting the original event.
+- `common/state_manager.py` and `common/storage_client.py` own local/GCS state transitions and idempotency.
+- `common/notification/` owns formatting, durable outbox/backlog state, and webhook delivery recovery.
+- `common/replay.py` reuses production feature and attention functions at point-in-time boundaries; `replay_upbit.py` is only its CLI and collection entrypoint.
+- `update_sectors.py` is the separate CoinGecko-to-Upbit sector refresh entrypoint.
+
+External data is validated at the client boundary. A scan fails closed when required market, candle, orderbook, or durable-state evidence cannot be verified.
+
 ## Local setup
 
-Install dependencies with:
+Install the locked Python 3.11 environment:
 
 ```bash
 uv sync --frozen
@@ -25,17 +40,22 @@ uv sync --frozen
 
 ## Local verification
 
-Run the same checks used for local validation:
+Run the same checks as the pull-request workflow:
 
 ```bash
+uv run ruff check .
+uv run ruff format --check .
 uv run python -m pytest
 uv run python -m compileall main.py config.py update_sectors.py replay_upbit.py common tests
+rm -rf dist
 uv build
 WHEEL_PATH="$(realpath dist/*.whl)"
 TEMP_DIR="$(mktemp -d)"
 (cd "$TEMP_DIR" && uv run --no-cache --isolated --with "$WHEEL_PATH" python -c \
   "import main, update_sectors, replay_upbit, config, common.upbit_client, common.notification.main")
 ```
+
+Tests use an ephemeral local state directory and disable webhook delivery. `main.py`, `update_sectors.py`, and `replay_upbit.py` are live entrypoints; do not use them as substitutes for verification.
 
 ## Local execution
 

@@ -30,7 +30,15 @@ def test_feature_requires_significant_and_stable_incremental_oos_value():
 
 
 def test_feature_is_rejected_when_any_required_oos_check_fails():
-    result = approve_feature(FeatureEvaluation(0.1, 0.05, {LiquidityTier.HIGH: 0.1, LiquidityTier.LOW: -0.01}, {MarketRegime.TRENDING_BULL: 0.1}, (-0.01, 0.2)))
+    result = approve_feature(
+        FeatureEvaluation(
+            0.1,
+            0.05,
+            {LiquidityTier.HIGH: 0.1, LiquidityTier.LOW: -0.01},
+            {MarketRegime.TRENDING_BULL: 0.1},
+            (-0.01, 0.2),
+        )
+    )
     assert not result.approved
     assert FeatureApprovalCode.INCREMENTAL_VALUE_NOT_SIGNIFICANT in result.reasons
     assert FeatureApprovalCode.LIQUIDITY_DIRECTION_NOT_STABLE in result.reasons

@@ -28,12 +28,13 @@ from replay_upbit import (
     _tmp_path,
     collect_dataset,
     load_dataset,
-    run as run_replay,
     save_dataset,
 )
+from replay_upbit import (
+    run as run_replay,
+)
 
-
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 
 def _candle(
@@ -332,7 +333,7 @@ def test_replay_run_reuses_superset_cache_and_separates_outputs(tmp_path, monkey
     async def fake_sectors():
         return {}, {}
 
-    monkeypatch.setattr("replay_upbit.load_and_process_sectors", fake_sectors)
+    monkeypatch.setattr("replay_upbit.load_sector_maps", fake_sectors)
     report = asyncio.run(
         run_replay(
             SimpleNamespace(

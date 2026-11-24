@@ -1,15 +1,19 @@
 """A small point-in-time logistic baseline for offline comparison only."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 
 from common.models import ScanEvent, ScanOutcome
 
 FEATURES = (
-    "price_surprise", "conditional_log_rvol_z_score", "cross_sectional_log_rvol_z_score",
-    "residual_momentum_score", "execution_spread_bps", "expected_slippage_bps",
+    "price_surprise",
+    "conditional_log_rvol_z_score",
+    "cross_sectional_log_rvol_z_score",
+    "residual_momentum_score",
+    "execution_spread_bps",
+    "expected_slippage_bps",
 )
 MIN_TRAINING_ROWS = 30
 
@@ -25,10 +29,14 @@ class LogisticBaseline:
         if values is None:
             raise ValueError("missing baseline feature")
         x = (values - self.means) / self.scales
-        return float(1 / (1 + np.exp(-np.clip(np.r_[1.0, x] @ self.coefficients, -30, 30))))
+        return float(
+            1 / (1 + np.exp(-np.clip(np.r_[1.0, x] @ self.coefficients, -30, 30)))
+        )
 
 
-def fit_baseline(events: Iterable[ScanEvent], outcomes: Iterable[ScanOutcome]) -> LogisticBaseline:
+def fit_baseline(
+    events: Iterable[ScanEvent], outcomes: Iterable[ScanOutcome]
+) -> LogisticBaseline:
     outcomes_by_event = {outcome.event_id: outcome for outcome in outcomes}
     rows, labels = [], []
     for event in events:

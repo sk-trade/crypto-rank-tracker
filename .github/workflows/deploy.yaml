@@ -36,11 +36,14 @@ jobs:
       - name: Lint Python sources
         run: uv run ruff check .
 
+      - name: Check Python formatting
+        run: uv run ruff format --check .
+
       - name: Run tests
         run: uv run python -m pytest
 
       - name: Compile Python sources
-        run: uv run python -m compileall main.py config.py update_sectors.py common tests
+        run: uv run python -m compileall main.py config.py update_sectors.py replay_upbit.py common tests
 
       - name: Build package
         run: uv build
@@ -50,7 +53,7 @@ jobs:
           WHEEL_PATH="$(realpath dist/*.whl)"
           TEMP_DIR="$(mktemp -d)"
           cd "$TEMP_DIR"
-          uv run --no-cache --isolated --with "$WHEEL_PATH" python -c "import main, update_sectors, config, common.upbit_client, common.notification.main"
+          uv run --no-cache --isolated --with "$WHEEL_PATH" python -c "import main, update_sectors, replay_upbit, config, common.upbit_client, common.notification.main"
 
   deploy:
     needs: verify
@@ -60,13 +63,11 @@ jobs:
       group: crypto-rank-tracker-production-deploy
       cancel-in-progress: false
 
-    # GCP에 인증하기 위한 권한 설정
     permissions:
       contents: 'read'
       id-token: 'write'
 
     steps:
-      # GitHub 리포지토리의 코드를 가져옴
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -79,17 +80,14 @@ jobs:
             exit 1
           fi
 
-      # Python 환경 설정
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      # uv 설치
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
-      # uv 캐시 활성화
       - name: Restore uv cache
         uses: actions/cache@v4
         with:
@@ -99,7 +97,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-uv-
 
-      # uv로 의존성 동기화
       - name: Install dependencies
         run: uv sync --frozen
 
@@ -117,14 +114,12 @@ jobs:
             exit 1
           fi
 
-      # uv에서 requirements.txt 생성 (GCF 배포용)
       - name: Generate requirements.txt
         run: |
           uv export --format requirements-txt --no-dev --output-file requirements.txt
           echo "Generated requirements.txt:"
           cat requirements.txt
 
-      # Google Cloud에 인증
       - name: Authenticate to Google Cloud
         uses: 'google-github-actions/auth@v2'
         with:
@@ -160,23 +155,22 @@ jobs:
             --quiet
           echo "mapping=WEBHOOK_URL=projects/$GCP_PROJECT_ID/secrets/$WEBHOOK_SECRET_ID/versions/latest" >> "$GITHUB_OUTPUT"
 
-      # Google Cloud Functions에 배포
       - name: Deploy Function
         id: deploy
         uses: 'google-github-actions/deploy-cloud-functions@v3'
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
-          name: crypto-rank-tracker          # 배포할 함수 이름
-          runtime: python311                # 파이썬 런타임 버전
-          entry_point: main                 # 진입점 함수 이름
-          region: asia-northeast1                  # 리전
-          source_dir: ./                    # 소스 코드 디렉토리
+          name: crypto-rank-tracker
+          runtime: python311
+          entry_point: main
+          region: asia-northeast1
+          source_dir: ./
           service_account: ${{ secrets.GCP_RUNTIME_SA_EMAIL }}
           memory: 512M
           service_timeout: 540s
           max_instance_count: 1
           max_instance_request_concurrency: 1
-          environment_variables: |          # 환경 변수 설정
+          environment_variables: |
             STATE_STORAGE_METHOD=GCS
             GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
             GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }}
@@ -190,10 +184,8 @@ jobs:
             --member="serviceAccount:${{ secrets.GCP_SCHEDULER_SA_EMAIL }}" \
             --role="roles/run.invoker"
 
-      # Cloud Scheduler 설정 (10분마다 실행)
       - name: Create Cloud Scheduler Job
         run: |
-          # Cloud Function URL 가져오기
           FUNCTION_URL=$(gcloud functions describe crypto-rank-tracker --project="${{ secrets.GCP_PROJECT_ID }}" --region=asia-northeast1 --gen2 --format="value(serviceConfig.uri)")
 
           echo "Creating/Updating Cloud Scheduler job to trigger: $FUNCTION_URL"
@@ -212,14 +204,13 @@ jobs:
             --max-backoff=5m
             --max-doublings=2
             --time-zone="Asia/Seoul"
-            --description="10분마다 업비트 랭킹 체크"
+            --description="Run the Upbit attention scan every 10 minutes"
           )
 
           if ! gcloud scheduler jobs update http crypto-rank-tracker-scheduler "${SCHEDULER_ARGS[@]}"; then
             gcloud scheduler jobs create http crypto-rank-tracker-scheduler "${SCHEDULER_ARGS[@]}"
           fi
 
-      # 배포 결과 확인
       - name: Verify deployment
         run: |
           echo "Function deployed successfully!"

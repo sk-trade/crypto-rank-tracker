@@ -1,17 +1,16 @@
 import datetime
 
 import config
-from common.attention import build_attention_result
-from common.attention import build_attention_queue
+from common.attention import build_attention_queue, build_attention_result
 from common.models import (
     Alert,
     AttentionStage,
     CandleData,
     DataQualityIssue,
     MarketEvent,
-    MarketTicker,
     MarketRegime,
     MarketRegimeSnapshot,
+    MarketTicker,
     RejectionCode,
     SignalCandidate,
     SignalType,
@@ -40,7 +39,7 @@ def _alert(signal_type: SignalType, price_change: float = -2.5) -> Alert:
 def _header_for(signal_type: SignalType, price_change: float = -2.5) -> str:
     rendered = NotificationFormatter()._format_single_alert(
         alert=_alert(signal_type, price_change),
-        reverse_sector_map={},
+        sectors_by_market={},
         market_regime=MarketRegimeSnapshot(regime=MarketRegime.TRENDING_BULL),
     )
 
@@ -59,7 +58,7 @@ def test_formatter_omits_opaque_signal_score_from_alert_header():
 
 
 def test_data_quality_alert_does_not_claim_the_market_has_no_events():
-    observed_at = datetime.datetime(2026, 8, 14, 18, 30, tzinfo=datetime.timezone.utc)
+    observed_at = datetime.datetime(2026, 8, 14, 18, 30, tzinfo=datetime.UTC)
     message = NotificationFormatter().format_data_quality_alert(
         [
             DataQualityIssue(
@@ -94,7 +93,7 @@ def test_formatter_labels_cooldown_follow_up_alerts():
 
 
 def test_attention_queue_shows_progression_and_concrete_evidence_without_a_score():
-    observed_at = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+    observed_at = datetime.datetime(2026, 7, 19, tzinfo=datetime.UTC)
     candles = [
         CandleData(
             market="KRW-KAITO",
@@ -141,9 +140,8 @@ def test_attention_queue_shows_progression_and_concrete_evidence_without_a_score
         enriched_tickers={ticker.market: ticker},
         current_rankings={ticker.market: 42},
         previous_rankings={ticker.market: 60},
-        SECTORS={},
-        REVERSE_SECTOR_MAP={ticker.market: ["AI"]},
-        alert_history={},
+        markets_by_sector={},
+        sectors_by_market={ticker.market: ["AI"]},
         market_regime=MarketRegimeSnapshot(regime=MarketRegime.UNKNOWN),
         observed_at=observed_at,
         attention_queue=queue,
@@ -161,7 +159,7 @@ def test_attention_queue_shows_progression_and_concrete_evidence_without_a_score
 
 
 def test_attention_direction_text_surfaces_contrary_timeframes():
-    observed_at = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+    observed_at = datetime.datetime(2026, 7, 19, tzinfo=datetime.UTC)
     candles = [
         CandleData(
             market="KRW-KAITO",
@@ -211,7 +209,7 @@ def test_v3_rollback_formatter_preserves_visible_order_for_data_limited_cards(
     monkeypatch.setattr(
         config, "ATTENTION_VISIBLE_MODEL", config.ATTENTION_V3_MODEL_VERSION
     )
-    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.timezone.utc)
+    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.UTC)
     candles = [
         CandleData(
             market=market,
@@ -258,7 +256,7 @@ def test_ridge_formatter_renders_selected_data_limited_card(monkeypatch):
     monkeypatch.setattr(
         config, "ATTENTION_VISIBLE_MODEL", config.ATTENTION_RIDGE_MODEL_VERSION
     )
-    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.timezone.utc)
+    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.UTC)
     candle = CandleData(
         market="KRW-A",
         timestamp=observed_at,
@@ -304,7 +302,7 @@ def test_v4_rollback_formatter_keeps_lane_sections(monkeypatch):
     monkeypatch.setattr(
         config, "ATTENTION_VISIBLE_MODEL", config.ATTENTION_V4_MODEL_VERSION
     )
-    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.timezone.utc)
+    observed_at = datetime.datetime(2026, 7, 19, 0, 30, tzinfo=datetime.UTC)
     candle = CandleData(
         market="KRW-A",
         timestamp=observed_at,
@@ -342,3 +340,58 @@ def test_v4_rollback_formatter_keeps_lane_sections(monkeypatch):
     assert "v5 ridge" not in rendered
     assert "Early Watch" in rendered
     assert "**A**" in rendered
+
+
+def test_leading_sector_section_is_rendered_once_without_nested_separator():
+    observed_at = datetime.datetime(2026, 7, 19, tzinfo=datetime.UTC)
+    sector_markets = [f"KRW-LEAD-{index}" for index in range(4)]
+    other_markets = [f"KRW-BASE-{index}" for index in range(8)]
+    enriched_tickers = {
+        market: TickerData(
+            market=market,
+            candle_history=[],
+            price_change_10m=1.0,
+            price_change_1h=6.0,
+            price_change_4h=3.0,
+            relative_volume=2.0,
+        )
+        for market in sector_markets
+    }
+    enriched_tickers.update(
+        {
+            market: TickerData(
+                market=market,
+                candle_history=[],
+                price_change_10m=0.0,
+                price_change_1h=0.0,
+                price_change_4h=0.0,
+                relative_volume=1.0,
+            )
+            for market in other_markets
+        }
+    )
+    raw_tickers = [
+        MarketTicker(
+            market=market,
+            acc_trade_price_24h=100_000_000,
+            market_event=MarketEvent(warning=False, caution={}),
+        )
+        for market in enriched_tickers
+    ]
+
+    rendered = NotificationFormatter().format_daily_briefing(
+        alerts=[],
+        raw_tickers=raw_tickers,
+        enriched_tickers=enriched_tickers,
+        current_rankings={
+            market: index for index, market in enumerate(enriched_tickers, 1)
+        },
+        previous_rankings={},
+        markets_by_sector={"Leadership": sector_markets},
+        sectors_by_market={market: ["Leadership"] for market in sector_markets},
+        market_regime=MarketRegimeSnapshot(regime=MarketRegime.TRENDING_BULL),
+        observed_at=observed_at,
+    )
+
+    assert rendered.count("주도 섹터") == 1
+    assert "\n---\n\n---\n" not in rendered

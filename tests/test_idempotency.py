@@ -9,7 +9,7 @@ import config
 from common import state_manager
 from common.models import ScanClaimState
 from common.storage_client import (
-    StateBackendUnavailable,
+    StateBackendUnavailableError,
     StateErrorCode,
     StateLoadError,
     StateOperationError,
@@ -17,7 +17,7 @@ from common.storage_client import (
 
 
 def _duplicate_claims(kind, scan_key, retry_execution_id="retry"):
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     stale_time = now - datetime.timedelta(
         seconds=state_manager.SCAN_CLAIM_LEASE_SECONDS + 1
     )
@@ -59,19 +59,27 @@ def _duplicate_claims(kind, scan_key, retry_execution_id="retry"):
     return cases[kind]
 
 
-def test_local_scan_claim_is_atomic_and_preserves_execution_metadata(monkeypatch, tmp_path):
+def test_local_scan_claim_is_atomic_and_preserves_execution_metadata(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
 
     async def claim_twice():
         return await asyncio.gather(
-            state_manager.claim_scan_key("completed-candle:2026-06-18T00:10:00+00:00", "run-a"),
-            state_manager.claim_scan_key("completed-candle:2026-06-18T00:10:00+00:00", "run-b"),
+            state_manager.claim_scan_key(
+                "completed-candle:2026-06-18T00:10:00+00:00", "run-a"
+            ),
+            state_manager.claim_scan_key(
+                "completed-candle:2026-06-18T00:10:00+00:00", "run-b"
+            ),
         )
 
     claims = asyncio.run(claim_twice())
 
     assert sorted(claims) == [False, True]
-    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    state = json.loads(
+        (tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text()
+    )
     assert len(state["claims"]) == 1
     assert state["claims"][0]["execution_id"] in {"run-a", "run-b"}
 
@@ -80,8 +88,10 @@ def test_gcs_scan_claim_requires_a_gcs_client(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "GCS")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
 
-    with pytest.raises(StateBackendUnavailable) as error:
-        asyncio.run(state_manager.claim_scan_key("completed-candle:2026-06-18T00:10:00+00:00"))
+    with pytest.raises(StateBackendUnavailableError) as error:
+        asyncio.run(
+            state_manager.claim_scan_key("completed-candle:2026-06-18T00:10:00+00:00")
+        )
 
     assert error.value.code is StateErrorCode.BACKEND_UNAVAILABLE
     assert error.value.resource == state_manager.IDEMPOTENCY_STATE_FILE_NAME
@@ -192,7 +202,9 @@ def test_same_scheduler_execution_reclaims_an_in_progress_scan(monkeypatch, tmp_
     assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is True
     assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is True
 
-    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    state = json.loads(
+        (tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text()
+    )
     assert state["claims"][0]["status"] == "in_progress"
 
 
@@ -205,11 +217,15 @@ def test_completed_scan_key_cannot_be_reclaimed(monkeypatch, tmp_path):
     asyncio.run(state_manager.complete_scan_key(scan_key))
 
     assert asyncio.run(state_manager.claim_scan_key(scan_key, "run-a")) is False
-    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    state = json.loads(
+        (tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text()
+    )
     assert state["claims"][0]["status"] == "completed"
 
 
-def test_malformed_local_claim_state_cannot_reclaim_a_completed_scan(monkeypatch, tmp_path):
+def test_malformed_local_claim_state_cannot_reclaim_a_completed_scan(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
@@ -285,9 +301,7 @@ def test_duplicate_local_claim_state_is_rejected_and_preserved(
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
-    original_text = json.dumps(
-        {"claims": _duplicate_claims(duplicate_kind, scan_key)}
-    )
+    original_text = json.dumps({"claims": _duplicate_claims(duplicate_kind, scan_key)})
     state_path = tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME
     state_path.write_text(original_text, encoding="utf-8")
 
@@ -324,7 +338,7 @@ def test_duplicate_local_claim_state_blocks_all_mutations(
 def test_distinct_local_claim_records_remain_valid(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now = datetime.datetime.now(datetime.UTC).isoformat()
     state_path = tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME
     state_path.write_text(
         json.dumps(
@@ -350,7 +364,9 @@ def test_legacy_claim_without_status_remains_a_completed_marker(monkeypatch, tmp
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
     state_path = tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME
-    state_path.write_text(json.dumps({"claims": [{"scan_key": scan_key}]}), encoding="utf-8")
+    state_path.write_text(
+        json.dumps({"claims": [{"scan_key": scan_key}]}), encoding="utf-8"
+    )
 
     assert asyncio.run(state_manager.claim_scan_key(scan_key, "retry")) is False
 
@@ -364,7 +380,7 @@ def test_stale_in_progress_scan_can_be_reclaimed(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     scan_key = "completed-candle:2026-06-18T00:10:00+00:00"
-    stale_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+    stale_time = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         seconds=state_manager.SCAN_CLAIM_LEASE_SECONDS + 1
     )
     (tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).write_text(
@@ -384,7 +400,9 @@ def test_stale_in_progress_scan_can_be_reclaimed(monkeypatch, tmp_path):
     )
 
     assert asyncio.run(state_manager.claim_scan_key(scan_key, "new-run")) is True
-    state = json.loads((tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text())
+    state = json.loads(
+        (tmp_path / state_manager.IDEMPOTENCY_STATE_FILE_NAME).read_text()
+    )
     assert state["claims"][0]["execution_id"] == "new-run"
     assert state["claims"][0]["status"] == "in_progress"
 
@@ -465,7 +483,8 @@ def test_malformed_gcs_claim_state_is_not_overwritten(
             assert if_generation_match == self.generation
             return raw_state
 
-        def upload_from_string(self, _value, *, content_type, if_generation_match):
+        def upload_from_string(self, _value, **write_options):
+            assert set(write_options) == {"content_type", "if_generation_match"}
             self.uploaded = True
 
     blob = Blob()
@@ -509,7 +528,8 @@ def test_duplicate_gcs_claim_state_blocks_all_mutations(monkeypatch, operation):
             assert if_generation_match == self.generation
             return raw_state
 
-        def upload_from_string(self, _value, *, content_type, if_generation_match):
+        def upload_from_string(self, _value, **write_options):
+            assert set(write_options) == {"content_type", "if_generation_match"}
             self.uploaded = True
 
     blob = Blob()
