@@ -1,9 +1,9 @@
 """Choose alert score thresholds by fixed-volume net expected value."""
 
-from collections import defaultdict
-from dataclasses import dataclass
 import math
-from typing import Iterable
+from collections import defaultdict
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from common.models import ScanEvent, ScanOutcome
 
@@ -15,9 +15,15 @@ class ThresholdSelection:
     selected_events: int
 
 
-def select_threshold(events: Iterable[ScanEvent], outcomes: Iterable[ScanOutcome], daily_alert_limit: int) -> ThresholdSelection:
+def select_threshold(
+    events: Iterable[ScanEvent], outcomes: Iterable[ScanOutcome], daily_alert_limit: int
+) -> ThresholdSelection:
     outcome_by_id = {outcome.event_id: outcome for outcome in outcomes}
-    rows = [(event, outcome_by_id[event.event_id]) for event in events if event.signal_score is not None and event.event_id in outcome_by_id]
+    rows = [
+        (event, outcome_by_id[event.event_id])
+        for event in events
+        if event.signal_score is not None and event.event_id in outcome_by_id
+    ]
     if daily_alert_limit < 1 or not rows:
         raise ValueError("insufficient scored outcomes for threshold selection")
     if any(

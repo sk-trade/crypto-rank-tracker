@@ -16,9 +16,7 @@ def test_primary_target_is_fixed_to_one_hour_from_the_next_ten_minute_open():
 
 
 def test_directional_returns_deduct_the_fixed_round_trip_cost_for_both_directions():
-    assert directional_net_return(100.0, 110.0, Direction.LONG) == pytest.approx(
-        0.099
-    )
+    assert directional_net_return(100.0, 110.0, Direction.LONG) == pytest.approx(0.099)
     assert directional_net_return(100.0, 90.0, Direction.SHORT) == pytest.approx(
         (100 / 90) - 1 - 0.001
     )

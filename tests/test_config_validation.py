@@ -21,7 +21,9 @@ def test_validate_storage_config_allows_local_without_bucket(monkeypatch):
 
 
 @pytest.mark.parametrize("storage_method", ["", "gcs", "LOCAL ", "filesystem"])
-def test_validate_storage_config_rejects_invalid_explicit_storage_methods(monkeypatch, storage_method):
+def test_validate_storage_config_rejects_invalid_explicit_storage_methods(
+    monkeypatch, storage_method
+):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", storage_method)
 
     with pytest.raises(config.StorageConfigError) as error:

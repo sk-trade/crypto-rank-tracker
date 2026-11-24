@@ -1,7 +1,7 @@
 [project]
 name = "crypto-rank-tracker"
-version = "0.7.0"
-description = ""
+version = "0.7.1"
+description = "Durable Upbit KRW market attention tracking with point-in-time replay."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -34,8 +34,38 @@ dev = [
   "ruff>=0.15.21,<0.16.0",
 ]
 
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "B"]
+select = [
+  "ARG",
+  "B",
+  "C90",
+  "DTZ",
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "G",
+  "I",
+  "LOG",
+  "N",
+  "PERF",
+  "RET",
+  "RUF",
+  "SIM",
+  "UP",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.uv]
 default-groups = ["dev"]

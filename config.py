@@ -1,13 +1,13 @@
-# config.py
+"""Environment-backed runtime and decision-policy configuration."""
 
 import os
 from enum import StrEnum
 
 from common.models import LiquidityTier
 
-# -- ENVIRONMENT & STORAGE CONFIGURATION --
+# Environment and storage
 
-# 저장 방식 선택 ('GCS' 또는 'LOCAL')
+# Supported values are GCS and LOCAL.
 STATE_STORAGE_METHOD = os.environ.get("STATE_STORAGE_METHOD", "LOCAL")
 SHADOW_MODE = os.environ.get("SHADOW_MODE", "").strip().lower() in {
     "1",
@@ -28,7 +28,7 @@ ALERT_HISTORY_FILE_NAME = "alert_history.json"
 SHADOW_ALERT_HISTORY_FILE_NAME = "shadow_alert_history.json"
 ATTENTION_STATE_FILE_NAME = "attention_state.json"
 
-# -- EXTERNAL API & WEBHOOK CONFIGURATION --
+# External services
 
 # Coingecko API Key
 CG_API_KEY = os.environ.get("CG_API_KEY")
@@ -36,11 +36,11 @@ CG_API_KEY = os.environ.get("CG_API_KEY")
 # Webhook
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-# -- APPLICATION SETTINGS --
+# Application state
 
 APP_LOGGER_NAME = "CryptoRankTracker"
 LOG_LEVEL = "INFO"
-STATE_HISTORY_COUNT = 12  # 순위 분석에 사용할 과거 데이터 수
+STATE_HISTORY_COUNT = 12
 CANDLE_SUCCESS_RATE_MINIMUM = 0.95
 
 
@@ -78,24 +78,23 @@ def validate_storage_config() -> StorageMethod:
     return method
 
 
-# -- ANALYSIS & ALERTING POLICY --
+# Analysis and alert policy
 
-# [통계 보정 설정]
-MAX_Z_SCORE_CAP = 10.0  # Z-Score 상한선 (통계 왜곡 방지)
-MIN_MAD_FLOOR = 0.001  # Z-Score 분모 0 방지
+# Robust statistics use bounded scores and a nonzero MAD denominator.
+MAX_Z_SCORE_CAP = 10.0
+MIN_MAD_FLOOR = 0.001
 CONDITIONAL_VOLUME_MIN_SAMPLES = 3
-# Recent indicators need 154 contiguous clock bars; conditional volume uses
-# separate same-slot observations so the broad scan stays within runtime limits.
-RECENT_SCAN_HISTORY_BARS = 154
+RVOL_BASELINE_BARS = 144
+RVOL_RECENT_EXCLUSION_BARS = 10
+RECENT_SCAN_HISTORY_BARS = RVOL_BASELINE_BARS + RVOL_RECENT_EXCLUSION_BARS
 CONDITIONAL_VOLUME_LOOKBACK_WEEKS = 3
 RESIDUAL_MOMENTUM_LOOKBACK_BARS = 144
 RESIDUAL_MOMENTUM_MIN_OBSERVATIONS = 30
 
-# [Wash Trading 필터]
-# 거래량 제한
+# Reject activity spikes without a corresponding price move.
 WASH_TRADING_MIN_PRICE_CHANGE = 0.5
 
-# [Pre-fitted candidate policy]
+# Pre-fitted candidate policy
 # These parameters are fixed for validation; revisions require the validation workflow.
 # Every value uses only candles completed before the current decision candle.
 PRICE_SURPRISE_LOOKBACK_BARS = 144
@@ -130,16 +129,25 @@ def rvol_z_score_minimum(liquidity_tier: LiquidityTier) -> float:
     return RVOL_Z_SCORE_MINIMUMS[tier]
 
 
-# [1차 필터링 공통]
+# Broad-scan thresholds
 SIGNAL_SCORE_CANDIDATE_MINIMUM = 0.5
 ROBUST_Z_SCORE_THRESHOLD = 3.0
 DECOUPLING_MIN_DEVIATION_PCT = 3.0
+LEADING_SECTOR_MIN_MARKETS = 4
+LEADING_SECTOR_LARGE_MARKET_COUNT = 10
+LEADING_SECTOR_BULL_MIN_ALPHA_1H = 2.0
+LEADING_SECTOR_BEAR_MIN_ALPHA_1H = 1.5
+LEADING_SECTOR_MIN_ALPHA_4H = 0.5
+LEADING_SECTOR_MIN_AVERAGE_RVOL = 1.5
+LEADING_SECTOR_LARGE_MIN_BREADTH = 0.60
+LEADING_SECTOR_SMALL_MIN_BREADTH = 0.75
+LEADING_SECTOR_MAX_DISPLAY = 5
 
-# [2차 알림 게이트키퍼]
-ALERT_MIN_PRICE_CHANGE_10M = 0.8  # 최소 변동폭 (스캘핑 마지노선)
+# Final alert thresholds
+ALERT_MIN_PRICE_CHANGE_10M = 0.8
 ALERT_MIN_SIGNAL_SCORE = 0.70
 
-# [Evaluation target]
+# Evaluation target
 # Signals are evaluated from the next fully completed 10-minute bar's opening
 # price over one hour. Costs are a fixed pre-trade estimate, not a fee quote.
 PRIMARY_HOLDING_PERIOD_MINUTES = 60
@@ -195,6 +203,6 @@ REGIME_ATR_LONG_PERIOD = 24
 REGIME_ATR_SHORT_PERIOD = 6
 IDEMPOTENCY_KEY_HISTORY_LIMIT = 1_440
 
-# [쿨다운]
+# Alert cooldown
 ALERT_COOLDOWN_MINUTES = 60
 SUSTAINED_MOMENTUM_MIN_ADDITIONAL_CHANGE_PCT = 1.0

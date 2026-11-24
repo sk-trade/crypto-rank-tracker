@@ -2,8 +2,8 @@ import asyncio
 import datetime
 from types import SimpleNamespace
 
-import config
 import common.attention as attention_module
+import config
 from common import state_manager
 from common.attention import (
     build_attention_queue,
@@ -15,9 +15,9 @@ from common.attention import (
 from common.attention_policy import frozen_feature_vector, score_frozen_candidate
 from common.execution import ExecutionDecision
 from common.models import (
-    AttentionState,
-    AttentionStage,
     AttentionLane,
+    AttentionStage,
+    AttentionState,
     CandleData,
     EvidenceFamily,
     EvidenceVerdict,
@@ -29,8 +29,7 @@ from common.models import (
     TrendState,
 )
 
-
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 
 def _ticker(

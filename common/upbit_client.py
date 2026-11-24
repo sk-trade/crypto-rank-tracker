@@ -1,12 +1,13 @@
-#common/upbit_client
+"""Validated, rate-limited access to Upbit market data."""
 
 import asyncio
 import datetime
 import logging
 from collections import Counter
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
-from typing import Any, Dict, List, Optional
+from typing import Any
 from weakref import WeakKeyDictionary
 
 import aiohttp
@@ -23,7 +24,6 @@ from common.models import (
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
-# --- 상수 및 사용자 정의 예외 ---
 UPBIT_API_BASE_URL = "https://api.upbit.com/v1"
 
 GLOBAL_RATE_LIMIT_PER_SECOND = 8
@@ -31,6 +31,7 @@ _LOOP_LIMITERS = WeakKeyDictionary()
 _LOOP_COOLDOWN_UNTIL = WeakKeyDictionary()
 MAX_CANDLES_PER_REQUEST = 200
 MAX_RETRY_DELAY_SECONDS = 60.0
+
 
 class UpbitErrorCode(StrEnum):
     INVALID_CANDLE_REQUEST = "invalid_candle_request"
@@ -52,15 +53,32 @@ class CandleTimeUnit(StrEnum):
     DAYS = "days"
 
 
+@dataclass(frozen=True)
+class _CandleCollectionRequest:
+    time_unit: CandleTimeUnit
+    count: int
+    minutes_unit: int | None
+    as_of: datetime.datetime
+    cutoff: datetime.datetime
+    synthesize_no_trade_intervals: bool
+    same_slot_lookback_weeks: int
+
+    @property
+    def endpoint(self) -> str:
+        if self.time_unit is CandleTimeUnit.MINUTES:
+            return f"{UPBIT_API_BASE_URL}/candles/minutes/{self.minutes_unit}"
+        return f"{UPBIT_API_BASE_URL}/candles/{self.time_unit.value}"
+
+
 class UpbitAPIError(Exception):
-    """Upbit API 호출 실패 시 발생하는 사용자 정의 예외입니다."""
+    """A typed Upbit request, response, or pagination failure."""
 
     def __init__(
         self,
         code: UpbitErrorCode,
         *,
         market: str | None = None,
-        details: Dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(code.value)
         self.code = code
@@ -108,13 +126,13 @@ def _extend_global_cooldown(delay: float) -> None:
 def _as_utc(timestamp: datetime.datetime) -> datetime.datetime:
     """Interpret Upbit's UTC timestamp strings consistently as aware UTC values."""
     if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=datetime.timezone.utc)
-    return timestamp.astimezone(datetime.timezone.utc)
+        return timestamp.replace(tzinfo=datetime.UTC)
+    return timestamp.astimezone(datetime.UTC)
 
 
 def _candle_grid(
     time_unit: CandleTimeUnit,
-    minutes_unit: Optional[int],
+    minutes_unit: int | None,
     as_of: datetime.datetime,
 ) -> tuple[datetime.datetime, datetime.timedelta]:
     """Return the current open candle start and interval in Upbit's UTC grid."""
@@ -126,10 +144,11 @@ def _candle_grid(
                 details={"field": "minutes_unit"},
             )
         interval = datetime.timedelta(minutes=minutes_unit)
-        elapsed = now_utc - datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-        current_start = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) + (
-            elapsed // interval
-        ) * interval
+        elapsed = now_utc - datetime.datetime.min.replace(tzinfo=datetime.UTC)
+        current_start = (
+            datetime.datetime.min.replace(tzinfo=datetime.UTC)
+            + (elapsed // interval) * interval
+        )
     elif time_unit is CandleTimeUnit.DAYS:
         interval = datetime.timedelta(days=1)
         current_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -144,9 +163,9 @@ def _candle_grid(
 def _expected_candle_starts(
     time_unit: CandleTimeUnit,
     count: int,
-    minutes_unit: Optional[int],
+    minutes_unit: int | None,
     as_of: datetime.datetime,
-) -> List[datetime.datetime]:
+) -> list[datetime.datetime]:
     """Return the ordered grid of fully closed Upbit candle start times."""
     current_start, interval = _candle_grid(time_unit, minutes_unit, as_of)
     latest_completed = current_start - interval
@@ -155,17 +174,17 @@ def _expected_candle_starts(
 
 
 def normalize_completed_candles(
-    candles: List[CandleData],
+    candles: list[CandleData],
     time_unit: CandleTimeUnit,
     count: int,
-    minutes_unit: Optional[int] = None,
-    as_of: Optional[datetime.datetime] = None,
-) -> List[CandleData]:
+    minutes_unit: int | None = None,
+    as_of: datetime.datetime | None = None,
+) -> list[CandleData]:
     """Reindex to the complete candle grid, rejecting partial or gapped histories."""
     expected_starts = _expected_candle_starts(
-        time_unit, count, minutes_unit, as_of or datetime.datetime.now(datetime.timezone.utc)
+        time_unit, count, minutes_unit, as_of or datetime.datetime.now(datetime.UTC)
     )
-    candles_by_start: Dict[datetime.datetime, CandleData] = {}
+    candles_by_start: dict[datetime.datetime, CandleData] = {}
     for candle in candles:
         timestamp = _as_utc(candle.timestamp)
         if timestamp in candles_by_start:
@@ -180,11 +199,11 @@ def normalize_completed_candles(
 
 
 def normalize_sparse_completed_candles(
-    candles: List[CandleData],
+    candles: list[CandleData],
     count: int,
     minutes_unit: int,
     as_of: datetime.datetime,
-) -> List[CandleData]:
+) -> list[CandleData]:
     """Fill valid no-trade clock slots while rejecting malformed candle history."""
     if not candles:
         return []
@@ -194,7 +213,7 @@ def normalize_sparse_completed_candles(
         CandleTimeUnit.MINUTES, count, minutes_unit, as_of
     )
     market = candles[0].market
-    candles_by_start: Dict[datetime.datetime, CandleData] = {}
+    candles_by_start: dict[datetime.datetime, CandleData] = {}
     for candle in candles:
         timestamp = _as_utc(candle.timestamp)
         if candle.market != market or timestamp >= current_start:
@@ -210,7 +229,9 @@ def normalize_sparse_completed_candles(
 
     first_expected = expected_starts[0]
     seed_candidates = [
-        candle for timestamp, candle in candles_by_start.items() if timestamp < first_expected
+        candle
+        for timestamp, candle in candles_by_start.items()
+        if timestamp < first_expected
     ]
     previous_close = None
     if seed_candidates:
@@ -241,7 +262,7 @@ def normalize_sparse_completed_candles(
     return normalized
 
 
-def _retry_after_seconds(value: Optional[str]) -> float:
+def _retry_after_seconds(value: str | None) -> float:
     """Parse either legal Retry-After form and cap excessive server delays."""
     if not value:
         return 1.0
@@ -251,7 +272,7 @@ def _retry_after_seconds(value: Optional[str]) -> float:
         try:
             retry_at = parsedate_to_datetime(value)
             delay = (
-                _as_utc(retry_at) - datetime.datetime.now(datetime.timezone.utc)
+                _as_utc(retry_at) - datetime.datetime.now(datetime.UTC)
             ).total_seconds()
         except (TypeError, ValueError, OverflowError):
             delay = 1.0
@@ -261,9 +282,9 @@ def _retry_after_seconds(value: Optional[str]) -> float:
 async def _request_candle_page(
     session: aiohttp.ClientSession,
     url: str,
-    params: Dict[str, Any],
+    params: dict[str, Any],
     market: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Fetch one candle page with bounded retries and explicit payload validation."""
     max_retries = 3
     for attempt in range(max_retries):
@@ -277,7 +298,7 @@ async def _request_candle_page(
                     )
                     _extend_global_cooldown(retry_after)
                     logger.warning(
-                        "%s: 429 Rate Limit. %.1f초 대기 (시도 %d/%d)",
+                        "%s: Upbit rate limit; retrying in %.1fs (attempt %d/%d)",
                         market,
                         retry_after,
                         attempt + 1,
@@ -288,7 +309,7 @@ async def _request_candle_page(
                 if 500 <= response.status < 600:
                     wait_time = 2**attempt
                     logger.warning(
-                        "%s: %d 서버 에러. %d초 대기 (시도 %d/%d)",
+                        "%s: Upbit HTTP %d; retrying in %ds (attempt %d/%d)",
                         market,
                         response.status,
                         wait_time,
@@ -304,7 +325,7 @@ async def _request_candle_page(
                 return page
         except aiohttp.ClientError as error:
             logger.warning(
-                "%s: 네트워크 오류 (시도 %d/%d): %s",
+                "%s: Upbit network error (attempt %d/%d): %s",
                 market,
                 attempt + 1,
                 max_retries,
@@ -322,7 +343,7 @@ async def _request_candle_page(
     raise UpbitAPIError(UpbitErrorCode.CANDLE_RETRIES_EXHAUSTED, market=market)
 
 
-def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleData]:
+def _parse_candle_page(page: list[dict[str, Any]], market: str) -> list[CandleData]:
     candles = []
     for item in page:
         if not isinstance(item, dict) or item.get("market") != market:
@@ -349,11 +370,11 @@ def _parse_candle_page(page: List[Dict[str, Any]], market: str) -> List[CandleDa
 
 
 def _same_slot_candle(
-    candles: List[CandleData],
+    candles: list[CandleData],
     market: str,
     target: datetime.datetime,
     minutes_unit: int,
-) -> Optional[CandleData]:
+) -> CandleData | None:
     """Return the target candle or a zero-volume carry-forward for a no-trade slot."""
     if not candles:
         return None
@@ -361,10 +382,7 @@ def _same_slot_candle(
         raise ValueError(f"{market}: expected one same-slot seed candle")
     candle = candles[0]
     timestamp = _as_utc(candle.timestamp)
-    if (
-        _candle_grid(CandleTimeUnit.MINUTES, minutes_unit, timestamp)[0]
-        != timestamp
-    ):
+    if _candle_grid(CandleTimeUnit.MINUTES, minutes_unit, timestamp)[0] != timestamp:
         raise ValueError(f"{market}: off-grid same-slot seed candle")
     if timestamp > target:
         raise ValueError(f"{market}: same-slot seed is newer than its cutoff")
@@ -381,198 +399,222 @@ def _same_slot_candle(
         trade_value=0.0,
     )
 
-# --- API 호출 함수 ---
+
+def _parse_krw_market_listings(payload: object) -> list[MarketListing]:
+    if not isinstance(payload, list):
+        raise UpbitAPIError(UpbitErrorCode.INVALID_MARKET_RESPONSE)
+
+    listings: list[MarketListing] = []
+    for row in payload:
+        if not isinstance(row, dict) or not isinstance(row.get("market"), str):
+            raise UpbitAPIError(UpbitErrorCode.INVALID_MARKET_RESPONSE)
+        if not row["market"].startswith("KRW-"):
+            continue
+        try:
+            listing = MarketListing.model_validate(row)
+        except ValidationError as error:
+            raise UpbitAPIError(
+                UpbitErrorCode.INVALID_MARKET_RESPONSE,
+                market=row["market"],
+            ) from error
+        if listing.market_event is None:
+            raise UpbitAPIError(
+                UpbitErrorCode.INVALID_MARKET_RESPONSE,
+                market=listing.market,
+            )
+        listings.append(listing)
+
+    if not listings:
+        raise UpbitAPIError(UpbitErrorCode.MARKET_LIST_EMPTY)
+    return listings
+
+
+async def _fetch_krw_market_listings(
+    session: aiohttp.ClientSession,
+) -> list[MarketListing]:
+    async with session.get(
+        f"{UPBIT_API_BASE_URL}/market/all",
+        params={"is_details": "true"},
+        timeout=10,
+    ) as response:
+        response.raise_for_status()
+        return _parse_krw_market_listings(await response.json())
+
+
+def _ticker_scope_mismatch(
+    payload: object,
+    expected_markets: list[str],
+) -> dict[str, Any] | None:
+    if not isinstance(payload, list) or not payload:
+        raise UpbitAPIError(UpbitErrorCode.TICKER_LIST_EMPTY)
+
+    payload_markets = [
+        row.get("market") if isinstance(row, dict) else None for row in payload
+    ]
+    market_counts = Counter(
+        market for market in payload_markets if isinstance(market, str)
+    )
+    expected = set(expected_markets)
+    missing = sorted(expected - set(market_counts))
+    unexpected = sorted(set(market_counts) - expected)
+    duplicates = sorted(market for market, count in market_counts.items() if count != 1)
+    invalid_rows = sum(market is None for market in payload_markets)
+    if (
+        missing
+        or unexpected
+        or duplicates
+        or invalid_rows
+        or len(payload) != len(expected_markets)
+    ):
+        return {
+            "missing": missing,
+            "unexpected": unexpected,
+            "duplicates": duplicates,
+            "invalid_rows": invalid_rows,
+        }
+    return None
+
+
+def _ticker_error_code(error: ValidationError) -> UpbitErrorCode:
+    invalid_turnover = any(
+        tuple(issue["loc"]) == ("acc_trade_price_24h",) for issue in error.errors()
+    )
+    return (
+        UpbitErrorCode.INVALID_TICKER_TURNOVER
+        if invalid_turnover
+        else UpbitErrorCode.INVALID_TICKER_RESPONSE
+    )
+
+
+def _parse_market_tickers(
+    payload: object,
+    listings: list[MarketListing],
+) -> list[MarketTicker]:
+    expected_markets = [listing.market for listing in listings]
+    if mismatch := _ticker_scope_mismatch(payload, expected_markets):
+        raise UpbitAPIError(
+            UpbitErrorCode.TICKER_SCOPE_MISMATCH,
+            details=mismatch,
+        )
+    if not isinstance(payload, list):
+        raise UpbitAPIError(UpbitErrorCode.TICKER_LIST_EMPTY)
+
+    market_events = {listing.market: listing.market_event for listing in listings}
+    parsed_tickers: list[MarketTicker] = []
+    for row in payload:
+        market = row["market"]
+        try:
+            parsed_tickers.append(
+                MarketTicker.model_validate(
+                    {
+                        **row,
+                        "market_event": market_events[market],
+                    }
+                )
+            )
+        except ValidationError as error:
+            raise UpbitAPIError(
+                _ticker_error_code(error),
+                market=market,
+            ) from error
+    return parsed_tickers
+
+
+async def _fetch_market_tickers(
+    session: aiohttp.ClientSession,
+    listings: list[MarketListing],
+) -> list[MarketTicker]:
+    markets = [listing.market for listing in listings]
+    async with session.get(
+        f"{UPBIT_API_BASE_URL}/ticker",
+        params={"markets": ",".join(markets)},
+        timeout=15,
+    ) as response:
+        response.raise_for_status()
+        return _parse_market_tickers(await response.json(), listings)
+
+
 async def get_all_krw_tickers(
     session: aiohttp.ClientSession,
-) -> List[MarketTicker]:
-    """Upbit의 모든 KRW 마켓 티커 정보를 가져옵니다."""
+) -> list[MarketTicker]:
+    """Fetch and validate the complete Upbit KRW ticker universe."""
     try:
-        async with session.get(
-            f"{UPBIT_API_BASE_URL}/market/all",
-            params={"is_details": "true"},
-            timeout=10,
-        ) as response:
-            response.raise_for_status()
-            markets_data = await response.json()
-            if not isinstance(markets_data, list):
-                raise UpbitAPIError(UpbitErrorCode.INVALID_MARKET_RESPONSE)
-            listings = []
-            for row in markets_data:
-                if not isinstance(row, dict) or not isinstance(row.get("market"), str):
-                    raise UpbitAPIError(UpbitErrorCode.INVALID_MARKET_RESPONSE)
-                if not row["market"].startswith("KRW-"):
-                    continue
-                try:
-                    listing = MarketListing.model_validate(row)
-                except ValidationError as error:
-                    raise UpbitAPIError(
-                        UpbitErrorCode.INVALID_MARKET_RESPONSE,
-                        market=row["market"],
-                    ) from error
-                if listing.market_event is None:
-                    raise UpbitAPIError(
-                        UpbitErrorCode.INVALID_MARKET_RESPONSE,
-                        market=listing.market,
-                    )
-                listings.append(listing)
-            krw_markets = [listing.market for listing in listings]
-            market_events = {
-                listing.market: listing.market_event for listing in listings
-            }
-
-        if not krw_markets:
-            raise UpbitAPIError(UpbitErrorCode.MARKET_LIST_EMPTY)
-
-        params = {"markets": ",".join(krw_markets)}
-        async with session.get(
-            f"{UPBIT_API_BASE_URL}/ticker", params=params, timeout=15
-        ) as response:
-            response.raise_for_status()
-            tickers = await response.json()
-            if not isinstance(tickers, list) or not tickers:
-                raise UpbitAPIError(UpbitErrorCode.TICKER_LIST_EMPTY)
-            requested_markets = set(krw_markets)
-            ticker_markets = [
-                ticker.get("market") if isinstance(ticker, dict) else None
-                for ticker in tickers
-            ]
-            market_counts = Counter(
-                market for market in ticker_markets if isinstance(market, str)
-            )
-            missing_markets = sorted(requested_markets - set(market_counts))
-            unexpected_markets = sorted(set(market_counts) - requested_markets)
-            duplicate_markets = sorted(
-                market for market, occurrence_count in market_counts.items() if occurrence_count != 1
-            )
-            invalid_rows = sum(market is None for market in ticker_markets)
-            if (
-                missing_markets
-                or unexpected_markets
-                or duplicate_markets
-                or invalid_rows
-                or len(tickers) != len(krw_markets)
-            ):
-                raise UpbitAPIError(
-                    UpbitErrorCode.TICKER_SCOPE_MISMATCH,
-                    details={
-                        "missing": missing_markets,
-                        "unexpected": unexpected_markets,
-                        "duplicates": duplicate_markets,
-                        "invalid_rows": invalid_rows,
-                    },
-                )
-            parsed_tickers = []
-            for ticker in tickers:
-                market = ticker["market"]
-                try:
-                    parsed_tickers.append(
-                        MarketTicker.model_validate(
-                            {
-                                **ticker,
-                                "market_event": market_events[market],
-                            }
-                        )
-                    )
-                except ValidationError as error:
-                    code = (
-                        UpbitErrorCode.INVALID_TICKER_TURNOVER
-                        if any(
-                            tuple(issue["loc"]) == ("acc_trade_price_24h",)
-                            for issue in error.errors()
-                        )
-                        else UpbitErrorCode.INVALID_TICKER_RESPONSE
-                    )
-                    raise UpbitAPIError(
-                        code, market=market
-                    ) from error
-            return parsed_tickers
-
+        listings = await _fetch_krw_market_listings(session)
+        return await _fetch_market_tickers(session, listings)
     except UpbitAPIError:
         raise
-    except aiohttp.ClientError as e:
-        logger.error(f"Upbit API 클라이언트 오류 (get_all_krw_tickers): {e}")
-        raise UpbitAPIError(UpbitErrorCode.NETWORK_ERROR) from e
-    except Exception as e:
-        logger.error(f"Upbit API 예상치 못한 오류 (get_all_krw_tickers): {e}")
-        raise UpbitAPIError(UpbitErrorCode.UNEXPECTED_ERROR) from e
+    except aiohttp.ClientError as error:
+        logger.error("Upbit market collection failed: %s", error)
+        raise UpbitAPIError(UpbitErrorCode.NETWORK_ERROR) from error
+    except Exception as error:
+        logger.exception("Unexpected Upbit market collection failure")
+        raise UpbitAPIError(UpbitErrorCode.UNEXPECTED_ERROR) from error
 
 
 async def get_orderbooks(
-    session: aiohttp.ClientSession, markets: List[str]
-) -> Dict[str, OrderBookSnapshot]:
+    session: aiohttp.ClientSession, markets: list[str]
+) -> dict[str, OrderBookSnapshot]:
     """Fetch orderbook snapshots; callers must fail closed for missing markets."""
     if not markets:
         return {}
     try:
-        async with _global_limiter():
-            async with session.get(
-                f"{UPBIT_API_BASE_URL}/orderbook", params={"markets": ",".join(markets)}, timeout=15
-            ) as response:
-                response.raise_for_status()
-                payload = await response.json()
-                if not isinstance(payload, list):
-                    raise ValueError("orderbook response must be a list")
-                requested_markets = set(markets)
-                orderbooks = {}
-                for raw_book in payload:
-                    try:
-                        book = OrderBookSnapshot.model_validate(raw_book)
-                    except ValidationError:
-                        market = (
-                            raw_book.get("market")
-                            if isinstance(raw_book, dict)
-                            else None
+        async with (
+            _global_limiter(),
+            session.get(
+                f"{UPBIT_API_BASE_URL}/orderbook",
+                params={"markets": ",".join(markets)},
+                timeout=15,
+            ) as response,
+        ):
+            response.raise_for_status()
+            payload = await response.json()
+            if not isinstance(payload, list):
+                raise ValueError("orderbook response must be a list")
+            requested_markets = set(markets)
+            orderbooks = {}
+            for raw_book in payload:
+                try:
+                    book = OrderBookSnapshot.model_validate(raw_book)
+                except ValidationError:
+                    market = (
+                        raw_book.get("market") if isinstance(raw_book, dict) else None
+                    )
+                    if market in requested_markets:
+                        logger.warning(
+                            "Ignoring malformed orderbook row for market %s",
+                            market,
                         )
-                        if market in requested_markets:
-                            logger.warning(
-                                "Ignoring malformed orderbook row for market %s",
-                                market,
-                            )
-                        continue
-                    if (
-                        book.market not in requested_markets
-                        or book.market in orderbooks
-                    ):
-                        continue
-                    orderbooks[book.market] = book
-                return orderbooks
+                    continue
+                if book.market not in requested_markets or book.market in orderbooks:
+                    continue
+                orderbooks[book.market] = book
+            return orderbooks
     except (aiohttp.ClientError, ValueError) as error:
         logger.warning("Orderbook collection failed: %s", error)
         return {}
 
 
-async def get_candles(
-    session: aiohttp.ClientSession,
-    markets: List[str],
+def _build_candle_collection_request(
+    *,
     time_unit: CandleTimeUnit,
-    count: int = 200,
-    minutes_unit: Optional[int] = None,
-    as_of: Optional[datetime.datetime] = None,
-    synthesize_no_trade_intervals: bool = False,
-    same_slot_lookback_weeks: int = 0,
-) -> Dict[str, List[CandleData]]:
-    """
-    지정된 시간 단위(분, 일)에 대한 캔들 데이터를 병렬로 가져옵니다.
-
-    Args:
-        session: aiohttp ClientSession.
-        markets: 마켓 코드 리스트.
-        time_unit: `CandleTimeUnit.MINUTES` 또는 `CandleTimeUnit.DAYS`.
-        count: strict mode에서는 요청할 캔들 수, sparse mode에서는 최근 clock bar 수.
-        minutes_unit: 분봉일 경우, 분 단위 (e.g., 1, 3, 5, 10, ...).
-        synthesize_no_trade_intervals: 거래가 없어서 생략된 최근 분봉을 carry-forward로 채웁니다.
-        same_slot_lookback_weeks: sparse mode에서 별도로 조회할 이전 주 동일 시각 수.
-    """
-    if not markets:
-        return {}
-    if count <= 0 or same_slot_lookback_weeks < 0:
+    count: int,
+    minutes_unit: int | None,
+    as_of: datetime.datetime | None,
+    synthesize_no_trade_intervals: bool,
+    same_slot_lookback_weeks: int,
+) -> _CandleCollectionRequest:
+    if count <= 0:
         raise UpbitAPIError(
             UpbitErrorCode.INVALID_CANDLE_REQUEST,
             details={"field": "count"},
         )
+    if same_slot_lookback_weeks < 0:
+        raise UpbitAPIError(
+            UpbitErrorCode.INVALID_CANDLE_REQUEST,
+            details={"field": "same_slot_lookback_weeks"},
+        )
     if synthesize_no_trade_intervals and (
-        time_unit is not CandleTimeUnit.MINUTES
-        or not minutes_unit
+        time_unit is not CandleTimeUnit.MINUTES or not minutes_unit
     ):
         raise UpbitAPIError(
             UpbitErrorCode.INVALID_CANDLE_REQUEST,
@@ -584,154 +626,297 @@ async def get_candles(
             details={"field": "same_slot_lookback_weeks"},
         )
 
-    request_as_of = as_of or datetime.datetime.now(datetime.timezone.utc)
+    request_as_of = as_of or datetime.datetime.now(datetime.UTC)
     request_cutoff, _ = _candle_grid(time_unit, minutes_unit, request_as_of)
+    return _CandleCollectionRequest(
+        time_unit=time_unit,
+        count=count,
+        minutes_unit=minutes_unit,
+        as_of=request_as_of,
+        cutoff=request_cutoff,
+        synthesize_no_trade_intervals=synthesize_no_trade_intervals,
+        same_slot_lookback_weeks=same_slot_lookback_weeks,
+    )
 
-    async def _fetch_single_market(market: str) -> tuple[str, List[CandleData]]:
-        """단일 마켓의 캔들 데이터를 가져오는 내부 헬퍼 함수입니다."""
-        if time_unit is CandleTimeUnit.MINUTES:
-            url = f"{UPBIT_API_BASE_URL}/candles/minutes/{minutes_unit}"
-        else:
-            url = f"{UPBIT_API_BASE_URL}/candles/{time_unit.value}"
-        if synthesize_no_trade_intervals:
-            try:
-                first_expected = _expected_candle_starts(
-                    time_unit, count, minutes_unit, request_as_of
-                )[0]
-                recent_source = []
-                to = request_cutoff
-                oldest_seen = None
-                max_pages = (count + MAX_CANDLES_PER_REQUEST - 1) // MAX_CANDLES_PER_REQUEST + 2
-                for _ in range(max_pages):
-                    recent_page = await _request_candle_page(
-                        session,
-                        url,
-                        {
-                            "market": market,
-                            "count": MAX_CANDLES_PER_REQUEST,
-                            "to": to.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        },
-                        market,
-                    )
-                    if not recent_page:
-                        break
-                    page_candles = _parse_candle_page(recent_page, market)
-                    recent_source.extend(page_candles)
-                    oldest = min(candle.timestamp for candle in page_candles)
-                    if oldest_seen is not None and oldest >= oldest_seen:
-                        raise ValueError(f"{market}: candle pagination did not advance")
-                    oldest_seen = oldest
-                    if oldest <= first_expected:
-                        break
-                    if len(recent_page) < MAX_CANDLES_PER_REQUEST:
-                        break
-                    to = oldest
-                recent_candles = normalize_sparse_completed_candles(
-                    recent_source, count, minutes_unit, request_as_of
-                )
-                del recent_source
-                if len(recent_candles) != count:
-                    logger.warning(
-                        "%s: rejected sparse candle history without a valid seed or grid.", market
-                    )
-                    return market, []
 
-                latest_completed = recent_candles[-1].timestamp
-                same_slot_candles = []
-                for weeks_ago in range(same_slot_lookback_weeks, 0, -1):
-                    target = latest_completed - datetime.timedelta(weeks=weeks_ago)
-                    cutoff = target + datetime.timedelta(minutes=minutes_unit)
-                    page = await _request_candle_page(
-                        session,
-                        url,
-                        {
-                            "market": market,
-                            "count": 1,
-                            "to": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        },
-                        market,
-                    )
-                    sample = _same_slot_candle(
-                        _parse_candle_page(page, market), market, target, minutes_unit
-                    )
-                    if sample is not None:
-                        same_slot_candles.append(sample)
-                if len(same_slot_candles) != same_slot_lookback_weeks:
-                    logger.warning(
-                        "%s: rejected candle history with incomplete weekly same-slot coverage.",
-                        market,
-                    )
-                    return market, []
-                return market, [*same_slot_candles, *recent_candles]
-            except (UpbitAPIError, KeyError, TypeError, ValueError) as error:
-                logger.warning("%s: sparse candle collection failed: %s", market, error)
-                return market, []
+def _format_upbit_cutoff(timestamp: datetime.datetime) -> str:
+    return timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        raw_candles = []
-        remaining = count
-        to = request_cutoff
 
-        while remaining:
-            params = {"market": market, "count": min(remaining, MAX_CANDLES_PER_REQUEST)}
-            if to:
-                params["to"] = to.strftime("%Y-%m-%dT%H:%M:%SZ")
-            try:
-                page = await _request_candle_page(session, url, params, market)
-            except UpbitAPIError as error:
-                logger.error("%s: candle page collection failed: %s", market, error)
-                return market, []
-            if not page:
-                logger.error(f"{market}: empty candle page returned.")
-                return market, []
-            raw_candles.extend(page)
-            remaining -= len(page)
-            if len(page) < params["count"]:
-                logger.warning(f"{market}: requested {count} candles but history ended early.")
-                return market, []
-            oldest = min(
-                datetime.datetime.fromisoformat(item["candle_date_time_utc"].replace("Z", "+00:00"))
-                for item in page
-            )
-            to = _as_utc(oldest)
-
-        try:
-            candles = _parse_candle_page(raw_candles, market)
-        except (KeyError, TypeError, ValueError) as error:
-            logger.warning("%s: invalid candle payload: %s", market, error)
-            return market, []
-        complete_candles = normalize_completed_candles(
-            candles, time_unit, count, minutes_unit, request_as_of
+async def _fetch_sparse_recent_candles(
+    session: aiohttp.ClientSession,
+    market: str,
+    request: _CandleCollectionRequest,
+) -> list[CandleData]:
+    if request.minutes_unit is None:
+        raise UpbitAPIError(
+            UpbitErrorCode.INVALID_CANDLE_REQUEST,
+            market=market,
+            details={"field": "minutes_unit"},
         )
-        if len(complete_candles) != count:
-            logger.warning("%s: rejected incomplete, duplicate, or off-grid paginated candle history.", market)
-            return market, []
-        return market, complete_candles
 
-    tasks = [_fetch_single_market(m) for m in markets]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    first_expected = _expected_candle_starts(
+        request.time_unit,
+        request.count,
+        request.minutes_unit,
+        request.as_of,
+    )[0]
+    source_candles: list[CandleData] = []
+    page_cutoff = request.cutoff
+    previous_oldest: datetime.datetime | None = None
+    maximum_pages = (
+        request.count + MAX_CANDLES_PER_REQUEST - 1
+    ) // MAX_CANDLES_PER_REQUEST + 2
 
-    candles_dict = {}
-    failed_markets = []
-    for i, res in enumerate(results):
-        market_name = markets[i]
-        if isinstance(res, Exception):
-            logger.error(f"'{market_name}' 작업 중 예외 발생: {res}")
-            failed_markets.append(market_name)
-        elif res and isinstance(res, tuple):
-            market, candles = res
-            if candles:
-                candles_dict[market] = candles
-            else:
-                failed_markets.append(market)
+    for _page_number in range(maximum_pages):
+        raw_page = await _request_candle_page(
+            session,
+            request.endpoint,
+            {
+                "market": market,
+                "count": MAX_CANDLES_PER_REQUEST,
+                "to": _format_upbit_cutoff(page_cutoff),
+            },
+            market,
+        )
+        if not raw_page:
+            break
 
-    success_count = len(candles_dict)
-    total_count = len(markets)
-    logger.info(f"캔들 수집 완료: {success_count}/{total_count}개 마켓 성공.")
+        page_candles = _parse_candle_page(raw_page, market)
+        source_candles.extend(page_candles)
+        oldest_timestamp = min(candle.timestamp for candle in page_candles)
+        if previous_oldest is not None and oldest_timestamp >= previous_oldest:
+            raise ValueError(f"{market}: candle pagination did not advance")
+        previous_oldest = oldest_timestamp
 
+        if (
+            oldest_timestamp <= first_expected
+            or len(raw_page) < MAX_CANDLES_PER_REQUEST
+        ):
+            break
+        page_cutoff = oldest_timestamp
+
+    return normalize_sparse_completed_candles(
+        source_candles,
+        request.count,
+        request.minutes_unit,
+        request.as_of,
+    )
+
+
+async def _fetch_same_slot_candles(
+    session: aiohttp.ClientSession,
+    market: str,
+    request: _CandleCollectionRequest,
+    latest_completed_at: datetime.datetime,
+) -> list[CandleData]:
+    if request.minutes_unit is None:
+        return []
+
+    same_slot_candles: list[CandleData] = []
+    for weeks_ago in range(request.same_slot_lookback_weeks, 0, -1):
+        target_at = latest_completed_at - datetime.timedelta(weeks=weeks_ago)
+        cutoff_at = target_at + datetime.timedelta(minutes=request.minutes_unit)
+        raw_page = await _request_candle_page(
+            session,
+            request.endpoint,
+            {
+                "market": market,
+                "count": 1,
+                "to": _format_upbit_cutoff(cutoff_at),
+            },
+            market,
+        )
+        sample = _same_slot_candle(
+            _parse_candle_page(raw_page, market),
+            market,
+            target_at,
+            request.minutes_unit,
+        )
+        if sample is not None:
+            same_slot_candles.append(sample)
+    return same_slot_candles
+
+
+async def _fetch_sparse_market_candles(
+    session: aiohttp.ClientSession,
+    market: str,
+    request: _CandleCollectionRequest,
+) -> list[CandleData]:
+    try:
+        recent_candles = await _fetch_sparse_recent_candles(session, market, request)
+        if len(recent_candles) != request.count:
+            logger.warning(
+                "%s: rejected sparse candle history without a valid seed or grid.",
+                market,
+            )
+            return []
+
+        same_slot_candles = await _fetch_same_slot_candles(
+            session,
+            market,
+            request,
+            recent_candles[-1].timestamp,
+        )
+        if len(same_slot_candles) != request.same_slot_lookback_weeks:
+            logger.warning(
+                "%s: rejected candle history with incomplete weekly same-slot coverage.",
+                market,
+            )
+            return []
+        return [*same_slot_candles, *recent_candles]
+    except (UpbitAPIError, KeyError, TypeError, ValueError) as error:
+        logger.warning("%s: sparse candle collection failed: %s", market, error)
+        return []
+
+
+def _oldest_raw_candle_timestamp(
+    raw_page: list[dict[str, Any]], market: str
+) -> datetime.datetime:
+    try:
+        return min(
+            _as_utc(
+                datetime.datetime.fromisoformat(
+                    row["candle_date_time_utc"].replace("Z", "+00:00")
+                )
+            )
+            for row in raw_page
+            if isinstance(row, dict) and row.get("market") == market
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{market}: invalid candle timestamp payload") from error
+
+
+async def _fetch_strict_market_candles(
+    session: aiohttp.ClientSession,
+    market: str,
+    request: _CandleCollectionRequest,
+) -> list[CandleData]:
+    raw_candles: list[dict[str, Any]] = []
+    remaining_count = request.count
+    page_cutoff = request.cutoff
+
+    while remaining_count:
+        requested_page_size = min(remaining_count, MAX_CANDLES_PER_REQUEST)
+        params = {
+            "market": market,
+            "count": requested_page_size,
+            "to": _format_upbit_cutoff(page_cutoff),
+        }
+        try:
+            raw_page = await _request_candle_page(
+                session, request.endpoint, params, market
+            )
+        except UpbitAPIError as error:
+            logger.error("%s: candle page collection failed: %s", market, error)
+            return []
+        if not raw_page:
+            logger.error("%s: empty candle page returned.", market)
+            return []
+
+        raw_candles.extend(raw_page)
+        remaining_count -= len(raw_page)
+        if len(raw_page) < requested_page_size:
+            logger.warning(
+                "%s: requested %d candles but history ended early.",
+                market,
+                request.count,
+            )
+            return []
+        try:
+            page_cutoff = _oldest_raw_candle_timestamp(raw_page, market)
+        except ValueError as error:
+            logger.warning("%s: invalid candle payload: %s", market, error)
+            return []
+
+    try:
+        parsed_candles = _parse_candle_page(raw_candles, market)
+    except (KeyError, TypeError, ValueError) as error:
+        logger.warning("%s: invalid candle payload: %s", market, error)
+        return []
+
+    complete_candles = normalize_completed_candles(
+        parsed_candles,
+        request.time_unit,
+        request.count,
+        request.minutes_unit,
+        request.as_of,
+    )
+    if len(complete_candles) != request.count:
+        logger.warning(
+            "%s: rejected incomplete, duplicate, or off-grid paginated candle history.",
+            market,
+        )
+        return []
+    return complete_candles
+
+
+async def _fetch_market_candles(
+    session: aiohttp.ClientSession,
+    market: str,
+    request: _CandleCollectionRequest,
+) -> tuple[str, list[CandleData]]:
+    if request.synthesize_no_trade_intervals:
+        candles = await _fetch_sparse_market_candles(session, market, request)
+    else:
+        candles = await _fetch_strict_market_candles(session, market, request)
+    return market, candles
+
+
+def _collect_candle_results(
+    markets: list[str],
+    results: list[tuple[str, list[CandleData]] | BaseException],
+) -> dict[str, list[CandleData]]:
+    candles_by_market: dict[str, list[CandleData]] = {}
+    failed_markets: list[str] = []
+
+    for requested_market, result in zip(markets, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.error("'%s' candle task failed: %s", requested_market, result)
+            failed_markets.append(requested_market)
+            continue
+
+        market, candles = result
+        if candles:
+            candles_by_market[market] = candles
+        else:
+            failed_markets.append(market)
+
+    logger.info(
+        "Candle collection completed: %d/%d markets succeeded.",
+        len(candles_by_market),
+        len(markets),
+    )
     if failed_markets:
-        failed_list_str = ", ".join(failed_markets[:10])
+        preview = ", ".join(failed_markets[:10])
         if len(failed_markets) > 10:
-            failed_list_str += "..."
-        logger.warning(f"실패한 마켓 ({len(failed_markets)}개): {failed_list_str}")
+            preview = f"{preview}..."
+        logger.warning("Failed markets (%d): %s", len(failed_markets), preview)
+    return candles_by_market
 
-    return candles_dict
+
+async def get_candles(
+    session: aiohttp.ClientSession,
+    markets: list[str],
+    time_unit: CandleTimeUnit,
+    count: int = 200,
+    minutes_unit: int | None = None,
+    as_of: datetime.datetime | None = None,
+    synthesize_no_trade_intervals: bool = False,
+    same_slot_lookback_weeks: int = 0,
+) -> dict[str, list[CandleData]]:
+    """Fetch complete candle histories for each market under one explicit contract."""
+    if not markets:
+        return {}
+
+    request = _build_candle_collection_request(
+        time_unit=time_unit,
+        count=count,
+        minutes_unit=minutes_unit,
+        as_of=as_of,
+        synthesize_no_trade_intervals=synthesize_no_trade_intervals,
+        same_slot_lookback_weeks=same_slot_lookback_weeks,
+    )
+    tasks = [_fetch_market_candles(session, market, request) for market in markets]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return _collect_candle_results(markets, results)

@@ -10,9 +10,9 @@ from common.models import (
     TrendState,
 )
 from common.signals.detector import (
-    calculate_signal_score,
+    calculate_candidate_signal_score,
     detect_anomalies,
-    filter_market_wide_events,
+    filter_market_wide_candidates,
 )
 
 
@@ -23,7 +23,7 @@ def _candle(
 ) -> CandleData:
     return CandleData(
         market=market,
-        timestamp=datetime.datetime(2026, 6, 18, 0, 0, tzinfo=datetime.timezone.utc),
+        timestamp=datetime.datetime(2026, 6, 18, 0, 0, tzinfo=datetime.UTC),
         open_price=price,
         high_price=price,
         low_price=price,
@@ -33,7 +33,7 @@ def _candle(
 
 
 def test_filter_market_wide_events_returns_empty_list_for_no_tickers():
-    assert filter_market_wide_events([], {}) == []
+    assert filter_market_wide_candidates([], {}) == []
 
 
 def test_detect_anomalies_allows_missing_rvol_z_score_for_price_only_candidate():
@@ -174,4 +174,6 @@ def test_signal_score_is_not_capped_at_an_arbitrary_value():
         decoupling_score=4.0,
     )
 
-    assert calculate_signal_score(ticker, sector_corr=1.0) == pytest.approx(1.0)
+    assert calculate_candidate_signal_score(
+        ticker, sector_alignment=1.0
+    ) == pytest.approx(1.0)

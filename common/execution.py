@@ -1,8 +1,8 @@
 """Execution-feasibility checks applied before costly analysis and scoring."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import List, Sequence
 
 import config
 from common.models import (
@@ -17,7 +17,7 @@ from common.models import (
 @dataclass(frozen=True)
 class ExecutionDecision:
     executable: bool
-    rejection_reasons: List[RejectionCode]
+    rejection_reasons: list[RejectionCode]
     spread_bps: float | None = None
     expected_slippage_bps: float | None = None
 
@@ -36,8 +36,7 @@ def assess_execution(
         return ExecutionDecision(False, [RejectionCode.MARKET_WARNING])
     if (
         raw_ticker is None
-        or raw_ticker.acc_trade_price_24h
-        < config.EXECUTION_MIN_DAILY_TURNOVER_KRW
+        or raw_ticker.acc_trade_price_24h < config.EXECUTION_MIN_DAILY_TURNOVER_KRW
     ):
         return ExecutionDecision(False, [RejectionCode.DAILY_TURNOVER_BELOW_MINIMUM])
     if orderbook is None:
@@ -71,7 +70,10 @@ def assess_execution(
             False, [RejectionCode.SLIPPAGE_ABOVE_MAXIMUM], spread_bps, slippage_bps
         )
     observed_move_bps = abs(ticker.price_change_10m or 0) * 100
-    if observed_move_bps <= config.ESTIMATED_ROUND_TRIP_COST_BPS + spread_bps + 2 * slippage_bps:
+    if (
+        observed_move_bps
+        <= config.ESTIMATED_ROUND_TRIP_COST_BPS + spread_bps + 2 * slippage_bps
+    ):
         return ExecutionDecision(
             False,
             [RejectionCode.MOVE_DOES_NOT_COVER_ESTIMATED_COSTS],

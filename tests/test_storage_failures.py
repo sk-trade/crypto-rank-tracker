@@ -8,7 +8,7 @@ import config
 from common import state_manager, storage_client
 from common.models import AnalysisState
 from common.storage_client import (
-    StateBackendUnavailable,
+    StateBackendUnavailableError,
     StateErrorCode,
     StateLoadError,
     StateSaveError,
@@ -22,7 +22,11 @@ from common.storage_client import (
 
 class _Blob:
     def __init__(self, *, exists_error=None, download_error=None, upload_error=None):
-        self.exists_error, self.download_error, self.upload_error = exists_error, download_error, upload_error
+        self.exists_error, self.download_error, self.upload_error = (
+            exists_error,
+            download_error,
+            upload_error,
+        )
 
     def exists(self):
         if self.exists_error:
@@ -52,19 +56,34 @@ class _Client:
 
 def test_gcs_exists_and_download_failures_are_explicit_state_load_errors():
     with pytest.raises(StateLoadError) as exists_error:
-        asyncio.run(_load_json_from_gcs(_Client(_Blob(exists_error=RuntimeError("no access"))), "x.json"))
+        asyncio.run(
+            _load_json_from_gcs(
+                _Client(_Blob(exists_error=RuntimeError("no access"))), "x.json"
+            )
+        )
     assert exists_error.value.code is StateErrorCode.READ_FAILED
 
     with pytest.raises(StateLoadError) as download_error:
-        asyncio.run(_load_json_from_gcs(_Client(_Blob(download_error=RuntimeError("read failed"))), "x.json"))
+        asyncio.run(
+            _load_json_from_gcs(
+                _Client(_Blob(download_error=RuntimeError("read failed"))), "x.json"
+            )
+        )
     assert download_error.value.code is StateErrorCode.READ_FAILED
 
 
-def test_existing_json_null_can_be_rejected_without_treating_missing_as_corrupt(tmp_path):
+def test_existing_json_null_can_be_rejected_without_treating_missing_as_corrupt(
+    tmp_path,
+):
     state_path = tmp_path / "state.json"
     state_path.write_text("null", encoding="utf-8")
 
-    assert asyncio.run(_load_json_from_local(str(tmp_path / "missing.json"), reject_null=True)) is None
+    assert (
+        asyncio.run(
+            _load_json_from_local(str(tmp_path / "missing.json"), reject_null=True)
+        )
+        is None
+    )
     with pytest.raises(StateLoadError) as error:
         asyncio.run(_load_json_from_local(str(state_path), reject_null=True))
     assert error.value.code is StateErrorCode.NULL_DOCUMENT
@@ -97,18 +116,20 @@ def test_gcs_mode_never_silently_falls_back_to_local_storage(monkeypatch, tmp_pa
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "GCS")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
 
-    with pytest.raises(StateBackendUnavailable) as load_error:
+    with pytest.raises(StateBackendUnavailableError) as load_error:
         asyncio.run(load_json("state.json"))
     assert load_error.value.code is StateErrorCode.BACKEND_UNAVAILABLE
 
-    with pytest.raises(StateBackendUnavailable) as save_error:
+    with pytest.raises(StateBackendUnavailableError) as save_error:
         asyncio.run(save_json("state.json", {"unexpected": "local write"}))
     assert save_error.value.code is StateErrorCode.BACKEND_UNAVAILABLE
 
     assert not (tmp_path / "state.json").exists()
 
 
-def test_local_save_keeps_the_previous_complete_state_if_atomic_replace_fails(monkeypatch, tmp_path):
+def test_local_save_keeps_the_previous_complete_state_if_atomic_replace_fails(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
     state_file = tmp_path / "state.json"
@@ -144,12 +165,10 @@ def test_analysis_log_rejects_corrupt_existing_shape_without_overwriting(
 ):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "LOCAL")
     monkeypatch.setattr(config, "LOCAL_STATE_DIR", str(tmp_path))
-    filename = state_manager.get_daily_log_filename()
+    filename = state_manager.get_daily_analysis_log_filename()
     state_file = tmp_path / filename
     state_file.write_text('{"unexpected": true}', encoding="utf-8")
-    state = AnalysisState(
-        last_updated=datetime.datetime.now(datetime.timezone.utc), tickers={}
-    )
+    state = AnalysisState(last_updated=datetime.datetime.now(datetime.UTC), tickers={})
 
     with pytest.raises(StateLoadError) as error:
         asyncio.run(state_manager.save_analysis_log(state))
@@ -159,14 +178,10 @@ def test_analysis_log_rejects_corrupt_existing_shape_without_overwriting(
 
 
 def test_analysis_log_propagates_typed_write_failure(monkeypatch):
-    state = AnalysisState(
-        last_updated=datetime.datetime.now(datetime.timezone.utc), tickers={}
-    )
+    state = AnalysisState(last_updated=datetime.datetime.now(datetime.UTC), tickers={})
     write_error = StateSaveError(StateErrorCode.WRITE_FAILED, "analysis.json")
     monkeypatch.setattr(state_manager, "load_json", AsyncMock(return_value=None))
-    monkeypatch.setattr(
-        state_manager, "save_json", AsyncMock(side_effect=write_error)
-    )
+    monkeypatch.setattr(state_manager, "save_json", AsyncMock(side_effect=write_error))
 
     with pytest.raises(StateSaveError) as error:
         asyncio.run(state_manager.save_analysis_log(state))
@@ -177,10 +192,10 @@ def test_analysis_log_propagates_typed_write_failure(monkeypatch):
 def test_log_cleanup_never_falls_back_to_local_in_gcs_mode(monkeypatch):
     monkeypatch.setattr(config, "STATE_STORAGE_METHOD", "GCS")
     local_cleanup = Mock(side_effect=AssertionError("local cleanup must not run"))
-    monkeypatch.setattr(state_manager, "_cleanup_local_logs", local_cleanup)
+    monkeypatch.setattr(state_manager, "_cleanup_expired_local_logs", local_cleanup)
 
-    with pytest.raises(StateBackendUnavailable) as error:
-        asyncio.run(state_manager.cleanup_old_logs())
+    with pytest.raises(StateBackendUnavailableError) as error:
+        asyncio.run(state_manager.cleanup_expired_analysis_logs())
 
     assert error.value.code is StateErrorCode.BACKEND_UNAVAILABLE
     local_cleanup.assert_not_called()

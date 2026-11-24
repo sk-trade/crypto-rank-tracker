@@ -1,54 +1,66 @@
-# common/analysis/scanner.py
+"""Point-in-time lightweight features and broad candidate eligibility."""
 
-import logging
-from typing import Dict, List
+from itertools import pairwise
+
 import numpy as np
 
 import config
-from common.models import CandidateDecision, LiquidityTier, RejectionCode, TickerData
+from common.models import (
+    CandidateDecision,
+    CandleData,
+    LiquidityTier,
+    RejectionCode,
+    TickerData,
+)
 
-logger = logging.getLogger(config.APP_LOGGER_NAME)
 
-def _historical_price_surprise(candle_list: List) -> float | None:
+def _historical_price_surprise(candles: list[CandleData]) -> float | None:
     """Standardize the latest return using only earlier completed-bar returns."""
-    required = config.PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS + 2
-    if len(candle_list) < required:
+    required_candles = config.PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS + 2
+    if len(candles) < required_candles:
         return None
 
-    historical = candle_list[-(config.PRICE_SURPRISE_LOOKBACK_BARS + 1):-1]
-    returns = [
+    historical_candles = candles[-(config.PRICE_SURPRISE_LOOKBACK_BARS + 1) : -1]
+    historical_returns = [
         (current.close_price / previous.close_price - 1) * 100
-        for previous, current in zip(historical, historical[1:], strict=False)
+        for previous, current in pairwise(historical_candles)
         if previous.close_price > 0
     ]
-    if len(returns) < config.PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS:
+    if len(historical_returns) < config.PRICE_SURPRISE_MIN_RETURN_OBSERVATIONS:
         return None
-    volatility = float(np.std(returns, ddof=1))
-    if volatility <= 0:
+    historical_volatility = float(np.std(historical_returns, ddof=1))
+    if historical_volatility <= 0:
         return None
-    latest_return = (candle_list[-1].close_price / candle_list[-2].close_price - 1) * 100
-    return abs(latest_return) / volatility
+    latest_return = (candles[-1].close_price / candles[-2].close_price - 1) * 100
+    return abs(latest_return) / historical_volatility
 
 
-def _rolling_turnover(candle_list: List) -> float | None:
+def _rolling_turnover(candles: list[CandleData]) -> float | None:
     """Use prior-bar notional turnover so tiering cannot see the current event."""
-    prior_candles = candle_list[-(config.ROLLING_TURNOVER_LOOKBACK_BARS + 1):-1]
+    prior_candles = candles[-(config.ROLLING_TURNOVER_LOOKBACK_BARS + 1) : -1]
     if not prior_candles:
         return None
-    turnovers = [
+    prior_turnovers = [
         candle.trade_value
         if candle.trade_value is not None
         else candle.close_price * candle.volume
         for candle in prior_candles
     ]
-    return float(np.median(turnovers)) if turnovers else None
+    return float(np.median(prior_turnovers)) if prior_turnovers else None
 
 
-def _assign_liquidity_tiers(tickers: Dict[str, TickerData]) -> None:
-    turnovers = [ticker.rolling_turnover for ticker in tickers.values() if ticker.rolling_turnover]
-    if not turnovers:
+def _assign_liquidity_tiers(tickers: dict[str, TickerData]) -> None:
+    rolling_turnovers = [
+        ticker.rolling_turnover
+        for ticker in tickers.values()
+        if ticker.rolling_turnover
+    ]
+    if not rolling_turnovers:
         return
-    low_cutoff, high_cutoff = np.quantile(turnovers, config.LIQUIDITY_TIER_QUANTILES)
+    low_cutoff, high_cutoff = np.quantile(
+        rolling_turnovers,
+        config.LIQUIDITY_TIER_QUANTILES,
+    )
     for ticker in tickers.values():
         if ticker.rolling_turnover is None:
             continue
@@ -60,94 +72,133 @@ def _assign_liquidity_tiers(tickers: Dict[str, TickerData]) -> None:
             ticker.liquidity_tier = LiquidityTier.LOW
 
 
-def _robust_z_score(value: float, baseline: List[float]) -> float | None:
+def _robust_z_score(value: float, baseline: list[float]) -> float | None:
     if len(baseline) < config.CONDITIONAL_VOLUME_MIN_SAMPLES:
         return None
     median = float(np.median(baseline))
-    mad = float(np.median(np.abs(np.array(baseline) - median)))
-    return min((value - median) / (1.4826 * max(mad, config.MIN_MAD_FLOOR)), config.MAX_Z_SCORE_CAP)
+    median_absolute_deviation = float(np.median(np.abs(np.array(baseline) - median)))
+    denominator = 1.4826 * max(
+        median_absolute_deviation,
+        config.MIN_MAD_FLOOR,
+    )
+    return min(
+        (value - median) / denominator,
+        config.MAX_Z_SCORE_CAP,
+    )
 
 
-def _conditional_log_rvol_z_score(candle_list: List) -> float | None:
+def _conditional_log_rvol_z_score(
+    candles: list[CandleData],
+) -> float | None:
     """Compare a bar only with the same weekday and clock slot in earlier weeks."""
-    latest = candle_list[-1]
-    if latest.volume <= 0:
+    latest_candle = candles[-1]
+    if latest_candle.volume <= 0:
         return None
-    slot = (latest.timestamp.weekday(), latest.timestamp.hour, latest.timestamp.minute)
-    prior = [
-        np.log(candle.volume)
-        for candle in candle_list[:-1]
+    latest_slot = (
+        latest_candle.timestamp.weekday(),
+        latest_candle.timestamp.hour,
+        latest_candle.timestamp.minute,
+    )
+    prior_log_volumes = [
+        float(np.log(candle.volume))
+        for candle in candles[:-1]
         if candle.volume > 0
-        and (candle.timestamp.weekday(), candle.timestamp.hour, candle.timestamp.minute) == slot
+        and (
+            candle.timestamp.weekday(),
+            candle.timestamp.hour,
+            candle.timestamp.minute,
+        )
+        == latest_slot
     ]
-    return _robust_z_score(float(np.log(latest.volume)), prior)
+    return _robust_z_score(
+        float(np.log(latest_candle.volume)),
+        prior_log_volumes,
+    )
 
 
-def _assign_cross_sectional_log_rvol_z_scores(tickers: Dict[str, TickerData]) -> None:
-    values = {
+def _recent_relative_volume(candles: list[CandleData]) -> float | None:
+    if len(candles) < config.RECENT_SCAN_HISTORY_BARS:
+        return None
+    baseline_start = -config.RECENT_SCAN_HISTORY_BARS
+    baseline_end = -config.RVOL_RECENT_EXCLUSION_BARS
+    baseline_volumes = [
+        candle.volume for candle in candles[baseline_start:baseline_end]
+    ]
+    median_baseline_volume = float(np.median(baseline_volumes))
+    if median_baseline_volume <= 0:
+        return None
+    return candles[-1].volume / median_baseline_volume
+
+
+def _assign_cross_sectional_log_rvol_z_scores(
+    tickers: dict[str, TickerData],
+) -> None:
+    log_relative_volumes = {
         market: float(np.log(ticker.relative_volume))
         for market, ticker in tickers.items()
         if ticker.relative_volume and ticker.relative_volume > 0
     }
-    baseline = list(values.values())
-    for market, value in values.items():
-        tickers[market].cross_sectional_log_rvol_z_score = _robust_z_score(value, baseline)
+    cross_section = list(log_relative_volumes.values())
+    for market, log_relative_volume in log_relative_volumes.items():
+        tickers[market].cross_sectional_log_rvol_z_score = _robust_z_score(
+            log_relative_volume,
+            cross_section,
+        )
 
-def process_lightweight_indicators(
-    candles_10m: Dict[str, List],
-) -> Dict[str, TickerData]:
-    """10분봉 데이터만으로 최소한의 필수 지표를 계산합니다."""
-    lightweight_tickers = {}
-    
-    # 전체 시장의 RVOL 분포를 파악하기 위한 리스트
-    all_rvols = []
-    for _market, candle_list in candles_10m.items():
-        if len(candle_list) >= 154:
-            baseline_volumes = [c.volume for c in candle_list[-154:-10]]
-            median_volume_24h = np.median(baseline_volumes)
-            if median_volume_24h > 0:
-                relative_volume = candle_list[-1].volume / median_volume_24h
-                all_rvols.append(relative_volume)
 
-    # Robust Z-Score 계산 준비
-    median_rvol = np.median(all_rvols) if all_rvols else 0
-    mad = np.median(np.abs(np.array(all_rvols) - median_rvol)) if all_rvols else 0
-    effective_mad = max(mad, config.MIN_MAD_FLOOR)
+def build_lightweight_tickers(
+    candles_by_market: dict[str, list[CandleData]],
+) -> dict[str, TickerData]:
+    """Build broad-scan features from completed 10-minute candles only."""
+    relative_volumes = [
+        relative_volume
+        for candles in candles_by_market.values()
+        if (relative_volume := _recent_relative_volume(candles)) is not None
+    ]
+    median_relative_volume = (
+        float(np.median(relative_volumes)) if relative_volumes else 0.0
+    )
+    relative_volume_mad = (
+        float(np.median(np.abs(np.array(relative_volumes) - median_relative_volume)))
+        if relative_volumes
+        else 0.0
+    )
+    cross_section_denominator = 1.4826 * max(
+        relative_volume_mad,
+        config.MIN_MAD_FLOOR,
+    )
 
-    for market, candle_list in candles_10m.items():
-        if len(candle_list) < 2:
+    lightweight_tickers: dict[str, TickerData] = {}
+    for market, candles in candles_by_market.items():
+        if len(candles) < 2:
             continue
-        
-        ticker = TickerData(market=market, candle_history=candle_list)
-        
-        # 가격 변동률 계산
+
+        ticker = TickerData(market=market, candle_history=candles)
         ticker.price_change_10m = (
-            candle_list[-1].close_price / candle_list[-2].close_price - 1
+            candles[-1].close_price / candles[-2].close_price - 1
         ) * 100
-        ticker.price_surprise = _historical_price_surprise(candle_list)
-        ticker.rolling_turnover = _rolling_turnover(candle_list)
-        
-        if len(candle_list) >= 7:
+        ticker.price_surprise = _historical_price_surprise(candles)
+        ticker.rolling_turnover = _rolling_turnover(candles)
+
+        if len(candles) >= 7:
             ticker.price_change_1h = (
-                candle_list[-1].close_price / candle_list[-7].close_price - 1
+                candles[-1].close_price / candles[-7].close_price - 1
             ) * 100
-
-        if len(candle_list) >= 25:
+        if len(candles) >= 25:
             ticker.price_change_4h = (
-                candle_list[-1].close_price / candle_list[-25].close_price - 1
+                candles[-1].close_price / candles[-25].close_price - 1
             ) * 100
 
-        # RVOL 및 Z-Score 계산
-        if len(candle_list) >= 154:
-            baseline_volumes = [c.volume for c in candle_list[-154:-10]]
-            median_volume_24h = np.median(baseline_volumes)
-            if median_volume_24h > 0:
-                ticker.relative_volume = candle_list[-1].volume / median_volume_24h
-                
-                raw_z = (ticker.relative_volume - median_rvol) / (1.4826 * effective_mad)
-                ticker.rvol_z_score = min(raw_z, config.MAX_Z_SCORE_CAP)
-        ticker.conditional_log_rvol_z_score = _conditional_log_rvol_z_score(candle_list)
-
+        ticker.relative_volume = _recent_relative_volume(candles)
+        if ticker.relative_volume is not None:
+            raw_z_score = (
+                ticker.relative_volume - median_relative_volume
+            ) / cross_section_denominator
+            ticker.rvol_z_score = min(
+                raw_z_score,
+                config.MAX_Z_SCORE_CAP,
+            )
+        ticker.conditional_log_rvol_z_score = _conditional_log_rvol_z_score(candles)
         lightweight_tickers[market] = ticker
 
     _assign_liquidity_tiers(lightweight_tickers)
@@ -156,20 +207,17 @@ def process_lightweight_indicators(
 
 
 def evaluate_candidate_eligibility(
-    lightweight_tickers: Dict[str, TickerData],
-) -> Dict[str, CandidateDecision]:
-    """Evaluate every ticker and retain explicit reasons for rejected candidates."""
-    decisions = {}
+    lightweight_tickers: dict[str, TickerData],
+) -> dict[str, CandidateDecision]:
+    """Evaluate every ticker and retain explicit rejection reasons."""
+    decisions: dict[str, CandidateDecision] = {}
     for market, ticker in lightweight_tickers.items():
-        
         conditional_z_score = ticker.conditional_log_rvol_z_score
-        z_score = conditional_z_score or 0
         price_change = abs(ticker.price_change_10m or 0)
         price_surprise = ticker.price_surprise
         liquidity_tier = ticker.liquidity_tier
-        min_z_score = config.rvol_z_score_minimum(liquidity_tier)
-        min_price_surprise = config.price_surprise_minimum(liquidity_tier)
-        is_strict_mode = liquidity_tier is not LiquidityTier.HIGH
+        minimum_z_score = config.rvol_z_score_minimum(liquidity_tier)
+        minimum_price_surprise = config.price_surprise_minimum(liquidity_tier)
 
         if price_surprise is None or liquidity_tier is LiquidityTier.UNKNOWN:
             decisions[market] = CandidateDecision(
@@ -180,45 +228,46 @@ def evaluate_candidate_eligibility(
         if conditional_z_score is None:
             decisions[market] = CandidateDecision(
                 eligible=False,
-                rejection_reasons=[RejectionCode.CONDITIONAL_VOLUME_HISTORY_UNAVAILABLE],
+                rejection_reasons=[
+                    RejectionCode.CONDITIONAL_VOLUME_HISTORY_UNAVAILABLE
+                ],
             )
             continue
 
-        # 필터 조건 확인
-        has_volume_spike = z_score > min_z_score
-        has_price_spike = price_surprise > min_price_surprise
-
-        # Wash Trading 방지
-        if z_score > 5.0 and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE:
+        has_volume_spike = conditional_z_score > minimum_z_score
+        has_price_spike = price_surprise > minimum_price_surprise
+        if (
+            conditional_z_score > 5.0
+            and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE
+        ):
             decisions[market] = CandidateDecision(
                 eligible=False,
                 rejection_reasons=[RejectionCode.SUSPECTED_WASH_TRADING],
             )
             continue
 
-        # 메이저는 유연하게, 잡코인은 엄격하게
-        if is_strict_mode:
-            # 잡코인/중위권: 거래량과 가격이 동시에 터져야 함
+        if liquidity_tier is not LiquidityTier.HIGH:
             if has_volume_spike and has_price_spike:
                 decisions[market] = CandidateDecision(eligible=True)
-            else:
-                reasons = []
-                if not has_volume_spike:
-                    reasons.append(RejectionCode.VOLUME_ANOMALY_BELOW_THRESHOLD)
-                if not has_price_spike:
-                    reasons.append(RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD)
-                decisions[market] = CandidateDecision(
-                    eligible=False, rejection_reasons=reasons
-                )
+                continue
+            rejection_reasons = []
+            if not has_volume_spike:
+                rejection_reasons.append(RejectionCode.VOLUME_ANOMALY_BELOW_THRESHOLD)
+            if not has_price_spike:
+                rejection_reasons.append(RejectionCode.PRICE_SURPRISE_BELOW_THRESHOLD)
+            decisions[market] = CandidateDecision(
+                eligible=False,
+                rejection_reasons=rejection_reasons,
+            )
+            continue
+
+        if has_volume_spike or has_price_spike:
+            decisions[market] = CandidateDecision(eligible=True)
         else:
-            # 메이저: 둘 중 하나만 터져도 감지 (선취매 혹은 뉴스 반응)
-            if has_volume_spike or has_price_spike:
-                decisions[market] = CandidateDecision(eligible=True)
-            else:
-                decisions[market] = CandidateDecision(
-                    eligible=False,
-                    rejection_reasons=[
-                        RejectionCode.VOLUME_AND_PRICE_SURPRISE_BELOW_THRESHOLD
-                    ],
-                )
+            decisions[market] = CandidateDecision(
+                eligible=False,
+                rejection_reasons=[
+                    RejectionCode.VOLUME_AND_PRICE_SURPRISE_BELOW_THRESHOLD
+                ],
+            )
     return decisions

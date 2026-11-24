@@ -1,7 +1,7 @@
 """Fixed, execution-aware outcome definitions for signal evaluation."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import config
 from common.models import Direction

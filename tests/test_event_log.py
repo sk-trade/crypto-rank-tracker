@@ -1,12 +1,13 @@
-import datetime
 import asyncio
+import datetime
 
 import pytest
 from pydantic import ValidationError
 
 import config
+from common import state_manager
+from common.analysis.deep_dive import enrich_tickers_with_higher_timeframes
 from common.attention import build_attention_queue, build_attention_result
-from common.analysis.deep_dive import enrich_deep_dive_tickers
 from common.event_log import build_scan_events, resolve_scan_outcomes
 from common.models import (
     Alert,
@@ -23,15 +24,13 @@ from common.models import (
     SignalType,
     TickerData,
 )
-from common import state_manager
 from common.storage_client import (
     StateErrorCode,
     StateLoadError,
     StateOperationError,
 )
 
-
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 
 def _candle(
@@ -295,11 +294,10 @@ def test_deep_dive_ma_flags_are_json_serializable_in_scan_events():
         price_change_10m=2.0,
     )
 
-    enriched = enrich_deep_dive_tickers(
+    enriched = enrich_tickers_with_higher_timeframes(
         {"KRW-BTC": ticker},
         {},
         {"KRW-BTC": daily_candles},
-        {"KRW-BTC": ticker},
     )
     event = build_scan_events(
         observed_at,

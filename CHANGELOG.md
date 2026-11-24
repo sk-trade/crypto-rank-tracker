@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.7.1] - 2026-11-24
+
+### Changed
+
+- Split scan orchestration, Upbit collection, attention ranking, immutable event creation, notification recovery, and replay evaluation into explicit stages with descriptive data types and bounded cyclomatic complexity.
+- Standardized imports, modern Python typing, function and variable names, and formatting across source and tests.
+- Expanded CI verification to enforce Ruff lint and formatting, compile every shipped entrypoint, and import the built wheel from an isolated directory.
+
+### Fixed
+
+- Forced tests to import the working tree instead of a stale installed copy of top-level entrypoint modules.
+- Corrected the sector workflow filename and aligned its tests and documentation with the actual path.
+- Removed duplicate leading-sector notification headings and dividers.
+- Rebuilt candle pagination and sparse-history collection around validated request contracts while preserving public behavior and error codes.
+
 ## [0.7.0] - 2026-08-15
 
 ### Changed

@@ -1,10 +1,10 @@
-import datetime
 import asyncio
+import datetime
 
 import pytest
 
-import config
 import common.upbit_client as upbit_client
+import config
 from common.models import (
     CandleData,
     MarketEvent,
@@ -24,8 +24,7 @@ from common.upbit_client import (
 )
 from main import filter_markets_with_complete_deep_dive_data
 
-
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 
 def _candle(timestamp: str) -> CandleData:
@@ -41,7 +40,11 @@ def _candle(timestamp: str) -> CandleData:
 
 
 def test_normalize_completed_candles_excludes_the_open_minute_candle():
-    candles = [_candle("2026-06-18T11:40:00"), _candle("2026-06-18T11:50:00"), _candle("2026-06-18T12:00:00")]
+    candles = [
+        _candle("2026-06-18T11:40:00"),
+        _candle("2026-06-18T11:50:00"),
+        _candle("2026-06-18T12:00:00"),
+    ]
 
     result = normalize_completed_candles(
         candles,
@@ -62,12 +65,13 @@ def test_normalize_completed_candles_rejects_missing_or_off_grid_minutes():
     off_grid = [_candle("2026-06-18T11:40:00"), _candle("2026-06-18T11:55:00")]
     as_of = datetime.datetime(2026, 6, 18, 12, 6, tzinfo=UTC)
 
-    assert normalize_completed_candles(
-        missing, CandleTimeUnit.MINUTES, 2, 10, as_of
-    ) == []
-    assert normalize_completed_candles(
-        off_grid, CandleTimeUnit.MINUTES, 2, 10, as_of
-    ) == []
+    assert (
+        normalize_completed_candles(missing, CandleTimeUnit.MINUTES, 2, 10, as_of) == []
+    )
+    assert (
+        normalize_completed_candles(off_grid, CandleTimeUnit.MINUTES, 2, 10, as_of)
+        == []
+    )
 
 
 def test_normalize_completed_daily_candles_uses_the_upbit_utc_boundary():
@@ -145,6 +149,7 @@ class _Session:
         self.calls = []
 
     def get(self, _url, params, timeout):
+        assert timeout > 0
         self.calls.append(params)
         response = self.pages.pop(0)
         return response if isinstance(response, _Response) else _Response(response)
@@ -174,9 +179,13 @@ def _raw_candle(
     volume: float = 1.0,
 ) -> dict:
     return {
-        "market": market, "candle_date_time_utc": timestamp.isoformat().replace("+00:00", "Z"),
-        "opening_price": price, "high_price": price, "low_price": price,
-        "trade_price": price, "candle_acc_trade_volume": volume,
+        "market": market,
+        "candle_date_time_utc": timestamp.isoformat().replace("+00:00", "Z"),
+        "opening_price": price,
+        "high_price": price,
+        "low_price": price,
+        "trade_price": price,
+        "candle_acc_trade_volume": volume,
         "candle_acc_trade_price": price * volume,
     }
 
@@ -184,8 +193,13 @@ def _raw_candle(
 def test_get_candles_paginates_before_normalizing_the_complete_grid():
     as_of = datetime.datetime(2026, 6, 18, 12, 6, tzinfo=UTC)
     latest = datetime.datetime(2026, 6, 18, 11, 50, tzinfo=UTC)
-    chronological = [latest - datetime.timedelta(minutes=10 * offset) for offset in range(200, -1, -1)]
-    newest_first = list(reversed([_raw_candle(timestamp) for timestamp in chronological]))
+    chronological = [
+        latest - datetime.timedelta(minutes=10 * offset)
+        for offset in range(200, -1, -1)
+    ]
+    newest_first = list(
+        reversed([_raw_candle(timestamp) for timestamp in chronological])
+    )
     session = _Session([newest_first[:200], newest_first[200:]])
 
     result = asyncio.run(
@@ -247,17 +261,25 @@ def test_sparse_normalization_rejects_duplicate_off_grid_or_open_rows(source):
 def test_sparse_candle_collection_is_bounded_to_recent_and_weekly_slot_requests():
     as_of = datetime.datetime(2026, 7, 13, 12, 6, tzinfo=UTC)
     recent_page = [
-        _raw_candle(datetime.datetime(2026, 7, 13, 11, 50, tzinfo=UTC), price=110.0, volume=5.0),
+        _raw_candle(
+            datetime.datetime(2026, 7, 13, 11, 50, tzinfo=UTC), price=110.0, volume=5.0
+        ),
         _raw_candle(datetime.datetime(2026, 7, 13, 11, 20, tzinfo=UTC), price=100.0),
     ]
     exact_week = [
-        _raw_candle(datetime.datetime(2026, 6, 22, 11, 50, tzinfo=UTC), price=80.0, volume=2.0)
+        _raw_candle(
+            datetime.datetime(2026, 6, 22, 11, 50, tzinfo=UTC), price=80.0, volume=2.0
+        )
     ]
     no_trade_week = [
-        _raw_candle(datetime.datetime(2026, 6, 29, 11, 40, tzinfo=UTC), price=90.0, volume=3.0)
+        _raw_candle(
+            datetime.datetime(2026, 6, 29, 11, 40, tzinfo=UTC), price=90.0, volume=3.0
+        )
     ]
     recent_week = [
-        _raw_candle(datetime.datetime(2026, 7, 6, 11, 50, tzinfo=UTC), price=95.0, volume=4.0)
+        _raw_candle(
+            datetime.datetime(2026, 7, 6, 11, 50, tzinfo=UTC), price=95.0, volume=4.0
+        )
     ]
     session = _Session([recent_page, exact_week, no_trade_week, recent_week])
 
@@ -344,7 +366,13 @@ def test_sparse_candle_collection_rejects_missing_weekly_same_slot_history():
 def test_sparse_candle_collection_rejects_cross_market_payloads():
     as_of = datetime.datetime(2026, 7, 13, 12, 6, tzinfo=UTC)
     session = _Session(
-        [[_raw_candle(datetime.datetime(2026, 7, 13, 11, 50, tzinfo=UTC), market="KRW-ETH")]]
+        [
+            [
+                _raw_candle(
+                    datetime.datetime(2026, 7, 13, 11, 50, tzinfo=UTC), market="KRW-ETH"
+                )
+            ]
+        ]
     )
 
     result = asyncio.run(

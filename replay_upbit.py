@@ -9,13 +9,13 @@ import gzip
 import json
 import os
 import tempfile
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence
 
 import aiohttp
 
-import config
 import common.upbit_client as upbit_client
+import config
 from common.models import CandleData
 from common.replay import (
     ReplayReport,
@@ -23,10 +23,9 @@ from common.replay import (
     replay_daily_bar_count,
     run_point_in_time_replay,
 )
-from common.sector_loader import load_and_process_sectors
+from common.sector_loader import load_sector_maps
 from common.storage_client import StateError
 from common.upbit_client import CandleTimeUnit, get_all_krw_tickers, get_candles
-
 
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_CACHE_DIR = Path("/tmp/crypto-rank-tracker-replay")
@@ -34,7 +33,7 @@ DEFAULT_CACHE_DIR = Path("/tmp/crypto-rank-tracker-replay")
 
 async def collect_dataset(
     evaluation_days: int, as_of: datetime.datetime
-) -> tuple[Dict[str, list[CandleData]], Dict[str, list[CandleData]], dict]:
+) -> tuple[dict[str, list[CandleData]], dict[str, list[CandleData]], dict]:
     """Fetch the current KRW universe plus replay and daily warm-up histories."""
     # A replay is a long bulk job and may share the IP with the scheduled scanner.
     upbit_client.GLOBAL_RATE_LIMIT_PER_SECOND = config.REPLAY_RATE_LIMIT_PER_SECOND
@@ -120,7 +119,7 @@ def load_dataset(
     cache_dir: Path,
     evaluation_days: int,
     as_of: datetime.datetime | None = None,
-) -> tuple[Dict[str, list[CandleData]], Dict[str, list[CandleData]], dict] | None:
+) -> tuple[dict[str, list[CandleData]], dict[str, list[CandleData]], dict] | None:
     required_ten_minute_count = replay_10m_bar_count(evaluation_days)
     required_daily_count = replay_daily_bar_count(evaluation_days)
     manifest_path = cache_dir / "manifest.json"
@@ -132,9 +131,7 @@ def load_dataset(
     cached_as_of = manifest.get("as_of")
     try:
         cached_as_of = (
-            _parse_as_of(cached_as_of)
-            if isinstance(cached_as_of, str)
-            else None
+            _parse_as_of(cached_as_of) if isinstance(cached_as_of, str) else None
         )
     except ValueError:
         return None
@@ -160,10 +157,7 @@ def load_dataset(
         manifest.get("schema_version") != CACHE_SCHEMA_VERSION
         or manifest.get("complete", True) is not True
         or cached_as_of is None
-        or (
-            as_of is not None
-            and cached_as_of != as_of.astimezone(datetime.timezone.utc)
-        )
+        or (as_of is not None and cached_as_of != as_of.astimezone(datetime.UTC))
     ):
         return None
     return (
@@ -176,9 +170,7 @@ def load_dataset(
 async def run(args: argparse.Namespace) -> ReplayReport:
     cache_dir = _tmp_path(Path(args.cache_dir))
     output_dir_value = getattr(args, "output_dir", None)
-    output_dir = (
-        _tmp_path(Path(output_dir_value)) if output_dir_value else cache_dir
-    )
+    output_dir = _tmp_path(Path(output_dir_value)) if output_dir_value else cache_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     requested_as_of = _parse_as_of(args.as_of) if args.as_of else None
     dataset = (
@@ -211,13 +203,13 @@ async def run(args: argparse.Namespace) -> ReplayReport:
             flush=True,
         )
     try:
-        sectors, reverse_sector_map = await load_and_process_sectors()
+        markets_by_sector, sectors_by_market = await load_sector_maps()
     except (StateError, config.StorageConfigError) as error:
         print(
             f"Sector context unavailable ({error.code.value}); replaying without sector tags.",
             flush=True,
         )
-        sectors, reverse_sector_map = {}, {}
+        markets_by_sector, sectors_by_market = {}, {}
 
     def progress(current: int, total: int, observed_at: datetime.datetime) -> None:
         if current == 1 or current == total or current % 144 == 0:
@@ -236,16 +228,15 @@ async def run(args: argparse.Namespace) -> ReplayReport:
             report = run_point_in_time_replay(
                 candles_10m,
                 candles_daily,
-                sectors,
-                reverse_sector_map,
+                markets_by_sector,
+                sectors_by_market,
                 evaluation_days=args.evaluation_days,
                 source_evaluation_days=manifest["evaluation_days"],
                 top_k=args.top_k,
                 requested_market_count=manifest["requested_market_count"],
                 progress=progress,
                 observation_sink=lambda record: handle.write(
-                    json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-                    + "\n"
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
                 ),
             )
             handle.flush()
@@ -281,9 +272,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             f"{config.REPLAY_MAX_EVALUATION_DAYS} days; warm-up is added separately)"
         ),
     )
-    parser.add_argument(
-        "--top-k", type=int, default=config.REPLAY_DEFAULT_TOP_K
-    )
+    parser.add_argument("--top-k", type=int, default=config.REPLAY_DEFAULT_TOP_K)
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
     parser.add_argument(
         "--output-dir",
@@ -305,12 +294,12 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 def _parse_as_of(value: str | None) -> datetime.datetime:
     if value is None:
-        return datetime.datetime.now(datetime.timezone.utc)
+        return datetime.datetime.now(datetime.UTC)
     normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
     parsed = datetime.datetime.fromisoformat(normalized)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("--as-of must include a timezone")
-    return parsed.astimezone(datetime.timezone.utc)
+    return parsed.astimezone(datetime.UTC)
 
 
 def _tmp_path(path: Path) -> Path:
@@ -335,7 +324,7 @@ def _save_candle_directory(
 
 def _load_candle_directory(
     directory: Path, markets: Sequence[str]
-) -> Dict[str, list[CandleData]]:
+) -> dict[str, list[CandleData]]:
     result = {}
     for market in markets:
         payload = _read_gzip_json(directory / f"{market}.json.gz")
@@ -369,9 +358,7 @@ def _atomic_write_gzip_json(path: Path, value) -> None:
 
 
 def _atomic_write_json(path: Path, value: dict) -> None:
-    _atomic_write_text(
-        path, json.dumps(value, ensure_ascii=False, indent=2) + "\n"
-    )
+    _atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def _atomic_write_text(path: Path, value: str) -> None:

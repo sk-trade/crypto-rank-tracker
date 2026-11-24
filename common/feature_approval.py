@@ -1,9 +1,9 @@
 """Fail-closed OOS approval policy for prospective signal features."""
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-import math
-from typing import Mapping
 
 from common.models import LiquidityTier, MarketRegime
 

@@ -1,11 +1,13 @@
-#common/state_manager
+"""Validated state transitions for scans, alerts, and notification delivery."""
+
 import asyncio
 import datetime
 import fcntl
 import json
 import logging
 import os
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -26,7 +28,7 @@ from common.models import (
     StructureDirection,
 )
 from common.storage_client import (
-    StateBackendUnavailable,
+    StateBackendUnavailableError,
     StateErrorCode,
     StateLoadError,
     StateOperationError,
@@ -49,50 +51,47 @@ class _LegacyCompletedScanClaim(BaseModel):
     scan_key: str = Field(min_length=1)
 
 
-# --- 순위 상태 관리 ---
-
-
-def _ordered_rank_states(states: List[RankState]) -> List[RankState]:
+def _ordered_rank_states(states: list[RankState]) -> list[RankState]:
     states_by_timestamp = {state.last_updated: state for state in states}
     return sorted(states_by_timestamp.values(), key=lambda state: state.last_updated)
 
 
-async def load_rank_state_history(gcs_client=None) -> List[RankState]:
-    """'순위' 상태 히스토리 리스트를 로드합니다."""
+async def load_rank_state_history(gcs_client=None) -> list[RankState]:
+    """Load turnover-rank snapshots in chronological order."""
     filename = config.RANK_STATE_FILE_NAME
     data = await load_json(filename, gcs_client, reject_null=True)
 
     if data is None:
-        logger.info(f"순위 상태 파일({filename})이 없어 초기 상태로 시작합니다.")
+        logger.info("Rank-state history is not initialized: %s", filename)
         return []
 
-    # 과거 호환성을 위해 단일 객체로 저장된 경우 리스트로 변환
+    # Migrate the original single-snapshot representation on read.
     if isinstance(data, dict):
         data = [data]
     elif not isinstance(data, list):
-        raise StateLoadError(
-            StateErrorCode.INVALID_SCHEMA, filename
-        )
+        raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename)
 
     try:
-        return _ordered_rank_states([RankState.model_validate(s) for s in data])
+        return _ordered_rank_states([RankState.model_validate(state) for state in data])
     except ValidationError as error:
         raise StateLoadError(StateErrorCode.INVALID_SCHEMA, filename) from error
 
 
 async def save_rank_state_history(
-    new_state: RankState, old_states: List[RankState], gcs_client=None
-):
-    """새로운 '순위' 상태를 히스토리에 추가하여 저장합니다."""
+    new_state: RankState,
+    old_states: list[RankState],
+    gcs_client=None,
+) -> None:
+    """Append one rank snapshot while retaining the configured history window."""
     filename = config.RANK_STATE_FILE_NAME
 
     updated_states = _ordered_rank_states([*old_states, new_state])
     if len(updated_states) > config.STATE_HISTORY_COUNT:
-        updated_states = updated_states[-config.STATE_HISTORY_COUNT:]
+        updated_states = updated_states[-config.STATE_HISTORY_COUNT :]
 
-    data_to_save = [s.model_dump(mode="json") for s in updated_states]
+    data_to_save = [state.model_dump(mode="json") for state in updated_states]
     await save_json(filename, data_to_save, gcs_client)
-    logger.info(f"순위 히스토리 저장 완료: {filename}")
+    logger.info("Saved rank-state history: %s", filename)
 
 
 async def load_attention_state(gcs_client=None) -> AttentionState:
@@ -116,16 +115,13 @@ async def save_attention_state(state: AttentionState, gcs_client=None) -> None:
     )
 
 
-# --- 분석 로그 관리 ---
-
-
-def get_daily_log_filename() -> str:
-    """오늘 날짜 기반의 로그 파일 이름을 반환합니다."""
+def get_daily_analysis_log_filename() -> str:
+    """Return the UTC-dated analysis-log filename."""
     return _get_daily_filename("analysis_log")
 
 
 def _get_daily_filename(prefix: str) -> str:
-    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
     return f"{prefix}_{today}.json"
 
 
@@ -134,13 +130,13 @@ def _get_hourly_filename(prefix: str, timestamp: datetime.datetime) -> str:
         raise StateOperationError(
             StateErrorCode.INVALID_ARGUMENT, f"{prefix}_timestamp"
         )
-    hour = timestamp.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H")
+    hour = timestamp.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H")
     return f"{prefix}_{hour}Z.json"
 
 
 def _validate_record_list(
     filename: str, data: Any, record_type: type[PersistedRecord]
-) -> List[PersistedRecord]:
+) -> list[PersistedRecord]:
     if data is None:
         return []
     if not isinstance(data, list):
@@ -153,10 +149,10 @@ def _validate_record_list(
 
 async def _append_records(
     filename: str,
-    records: List[PersistedRecord],
+    records: list[PersistedRecord],
     record_type: type[PersistedRecord],
     gcs_client=None,
-) -> List[str]:
+) -> list[str]:
     existing = await load_json(filename, gcs_client, reject_null=True)
     existing_records = _validate_record_list(filename, existing, record_type)
     records_by_id = {
@@ -170,7 +166,7 @@ async def _append_records(
         existing_payload = records_by_id.get(event_id)
         if existing_payload is None:
             continue
-        elif existing_payload != payload:
+        if existing_payload != payload:
             conflicting_ids.append(event_id)
     if conflicting_ids:
         logger.error(
@@ -187,12 +183,12 @@ async def _append_records(
 
 async def _append_partitioned_records(
     prefix: str,
-    records: List[PersistedRecord],
+    records: list[PersistedRecord],
     record_type: type[PersistedRecord],
     timestamp_for_record: Callable[[PersistedRecord], datetime.datetime],
     gcs_client=None,
-) -> List[str]:
-    records_by_file: Dict[str, List[PersistedRecord]] = {}
+) -> list[str]:
+    records_by_file: dict[str, list[PersistedRecord]] = {}
     for record in records:
         filename = _get_hourly_filename(prefix, timestamp_for_record(record))
         records_by_file.setdefault(filename, []).append(record)
@@ -207,7 +203,7 @@ async def _append_partitioned_records(
     return conflicting_ids
 
 
-async def append_scan_events(events: List[ScanEvent], gcs_client=None):
+async def append_scan_events(events: list[ScanEvent], gcs_client=None):
     return await _append_partitioned_records(
         "scan_events",
         events,
@@ -217,7 +213,7 @@ async def append_scan_events(events: List[ScanEvent], gcs_client=None):
     )
 
 
-async def append_scan_outcomes(outcomes: List[ScanOutcome], gcs_client=None):
+async def append_scan_outcomes(outcomes: list[ScanOutcome], gcs_client=None):
     return await _append_partitioned_records(
         "scan_outcomes",
         outcomes,
@@ -227,13 +223,13 @@ async def append_scan_outcomes(outcomes: List[ScanOutcome], gcs_client=None):
     )
 
 
-async def load_pending_scan_events(gcs_client=None) -> List[ScanEvent]:
+async def load_pending_scan_events(gcs_client=None) -> list[ScanEvent]:
     filename = "pending_scan_events.json"
     data = await load_json(filename, gcs_client, reject_null=True)
     return _validate_record_list(filename, data, ScanEvent)
 
 
-async def save_pending_scan_events(events: List[ScanEvent], gcs_client=None):
+async def save_pending_scan_events(events: list[ScanEvent], gcs_client=None):
     events_by_id = {event.event_id: event for event in events}
     await save_json(
         "pending_scan_events.json",
@@ -256,13 +252,15 @@ def _validate_execution_id(execution_id: Any) -> str | None:
     return execution_id
 
 
-async def claim_scan_key(scan_key: str, execution_id: str | None = None, gcs_client=None) -> bool:
+async def claim_scan_key(
+    scan_key: str, execution_id: str | None = None, gcs_client=None
+) -> bool:
     """Atomically acquire or resume an in-progress completed-candle scan."""
     scan_key = _validate_scan_key(scan_key)
     execution_id = _validate_execution_id(execution_id)
     if config.storage_method() is config.StorageMethod.GCS:
         if gcs_client is None:
-            raise StateBackendUnavailable(
+            raise StateBackendUnavailableError(
                 StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
             )
         return await _claim_scan_key_in_gcs(scan_key, execution_id, gcs_client)
@@ -274,7 +272,7 @@ async def complete_scan_key(scan_key: str, gcs_client=None) -> None:
     scan_key = _validate_scan_key(scan_key)
     if config.storage_method() is config.StorageMethod.GCS:
         if gcs_client is None:
-            raise StateBackendUnavailable(
+            raise StateBackendUnavailableError(
                 StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
             )
         await _complete_scan_key_in_gcs(scan_key, gcs_client)
@@ -287,7 +285,7 @@ async def release_scan_key(scan_key: str, gcs_client=None) -> None:
     scan_key = _validate_scan_key(scan_key)
     if config.storage_method() is config.StorageMethod.GCS:
         if gcs_client is None:
-            raise StateBackendUnavailable(
+            raise StateBackendUnavailableError(
                 StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
             )
         await _release_scan_key_in_gcs(scan_key, gcs_client)
@@ -341,7 +339,7 @@ def _claim_can_resume(
 def _acquire_claim(
     state: ScanClaimState, scan_key: str, execution_id: str | None
 ) -> tuple[bool, ScanClaimState]:
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     for claim in state.claims:
         if claim.scan_key != scan_key:
             continue
@@ -364,20 +362,16 @@ def _acquire_claim(
 
 
 def _complete_claim(state: ScanClaimState, scan_key: str) -> bool:
-    claim = next(
-        (claim for claim in state.claims if claim.scan_key == scan_key), None
-    )
+    claim = next((claim for claim in state.claims if claim.scan_key == scan_key), None)
     if claim is None:
         return False
     claim.status = ScanClaimStatus.COMPLETED
-    claim.completed_at = datetime.datetime.now(datetime.timezone.utc)
+    claim.completed_at = datetime.datetime.now(datetime.UTC)
     return True
 
 
 def _release_claim(state: ScanClaimState, scan_key: str) -> bool:
-    remaining_claims = [
-        claim for claim in state.claims if claim.scan_key != scan_key
-    ]
+    remaining_claims = [claim for claim in state.claims if claim.scan_key != scan_key]
     if len(remaining_claims) == len(state.claims):
         return False
     state.claims = remaining_claims
@@ -386,7 +380,9 @@ def _release_claim(state: ScanClaimState, scan_key: str) -> bool:
 
 def _claim_scan_key_locally(scan_key: str, execution_id: str | None) -> bool:
     os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
-    lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
+    lock_path = os.path.join(
+        config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock"
+    )
     state_path = os.path.join(config.LOCAL_STATE_DIR, IDEMPOTENCY_STATE_FILE_NAME)
     with open(lock_path, "a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -415,7 +411,9 @@ def _mutate_scan_claim_state_locally(
     scan_key: str, mutation: Callable[[ScanClaimState, str], bool]
 ) -> None:
     os.makedirs(config.LOCAL_STATE_DIR, exist_ok=True)
-    lock_path = os.path.join(config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock")
+    lock_path = os.path.join(
+        config.LOCAL_STATE_DIR, f"{IDEMPOTENCY_STATE_FILE_NAME}.lock"
+    )
     state_path = os.path.join(config.LOCAL_STATE_DIR, IDEMPOTENCY_STATE_FILE_NAME)
     with open(lock_path, "a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -445,12 +443,14 @@ def _release_scan_key_locally(scan_key: str) -> None:
     _mutate_scan_claim_state_locally(scan_key, _release_claim)
 
 
-async def _claim_scan_key_in_gcs(scan_key: str, execution_id: str | None, gcs_client) -> bool:
+async def _claim_scan_key_in_gcs(
+    scan_key: str, execution_id: str | None, gcs_client
+) -> bool:
     """Use object generations so competing Cloud Function instances cannot both claim a key."""
     try:
         from google.api_core.exceptions import PreconditionFailed
     except ImportError as error:
-        raise StateBackendUnavailable(
+        raise StateBackendUnavailableError(
             StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
         ) from error
 
@@ -497,7 +497,7 @@ async def _mutate_scan_claim_state_in_gcs(
     try:
         from google.api_core.exceptions import PreconditionFailed
     except ImportError as error:
-        raise StateBackendUnavailable(
+        raise StateBackendUnavailableError(
             StateErrorCode.BACKEND_UNAVAILABLE, IDEMPOTENCY_STATE_FILE_NAME
         ) from error
 
@@ -539,10 +539,13 @@ async def _release_scan_key_in_gcs(scan_key: str, gcs_client) -> None:
     await _mutate_scan_claim_state_in_gcs(scan_key, gcs_client, _release_claim)
 
 
-async def save_analysis_log(state: AnalysisState, gcs_client=None):
-    """현재 분석 결과를 오늘 날짜의 로그 파일에 추가(append)합니다."""
-    filename = get_daily_log_filename()
-    # candle_history는 용량이 크므로 로그에서 제외
+async def save_analysis_log(
+    state: AnalysisState,
+    gcs_client=None,
+) -> None:
+    """Append one bounded analysis snapshot to the current UTC-day log."""
+    filename = get_daily_analysis_log_filename()
+    # Candle histories are already durable inputs and would dominate log size.
     new_log_entry = state.model_dump(
         mode="json", exclude={"tickers": {"__all__": {"candle_history"}}}
     )
@@ -555,10 +558,7 @@ async def save_analysis_log(state: AnalysisState, gcs_client=None):
 
     log_list.append(new_log_entry)
     await save_json(filename, log_list, gcs_client)
-    logger.info(f"분석 로그 추가 완료: {filename}")
-
-
-# --- 알림 히스토리 관리 ---
+    logger.info("Appended analysis log entry: %s", filename)
 
 
 _LEGACY_ALERT_SIGNAL_TYPES = {
@@ -574,9 +574,9 @@ _STRUCTURED_ALERT_DIRECTIONS = {
 
 
 def _migrate_alert_history_payload(
-    data: Dict[str, Any],
-) -> tuple[Dict[str, Any], bool]:
-    migrated_data: Dict[str, Any] = {}
+    data: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    migrated_data: dict[str, Any] = {}
     migrated = False
 
     for market, raw_alert_data in data.items():
@@ -621,9 +621,9 @@ def _migrate_alert_history_payload(
 
 
 def _active_alert_history(
-    history: Dict[str, AlertHistory], now: Optional[datetime.datetime] = None
-) -> Dict[str, AlertHistory]:
-    cutoff = (now or datetime.datetime.now(datetime.timezone.utc)) - datetime.timedelta(hours=24)
+    history: dict[str, AlertHistory], now: datetime.datetime | None = None
+) -> dict[str, AlertHistory]:
+    cutoff = (now or datetime.datetime.now(datetime.UTC)) - datetime.timedelta(hours=24)
     return {
         market: alert
         for market, alert in history.items()
@@ -639,8 +639,8 @@ def _alert_history_file_name() -> str:
     )
 
 
-async def load_alert_history(gcs_client=None) -> Dict[str, AlertHistory]:
-    """알림 히스토리 파일을 로드합니다."""
+async def load_alert_history(gcs_client=None) -> dict[str, AlertHistory]:
+    """Load active alert cooldown and structure state."""
     filename = _alert_history_file_name()
     data = await load_json(filename, gcs_client, reject_null=True)
     if data is None:
@@ -661,13 +661,19 @@ async def load_alert_history(gcs_client=None) -> Dict[str, AlertHistory]:
     return active_history
 
 
-async def save_alert_history(history: Dict[str, AlertHistory], gcs_client=None):
-    """알림 히스토리를 저장하며, 24시간 이상된 기록은 자동으로 정리합니다."""
+async def save_alert_history(
+    history: dict[str, AlertHistory],
+    gcs_client=None,
+) -> None:
+    """Persist alert state after removing entries older than 24 hours."""
     filename = _alert_history_file_name()
     cleaned_history = _active_alert_history(history)
-    data_to_save = {m: ah.model_dump(mode="json") for m, ah in cleaned_history.items()}
+    data_to_save = {
+        market: alert.model_dump(mode="json")
+        for market, alert in cleaned_history.items()
+    }
     await save_json(filename, data_to_save, gcs_client)
-    logger.info(f"알림 히스토리 저장 완료: {filename}")
+    logger.info("Saved active alert history: %s", filename)
 
 
 def _parse_notification_outbox(data: Any) -> NotificationOutbox:
@@ -679,7 +685,7 @@ def _parse_notification_outbox(data: Any) -> NotificationOutbox:
         ) from error
 
 
-async def load_notification_outbox(gcs_client=None) -> Optional[NotificationOutbox]:
+async def load_notification_outbox(gcs_client=None) -> NotificationOutbox | None:
     """Load the single pending webhook delivery, failing closed on corrupt state."""
     data = await load_json(NOTIFICATION_OUTBOX_FILE_NAME, gcs_client)
     if data is None:
@@ -688,18 +694,16 @@ async def load_notification_outbox(gcs_client=None) -> Optional[NotificationOutb
 
 
 async def save_notification_outbox(
-    outbox: Optional[NotificationOutbox], gcs_client=None
+    outbox: NotificationOutbox | None, gcs_client=None
 ) -> None:
     """Persist or clear the single pending webhook delivery."""
     payload = outbox.model_dump(mode="json") if outbox is not None else None
     await save_json(NOTIFICATION_OUTBOX_FILE_NAME, payload, gcs_client)
 
 
-async def load_notification_backlog(gcs_client=None) -> List[NotificationOutbox]:
+async def load_notification_backlog(gcs_client=None) -> list[NotificationOutbox]:
     """Load deferred prepared notifications in FIFO order."""
-    data = await load_json(
-        NOTIFICATION_BACKLOG_FILE_NAME, gcs_client, reject_null=True
-    )
+    data = await load_json(NOTIFICATION_BACKLOG_FILE_NAME, gcs_client, reject_null=True)
     if data is None:
         return []
     try:
@@ -711,7 +715,7 @@ async def load_notification_backlog(gcs_client=None) -> List[NotificationOutbox]
 
 
 async def save_notification_backlog(
-    backlog: List[NotificationOutbox], gcs_client=None
+    backlog: list[NotificationOutbox], gcs_client=None
 ) -> None:
     """Persist the deferred notification FIFO after validating every record."""
     try:
@@ -727,12 +731,12 @@ async def save_notification_backlog(
     )
 
 
-# --- 로그 정리 ---
-
-
-async def cleanup_old_logs(days_to_keep: int = 7, gcs_client=None):
-    """설정된 기간보다 오래된 분석 로그 파일을 삭제합니다."""
-    cutoff_date = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+async def cleanup_expired_analysis_logs(
+    days_to_keep: int = 7,
+    gcs_client=None,
+) -> None:
+    """Delete dated analysis logs older than the retention window."""
+    cutoff_date = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         days=days_to_keep
     )
     prefix = "analysis_log_"
@@ -740,13 +744,13 @@ async def cleanup_old_logs(days_to_keep: int = 7, gcs_client=None):
     try:
         if config.storage_method() is config.StorageMethod.GCS:
             if gcs_client is None:
-                raise StateBackendUnavailable(
+                raise StateBackendUnavailableError(
                     StateErrorCode.BACKEND_UNAVAILABLE, prefix
                 )
-            await _cleanup_gcs_logs(gcs_client, prefix, cutoff_date)
+            await _cleanup_expired_gcs_logs(gcs_client, prefix, cutoff_date)
         else:
-            _cleanup_local_logs(prefix, cutoff_date)
-    except StateBackendUnavailable:
+            _cleanup_expired_local_logs(prefix, cutoff_date)
+    except StateBackendUnavailableError:
         raise
     except Exception as error:
         raise StateSaveError(
@@ -754,8 +758,12 @@ async def cleanup_old_logs(days_to_keep: int = 7, gcs_client=None):
         ) from error
 
 
-async def _cleanup_gcs_logs(gcs_client, prefix: str, cutoff_date: datetime.datetime):
-    """GCS에서 오래된 로그 파일을 삭제합니다."""
+async def _cleanup_expired_gcs_logs(
+    gcs_client,
+    prefix: str,
+    cutoff_date: datetime.datetime,
+) -> None:
+    """Delete expired GCS analysis-log objects."""
     bucket = gcs_client.bucket(config.GCS_BUCKET_NAME)
     blobs_iterator = await asyncio.to_thread(bucket.list_blobs, prefix=prefix)
 
@@ -763,17 +771,20 @@ async def _cleanup_gcs_logs(gcs_client, prefix: str, cutoff_date: datetime.datet
         try:
             date_str = blob.name.replace(prefix, "").replace(".json", "")
             file_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(
-                tzinfo=datetime.timezone.utc
+                tzinfo=datetime.UTC
             )
             if file_date < cutoff_date:
-                logger.info(f"오래된 GCS 로그 파일 삭제: {blob.name}")
+                logger.info("Deleted expired GCS analysis log: %s", blob.name)
                 await asyncio.to_thread(blob.delete)
         except ValueError:
-            continue  # 날짜 형식이 아닌 파일은 건너뜀
+            continue  # Ignore unrelated objects that share the prefix.
 
 
-def _cleanup_local_logs(prefix: str, cutoff_date: datetime.datetime):
-    """로컬에서 오래된 로그 파일을 삭제합니다."""
+def _cleanup_expired_local_logs(
+    prefix: str,
+    cutoff_date: datetime.datetime,
+) -> None:
+    """Delete expired local analysis-log files."""
     log_dir = config.LOCAL_STATE_DIR
     if not os.path.isdir(log_dir):
         return
@@ -783,11 +794,11 @@ def _cleanup_local_logs(prefix: str, cutoff_date: datetime.datetime):
             try:
                 date_str = filename.replace(prefix, "").replace(".json", "")
                 file_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(
-                    tzinfo=datetime.timezone.utc
+                    tzinfo=datetime.UTC
                 )
                 if file_date < cutoff_date:
                     filepath = os.path.join(log_dir, filename)
                     os.remove(filepath)
-                    logger.info(f"오래된 로컬 로그 파일 삭제: {filepath}")
+                    logger.info("Deleted expired local analysis log: %s", filepath)
             except ValueError:
                 continue

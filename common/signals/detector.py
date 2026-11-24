@@ -1,55 +1,59 @@
-#common/signals/detector
+"""Candidate scoring and market-wide outlier filtering."""
 
 import logging
-from typing import Dict, Iterable, List
+from collections.abc import Iterable
 
 import numpy as np
 
 import config
-from common.models import (
-    SignalCandidate,
-    TickerData,
-    TrendState,
-)
+from common.models import SignalCandidate, TickerData, TrendState
 
 logger = logging.getLogger(config.APP_LOGGER_NAME)
 
 
 def detect_anomalies(
     candidate_markets: Iterable[str],
-    enriched_tickers: Dict[str, TickerData],
-    SECTORS: Dict[str, List[str]],
-    REVERSE_SECTOR_MAP: Dict[str, List[str]],
-) -> List[SignalCandidate]:
-    """Score selected candidates while retaining whole-market context."""
-    # Z-score는 scanner에서 이미 계산됨. detector는 읽기만 한다.
-
-    # 각 티커를 순회하며 시그널 후보 생성
-    candidates = []
+    enriched_tickers: dict[str, TickerData],
+    markets_by_sector: dict[str, list[str]],
+    sectors_by_market: dict[str, list[str]],
+) -> list[SignalCandidate]:
+    """Score broad-scan candidates with higher-timeframe and sector context."""
+    candidates: list[SignalCandidate] = []
     for market in candidate_markets:
         ticker = enriched_tickers.get(market)
         if ticker is None:
             continue
-        # Candidate selection already requires this metric; retain that contract here.
         conditional_z_score = ticker.conditional_log_rvol_z_score
-        if conditional_z_score is None:
-            continue
-        z_score = conditional_z_score
-        price_change = abs(ticker.price_change_10m or 0)
         price_surprise = ticker.price_surprise
-
-        if z_score > 5.0 and price_change < config.WASH_TRADING_MIN_PRICE_CHANGE:
-            continue
-        if price_surprise is None:
-            continue
-        if z_score <= config.ROBUST_Z_SCORE_THRESHOLD and price_surprise < config.price_surprise_minimum(ticker.liquidity_tier):
+        if conditional_z_score is None or price_surprise is None:
             continue
 
-        sector_corr = calculate_sector_correlation(market, enriched_tickers, SECTORS, REVERSE_SECTOR_MAP)
-        signal_score = calculate_signal_score(ticker, sector_corr)
+        absolute_price_change = abs(ticker.price_change_10m or 0)
+        if (
+            conditional_z_score > 5.0
+            and absolute_price_change < config.WASH_TRADING_MIN_PRICE_CHANGE
+        ):
+            continue
+        if (
+            conditional_z_score <= config.ROBUST_Z_SCORE_THRESHOLD
+            and price_surprise < config.price_surprise_minimum(ticker.liquidity_tier)
+        ):
+            continue
 
-        if signal_score >= config.SIGNAL_SCORE_CANDIDATE_MINIMUM:
-            candidate = SignalCandidate(
+        sector_alignment = calculate_sector_directional_alignment(
+            market,
+            enriched_tickers,
+            markets_by_sector,
+            sectors_by_market,
+        )
+        signal_score = calculate_candidate_signal_score(
+            ticker,
+            sector_alignment,
+        )
+        if signal_score < config.SIGNAL_SCORE_CANDIDATE_MINIMUM:
+            continue
+        candidates.append(
+            SignalCandidate(
                 market=market,
                 signal_score=signal_score,
                 price_change=ticker.price_change_10m or 0.0,
@@ -57,78 +61,72 @@ def detect_anomalies(
                 rvol_z_score=conditional_z_score,
                 current_price=ticker.candle_history[-1].close_price,
             )
-            candidates.append(candidate)
+        )
 
-    return sorted(candidates, key=lambda x: x.signal_score, reverse=True)
+    return sorted(
+        candidates,
+        key=lambda candidate: candidate.signal_score,
+        reverse=True,
+    )
 
 
-def calculate_sector_correlation(
+def calculate_sector_directional_alignment(
     market: str,
-    enriched_tickers: Dict[str, TickerData],
-    SECTORS: Dict[str, List[str]],
-    REVERSE_SECTOR_MAP: Dict[str, List[str]],
+    enriched_tickers: dict[str, TickerData],
+    markets_by_sector: dict[str, list[str]],
+    sectors_by_market: dict[str, list[str]],
 ) -> float:
-    """해당 코인이 속한 섹터 내 다른 코인들과의 가격 변동 동조성을 계산합니다."""
-    tags = REVERSE_SECTOR_MAP.get(market, [])
-    if not tags:
+    """Measure same-direction participation among peers in the primary sector."""
+    market_sectors = sectors_by_market.get(market, [])
+    if not market_sectors:
         return 0.0
 
-    primary_sector = tags[0]
-    sector_coins = SECTORS.get(primary_sector, [])
-    if len(sector_coins) < 3:
+    primary_sector = market_sectors[0]
+    peer_markets = markets_by_sector.get(primary_sector, [])
+    if len(peer_markets) < 3:
         return 0.0
 
-    sector_changes = [
-        t.price_change_10m
-        for coin in sector_coins
-        if coin != market and (t := enriched_tickers.get(coin)) and t.price_change_10m is not None
+    peer_changes = [
+        peer_ticker.price_change_10m
+        for peer_market in peer_markets
+        if peer_market != market
+        and (peer_ticker := enriched_tickers.get(peer_market))
+        and peer_ticker.price_change_10m is not None
     ]
-    if len(sector_changes) < 3:
+    if len(peer_changes) < 3:
         return 0.0
 
     target_change = enriched_tickers[market].price_change_10m
     if target_change is None:
         return 0.0
-
-    same_direction = sum(
-        1
-        for c in sector_changes
-        if (c > 0 and target_change > 0) or (c < 0 and target_change < 0)
+    same_direction_count = sum(
+        (peer_change > 0 and target_change > 0)
+        or (peer_change < 0 and target_change < 0)
+        for peer_change in peer_changes
     )
-    correlation = same_direction / len(sector_changes)
-
-    # 0.5(무작위)를 0으로, 1.0(완전동조)을 1.0으로 스케일링
-    return max(0, (correlation - 0.5) * 2)
+    agreement_ratio = same_direction_count / len(peer_changes)
+    return max(0.0, (agreement_ratio - 0.5) * 2)
 
 
-def calculate_signal_score(ticker: TickerData, sector_corr: float) -> float:
-    """
-    사전 시점의 변동성 정규화 가격 surprise와 유동성 구간으로 점수를 매깁니다.
-    """
+def calculate_candidate_signal_score(
+    ticker: TickerData,
+    sector_alignment: float,
+) -> float:
+    """Score pre-decision price, activity, trend, and sector evidence."""
     score = 0.0
-    
-    z_score = ticker.conditional_log_rvol_z_score or 0
-    price_change_abs = abs(ticker.price_change_10m or 0)
+    volume_z_score = ticker.conditional_log_rvol_z_score or 0.0
+    absolute_price_change = abs(ticker.price_change_10m or 0.0)
     price_surprise = ticker.price_surprise or 0.0
     target_price_surprise = config.price_surprise_minimum(ticker.liquidity_tier)
 
-    # 가격 모멘텀 점수 (최대 0.4)
-    # 목표치를 초과 달성할수록 점수가 높아짐 (비율로 계산)
-    
     momentum_ratio = price_surprise / target_price_surprise
     if momentum_ratio >= 1.0:
-        score += 0.2 # 목표 달성 시 기본 0.2 확보
-        # 목표의 2배 달성 시 추가 0.2 (최대 0.4)
+        score += 0.2
         score += min((momentum_ratio - 1.0) * 0.2, 0.2)
     else:
-        # 목표 미달 시 비율만큼 점수 (0 ~ 0.2)
         score += momentum_ratio * 0.2
-    
-    # 거래량 폭발 (최대 0.2)
-    # Z-Score는 통계적 수치라 순위 상관없이 절대평가 가능 (Cap 10.0 기준)
-    score += min(z_score / 20.0, 0.2) 
 
-    # 추세 정렬 (최대 0.2)
+    score += min(volume_z_score / 20.0, 0.2)
     if (ticker.price_change_10m or 0) > 0:
         if ticker.trend_1h_stable is TrendState.UP:
             score += 0.1
@@ -140,51 +138,60 @@ def calculate_signal_score(ticker: TickerData, sector_corr: float) -> float:
         if ticker.is_above_ma50_daily is False:
             score += 0.1
 
-    # 보너스 (섹터, 디커플링)
-    score += sector_corr * 0.1
-    
-    if ticker.decoupling_score and abs(ticker.decoupling_score) > config.DECOUPLING_MIN_DEVIATION_PCT:
+    score += sector_alignment * 0.1
+    if (
+        ticker.decoupling_score
+        and abs(ticker.decoupling_score) > config.DECOUPLING_MIN_DEVIATION_PCT
+    ):
         score += 0.1
-        
-    # 페널티 (변동성 없는 거래량 - Wash Trading)
-    if z_score > 3.0 and price_change_abs < config.WASH_TRADING_MIN_PRICE_CHANGE:
-        score -= 0.3 
-
+    if (
+        volume_z_score > 3.0
+        and absolute_price_change < config.WASH_TRADING_MIN_PRICE_CHANGE
+    ):
+        score -= 0.3
     return max(score, 0.0)
 
-def filter_market_wide_events(
-    candidates: List[SignalCandidate], enriched_tickers: Dict[str, TickerData]
-) -> List[SignalCandidate]:
-    """시장 전체가 급등/급락하는 이벤트와 개별 종목의 이상 현상을 구분합니다."""
-    total = len(enriched_tickers)
-    if total == 0:
+
+def filter_market_wide_candidates(
+    candidates: list[SignalCandidate],
+    enriched_tickers: dict[str, TickerData],
+) -> list[SignalCandidate]:
+    """During broad market moves, retain only candidates that are true outliers."""
+    market_count = len(enriched_tickers)
+    if market_count == 0:
         return candidates
 
-    strong_gainers = sum(
-        1
-        for t in enriched_tickers.values()
-        if t.price_change_10m and t.price_change_10m > 2.0
+    strong_gainer_count = sum(
+        ticker.price_change_10m is not None and ticker.price_change_10m > 2.0
+        for ticker in enriched_tickers.values()
     )
-    strong_losers = sum(
-        1
-        for t in enriched_tickers.values()
-        if t.price_change_10m and t.price_change_10m < -2.0
+    strong_loser_count = sum(
+        ticker.price_change_10m is not None and ticker.price_change_10m < -2.0
+        for ticker in enriched_tickers.values()
     )
+    is_market_wide_move = (
+        strong_gainer_count / market_count > 0.7
+        or strong_loser_count / market_count > 0.7
+    )
+    if not is_market_wide_move:
+        return candidates
 
-    is_market_event = (strong_gainers / total) > 0.7 or (strong_losers / total) > 0.7
-    if not is_market_event:
-        return candidates 
-
-    avg_change = np.mean(
-        [t.price_change_10m for t in enriched_tickers.values() if t.price_change_10m]
-    )
-    
-    extreme_candidates = [
-        c for c in candidates if abs(c.price_change) > abs(avg_change) * 2
+    nonzero_changes = [
+        ticker.price_change_10m
+        for ticker in enriched_tickers.values()
+        if ticker.price_change_10m
     ]
-
-    if extreme_candidates:
+    if not nonzero_changes:
+        return []
+    average_market_change = float(np.mean(nonzero_changes))
+    outliers = [
+        candidate
+        for candidate in candidates
+        if abs(candidate.price_change) > abs(average_market_change) * 2
+    ]
+    if outliers:
         logger.info(
-            f"시장 전체 이벤트 감지, 그러나 {len(extreme_candidates)}개 극단 이상치 유지"
+            "Market-wide move detected; retained %d extreme candidates",
+            len(outliers),
         )
-    return extreme_candidates
+    return outliers
